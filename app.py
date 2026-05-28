@@ -1676,12 +1676,15 @@ class DashboardBuilder:
                     ], className="card det-card")
                 ], className="mb-4"),
                 self._reference_section(),
-                self._missing_data_banner(),
                 html.Div([
-                    html.Span(f"Metric definitions use UBPR-style concepts · {len(METRIC_CATEGORIES)} categories · "
-                              f"concept code reference: ffiec.gov/data/ubpr/report-user-guide",
-                              className="foot-txt")
-                ], className="foot"),
+                    self._missing_data_banner(),
+                    html.Div([
+                        html.Span("Dashboard notes", className="dashboard-footer-label"),
+                        html.Span(f"Metric definitions use UBPR-style concepts across {len(METRIC_CATEGORIES)} categories; concept code reference: ffiec.gov/data/ubpr/report-user-guide. "
+                                  f"Source detail, history window, and peer-comparability assumptions are summarized above.",
+                                  className="dashboard-footer-text")
+                    ], className="dashboard-footer-note"),
+                ], className="dashboard-footer"),
             ], className="main")
         ])
 
@@ -2361,20 +2364,27 @@ body {
 .tb-btn-secondary { background: %(neutral_light)s; color: %(text2)s; box-shadow: 0 1px 2px rgba(15,23,42,0.05) }
 .tb-btn-secondary:hover { background: %(lighter)s; color: %(text)s }
 .main { padding: 14px 28px 28px; max-width: 1600px; margin: 0 auto }
-.data-scope-banner {
-    margin: 0 0 14px; padding: 11px 14px 12px; border-radius: 12px;
-    border: 1px solid rgba(0,94,184,0.14); background: linear-gradient(180deg, #ffffff 0%%, %(accent_light)s 100%%);
-    color: %(text)s; box-shadow: 0 1px 2px rgba(15,23,42,0.03), 0 4px 14px rgba(0,94,184,0.035);
+.dashboard-footer {
+    margin-top: 10px; padding: 16px 18px 18px; border-radius: 16px;
+    border: 1px solid rgba(15,23,42,0.07); background: linear-gradient(180deg, #ffffff 0%%, #f8fafc 100%%);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.75), 0 1px 2px rgba(15,23,42,0.025);
 }
-.scope-hdr { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 7px }
-.scope-title-wrap { display: flex; align-items: baseline; gap: 9px; min-width: 0 }
-.scope-title { font-size: 0.74rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.75px; color: %(primary)s; white-space: nowrap }
-.scope-title-pill { background: #fff; border: 1px solid rgba(0,94,184,0.16); border-radius: 999px; padding: 5px 12px; box-shadow: 0 1px 2px rgba(0,94,184,0.06); flex-shrink: 0 }
-.scope-meta { font-size: 0.63rem; font-weight: 600; color: %(text3)s; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
-.scope-lines { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px 12px }
-.scope-line { display: flex; align-items: baseline; gap: 7px; min-width: 0; line-height: 1.35 }
-.scope-k { font-size: 0.58rem; font-weight: 800; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.55px; white-space: nowrap; flex-shrink: 0 }
+.data-scope-banner {
+    margin: 0; padding: 0; border-radius: 0; border: none; background: transparent;
+    color: %(text)s; box-shadow: none;
+}
+.scope-hdr { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 9px; padding-bottom: 8px; border-bottom: 1px solid rgba(15,23,42,0.06) }
+.scope-title-wrap { display: flex; align-items: center; gap: 10px; min-width: 0 }
+.scope-title { font-size: 0.72rem; font-weight: 850; text-transform: uppercase; letter-spacing: 0.78px; color: %(primary)s; white-space: nowrap }
+.scope-title-pill { background: %(accent_light)s; border: 1px solid rgba(0,94,184,0.16); border-radius: 999px; padding: 5px 12px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.75); flex-shrink: 0 }
+.scope-meta { font-size: 0.64rem; font-weight: 650; color: %(text3)s; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.scope-lines { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 18px }
+.scope-line { display: flex; align-items: baseline; gap: 8px; min-width: 0; line-height: 1.38 }
+.scope-k { font-size: 0.57rem; font-weight: 850; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.58px; white-space: nowrap; flex-shrink: 0 }
 .scope-v { font-size: 0.68rem; color: %(text2)s; min-width: 0 }
+.dashboard-footer-note { margin-top: 11px; padding-top: 10px; border-top: 1px solid rgba(15,23,42,0.06); display: flex; align-items: baseline; justify-content: center; gap: 8px; text-align: center; flex-wrap: wrap }
+.dashboard-footer-label { font-size: 0.56rem; font-weight: 850; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.65px }
+.dashboard-footer-text { font-size: 0.64rem; color: %(text3)s; letter-spacing: 0.15px; line-height: 1.45 }
 
 .peer-performance-card { margin-bottom: 14px; overflow: visible; background: linear-gradient(180deg, #fff 0%%, #fbfdff 100%%); border-color: rgba(0,94,184,0.10) }
 .peer-perf-top { display: flex; flex-direction: column; align-items: stretch; gap: 11px; padding: 14px 16px 13px; background: linear-gradient(135deg, rgba(0,94,184,0.08) 0%%, rgba(213,228,242,0.52) 100%%); border-bottom: 1px solid rgba(0,94,184,0.10); border-radius: 12px 12px 0 0 }
@@ -2470,11 +2480,14 @@ body {
 .vs { font-size: 0.64rem; color: %(light)s; font-weight: 500; flex-shrink: 0 }
 .section-title-note { font-size: 0.64rem; color: %(text3)s; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0 }
 .jpm-corr-card { margin-bottom: 14px; overflow: visible; background: linear-gradient(180deg, #fff 0%%, #fbfdff 100%%); border-color: rgba(0,94,184,0.10) }
-.corr-header-grid { width: 100%%; min-width: 0; display: grid; grid-template-columns: minmax(230px, 0.52fr) minmax(760px, 2.2fr); gap: 16px; align-items: end; padding: 14px 16px 15px; background: linear-gradient(135deg, rgba(0,94,184,0.08) 0%%, rgba(213,228,242,0.50) 100%%); border-bottom: 1px solid rgba(0,94,184,0.10); border-radius: 12px 12px 0 0 }
-.corr-title-block { min-width: 0; display: flex; flex-direction: column; justify-content: flex-end; gap: 2px; padding-bottom: 2px }
+.corr-header-grid { width: 100%%; min-width: 0; display: grid; grid-template-columns: minmax(255px, 0.48fr) minmax(0, 1.72fr); gap: 14px; align-items: center; padding: 10px 14px; background: linear-gradient(135deg, rgba(0,94,184,0.08) 0%%, rgba(213,228,242,0.50) 100%%); border-bottom: 1px solid rgba(0,94,184,0.10); border-radius: 12px 12px 0 0 }
+.corr-title-block { min-width: 0; display: flex; align-items: center; justify-content: flex-start; gap: 2px; height: 100%% }
 .corr-title-eyebrow { font-size: 0.58rem; font-weight: 850; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.68px; white-space: nowrap }
-.corr-title-main { font-size: 0.95rem; font-weight: 850; color: %(text)s; letter-spacing: -0.012em; line-height: 1.08; white-space: nowrap }
-.corr-control-grid { width: 100%%; min-width: 0; display: grid; grid-template-columns: minmax(305px, 1fr) minmax(305px, 1fr) 194px; gap: 12px; align-items: end }
+.corr-title-main { font-size: 0.90rem; font-weight: 850; color: %(text)s; letter-spacing: -0.012em; line-height: 1.1; white-space: nowrap }
+.corr-control-grid { width: 100%%; min-width: 0; display: flex; flex-wrap: wrap; gap: 9px 11px; align-items: flex-end; justify-content: flex-end }
+.corr-control-grid .peer-control { gap: 4px }
+.corr-control-metric { flex: 1 1 300px; min-width: 260px; max-width: 430px }
+.corr-control-timeline { flex: 0 0 194px; min-width: 176px }
 .corr-metric-dd { width: 100%% !important; min-width: 0 !important; flex-shrink: 1 }
 .corr-control-timeline .idd-t { width: 100%% !important; min-width: 0 !important }
 .corr-subrow { margin-left: -7px; margin-right: -7px; padding: 14px 14px 0 }
@@ -2500,6 +2513,7 @@ body {
 .idd-m .Select-placeholder, .idd-m2 .Select-placeholder { font-size: 0.82rem !important }
 .idd-m .Select-input > input, .idd-m2 .Select-input > input { font-size: 0.82rem !important }
 .idd-m2 { width: 485px !important }
+.idd-m.corr-metric-dd, .idd-m2.corr-metric-dd { width: 100%% !important; min-width: 0 !important; flex-shrink: 1 !important }
 .idd-t { width: 194px !important; min-width: 194px !important; flex-shrink: 0 }
 .idd-t .Select-control { min-height: 30px !important; border-radius: 7px !important; background: %(hover_bg)s !important; border-color: rgba(15,23,42,0.07) !important }
 .idd-t .Select-value { line-height: 30px !important }
@@ -2585,7 +2599,7 @@ body {
 .ref-row:hover { background: %(hover_bg)s }
 .ref-name { font-size: 0.72rem; font-weight: 600; color: %(text)s; min-width: 280px; flex-shrink: 0; line-height: 1.35 }
 .ref-desc { font-size: 0.72rem; color: %(text2)s; line-height: 1.5 }
-.foot { text-align: center; padding: 20px 28px 26px }
+.foot { text-align: center; padding: 18px 24px 22px }
 .foot-txt { font-size: 0.64rem; color: %(light)s; letter-spacing: 0.35px }
 .js-plotly-plot .plotly .modebar { display: none !important }
 .Select-control { border-radius: 7px !important; border-color: rgba(15,23,42,0.09) !important; min-height: 30px !important; transition: all 0.15s ease }
@@ -2605,10 +2619,11 @@ body {
 @media (max-width: 1200px) {
     .peer-control-grid { grid-template-columns: minmax(360px, 1fr) 165px; gap: 10px }
     .peer-control-peers { grid-column: 1 / -1 }
-    .corr-header-grid { grid-template-columns: 1fr; gap: 11px; align-items: start }
-    .corr-title-block { padding-bottom: 0 }
-    .corr-control-grid { grid-template-columns: minmax(320px, 1fr) minmax(320px, 1fr); gap: 10px }
-    .corr-control-timeline { grid-column: 1 / -1; max-width: 194px }
+    .corr-header-grid { grid-template-columns: 1fr; gap: 10px; align-items: start }
+    .corr-title-block { min-height: 0 }
+    .corr-control-grid { justify-content: flex-start; gap: 9px 10px }
+    .corr-control-metric { flex: 1 1 320px; max-width: none }
+    .corr-control-timeline { flex: 0 0 194px }
 }
 @media (max-width: 992px) {
     .main { padding: 10px 16px }
@@ -2624,10 +2639,10 @@ body {
     .idd-m, .idd-m2 { width: 100%% !important }
     .toolbar { flex-wrap: wrap; gap: 6px }
     .peer-control-grid { grid-template-columns: 1fr }
-    .corr-header-grid { grid-template-columns: 1fr }
+    .corr-header-grid { grid-template-columns: 1fr; padding: 10px 12px }
     .corr-title-main { white-space: normal }
-    .corr-control-grid { grid-template-columns: 1fr }
-    .corr-control-timeline { max-width: none }
+    .corr-control-grid { flex-direction: column; align-items: stretch }
+    .corr-control-metric, .corr-control-timeline { flex: 1 1 auto; min-width: 0; max-width: none; width: 100%% }
     .peer-select-row { flex-direction: column; align-items: stretch }
     .peer-actions { justify-content: flex-start }
     .peer-sel-dd .Select-multi-value-wrapper { max-height: 68px; flex-wrap: wrap !important; overflow-y: auto !important }
@@ -2643,10 +2658,13 @@ body {
     .dright { gap: 6px }
     .dspark { display: none }
     .ddelta { min-width: 40px }
+    .dashboard-footer { padding: 14px 13px 16px }
     .scope-hdr { flex-direction: column; align-items: flex-start; gap: 5px }
-    .scope-title-wrap { flex-direction: column; align-items: flex-start; gap: 2px }
-    .scope-lines { grid-template-columns: 1fr; gap: 6px }
+    .scope-title-wrap { flex-direction: column; align-items: flex-start; gap: 3px }
+    .scope-meta { white-space: normal }
+    .scope-lines { grid-template-columns: 1fr; gap: 7px }
     .scope-line { flex-direction: column; gap: 1px }
+    .dashboard-footer-note { justify-content: flex-start; text-align: left }
 }
 """ % c
         return '<!DOCTYPE html>\n<html><head>{%metas%}<title>{%title%}</title>{%favicon%}{%css%}<style>' + css + '</style></head>\n<body>{%app_entry%}<footer>{%config%}{%scripts%}{%renderer%}</footer></body></html>'
