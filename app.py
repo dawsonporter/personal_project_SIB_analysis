@@ -1397,7 +1397,10 @@ class DashboardBuilder:
             years = int(y)
         except (TypeError, ValueError):
             years = 4
-        return end_ts - pd.DateOffset(years=years), end_ts
+        start_ts = end_ts - pd.DateOffset(years=years)
+        if self.analysis_start_date is not None:
+            start_ts = max(pd.Timestamp(self.analysis_start_date), start_ts)
+        return start_ts, end_ts
 
     @staticmethod
     def _window_label(y, start, end):
@@ -1541,51 +1544,74 @@ class DashboardBuilder:
                     html.Button("All", id="sel-all", className="tb-btn"),
                     html.Button("Clear", id="sel-clear", className="tb-btn tb-btn-secondary")
                 ], className="toolbar"),
-                dbc.Row([
-                    dbc.Col(html.Div([
+                html.Div([
+                    html.Div([
                         html.Div([
-                            html.H6("Peer Snapshot", className="ct"),
-                            self._mdd('r1m'),
+                            html.H6("Peer Performance", className="ct peer-perf-title"),
+                            html.Span("Shared metric and as-of date drive snapshot + trend", className="peer-perf-sub")
+                        ], className="peer-perf-title-wrap"),
+                        self._mdd('peer-metric', c="idd-m peer-metric-dd"),
+                        html.Div([
+                            html.Span("As-of Date", className="control-label"),
                             dcc.Dropdown(id='r1d', options=self._do, value=dv, clearable=False,
                                          searchable=False, className="idd-d")
-                        ], className="ch ch-wrap"),
+                        ], className="peer-top-control")
+                    ], className="peer-perf-top"),
+                    html.Div(id='peer-def', className="dfoot peer-def-wrap"),
+                    html.Div([
                         html.Div([
-                            dcc.Loading(dcc.Graph(id='r1c', config={'displayModeBar': False},
-                                                  style=chart_style, className="viz-graph"),
-                                        type="dot", color=CS['primary'])
-                        ], className="viz-shell"),
-                        self._dfoot('r1f')
-                    ], className="card pair-card pair-card-chart"), md=7, className="mb-3 pair-col"),
-                    dbc.Col(html.Div([
-                        html.Div([html.H6("Peer Snapshot Stats", className="ct")], className="ch"),
+                            html.Span("Snapshot", className="peer-section-label"),
+                            html.Span("Point-in-time peer ranking and distribution", className="peer-section-sub")
+                        ], className="peer-section-bar"),
+                        dbc.Row([
+                            dbc.Col(html.Div([
+                                html.Div([
+                                    html.H6("Peer Snapshot", className="ct"),
+                                    html.Span("As-of peer comparison", className="rng")
+                                ], className="ch ch-wrap"),
+                                html.Div([
+                                    dcc.Loading(dcc.Graph(id='r1c', config={'displayModeBar': False},
+                                                          style=chart_style, className="viz-graph"),
+                                                type="dot", color=CS['primary'])
+                                ], className="viz-shell"),
+                            ], className="peer-panel pair-card pair-card-chart"), md=7, className="mb-3 pair-col"),
+                            dbc.Col(html.Div([
+                                html.Div([html.H6("Snapshot Stats", className="ct")], className="ch"),
+                                html.Div([
+                                    dcc.Loading(html.Div(id='r1o', className="insight-shell overview-shell"),
+                                                type="dot", color=CS['primary'])
+                                ], className="insight-load-shell")
+                            ], className="peer-panel pair-card pair-card-side"), md=5, className="mb-3 pair-col")
+                        ], className="paired-row peer-subrow"),
+                    ], className="peer-section peer-section-snapshot"),
+                    html.Div([
                         html.Div([
-                            dcc.Loading(html.Div(id='r1o', className="insight-shell overview-shell"),
-                                        type="dot", color=CS['primary'])
-                        ], className="insight-load-shell")
-                    ], className="card pair-card pair-card-side"), md=5, className="mb-3 pair-col")
-                ], className="paired-row"),
-                dbc.Row([
-                    dbc.Col(html.Div([
-                        html.Div([
-                            html.H6("Peer Trend", className="ct"),
-                            self._mdd('r2m'), self._tdd('r2t'),
-                            html.Span(id='r2r', className="rng")
-                        ], className="ch ch-wrap"),
-                        html.Div([
-                            dcc.Loading(dcc.Graph(id='r2c', config={'displayModeBar': False},
-                                                  style=chart_style, className="viz-graph"),
-                                        type="dot", color=CS['primary'])
-                        ], className="viz-shell"),
-                        self._dfoot('r2f')
-                    ], className="card pair-card pair-card-chart"), md=7, className="mb-3 pair-col"),
-                    dbc.Col(html.Div([
-                        html.Div([html.H6("Peer Trend Stats", className="ct")], className="ch"),
-                        html.Div([
-                            dcc.Loading(html.Div(id='r2a', className="insight-shell analysis-shell"),
-                                        type="dot", color=CS['primary'])
-                        ], className="insight-load-shell")
-                    ], className="card pair-card pair-card-side"), md=5, className="mb-3 pair-col")
-                ], className="paired-row"),
+                            html.Span("Trend", className="peer-section-label"),
+                            html.Span("Same metric through the selected as-of date", className="peer-section-sub")
+                        ], className="peer-section-bar peer-section-bar-trend"),
+                        dbc.Row([
+                            dbc.Col(html.Div([
+                                html.Div([
+                                    html.H6("Peer Trend", className="ct"),
+                                    self._tdd('r2t'),
+                                    html.Span(id='r2r', className="rng")
+                                ], className="ch ch-wrap"),
+                                html.Div([
+                                    dcc.Loading(dcc.Graph(id='r2c', config={'displayModeBar': False},
+                                                          style=chart_style, className="viz-graph"),
+                                                type="dot", color=CS['primary'])
+                                ], className="viz-shell"),
+                            ], className="peer-panel pair-card pair-card-chart"), md=7, className="mb-3 pair-col"),
+                            dbc.Col(html.Div([
+                                html.Div([html.H6("Trend Stats", className="ct")], className="ch"),
+                                html.Div([
+                                    dcc.Loading(html.Div(id='r2a', className="insight-shell analysis-shell"),
+                                                type="dot", color=CS['primary'])
+                                ], className="insight-load-shell")
+                            ], className="peer-panel pair-card pair-card-side"), md=5, className="mb-3 pair-col")
+                        ], className="paired-row peer-subrow"),
+                    ], className="peer-section peer-section-trend"),
+                ], className="card peer-performance-card mb-3"),
                 dbc.Row([
                     dbc.Col(html.Div([
                         html.Div([
@@ -1692,12 +1718,8 @@ class DashboardBuilder:
         def ue(p):
             return self._exec_banner(p or [])
 
-        @app.callback(Output('r1f', 'children'), Input('r1m', 'value'))
-        def d1(m):
-            return self._rdef(m)
-
-        @app.callback(Output('r2f', 'children'), Input('r2m', 'value'))
-        def d2(m):
+        @app.callback(Output('peer-def', 'children'), Input('peer-metric', 'value'))
+        def d_peer(m):
             return self._rdef(m)
 
         @app.callback(Output('r3f', 'children'), [Input('r3p', 'value'), Input('r3s', 'value')])
@@ -1705,7 +1727,7 @@ class DashboardBuilder:
             return html.Div([self._rdef(a, "Primary"), self._rdef(b, "Secondary")])
 
         @app.callback([Output('r1c', 'figure'), Output('r1o', 'children')],
-                      [Input('r1m', 'value'), Input('r1d', 'value'), Input('peer-sel', 'value')])
+                      [Input('peer-metric', 'value'), Input('r1d', 'value'), Input('peer-sel', 'value')])
         def u1(m, ds, p):
             if not m or not ds:
                 return self._ef(""), html.Div()
@@ -1717,14 +1739,15 @@ class DashboardBuilder:
             return self._bar(f.sort_values(m, ascending=is_inverse_metric(m)), m, dt), self._ov(f, m, dt)
 
         @app.callback([Output('r2c', 'figure'), Output('r2a', 'children'), Output('r2r', 'children')],
-                      [Input('r2m', 'value'), Input('peer-sel', 'value'), Input('r2t', 'value')])
-        def u2(m, p, y):
+                      [Input('peer-metric', 'value'), Input('peer-sel', 'value'),
+                       Input('r2t', 'value'), Input('r1d', 'value')])
+        def u2(m, p, y, ds):
             if not m:
                 return self._ef(""), html.Div(), ""
             bk = [self.GHB] + (p or [])
-            end = self.analysis_end_date if self.analysis_end_date is not None else self.df['Date'].max()
+            end = pd.to_datetime(ds) if ds else (self.analysis_end_date if self.analysis_end_date is not None else self.df['Date'].max())
             start_ts, end_ts = self._window_bounds(y, end=end, bank_filter=bk)
-            return self._trend(bk, m, y), self._ta(bk, m, y), self._window_label(y, start_ts, end_ts)
+            return self._trend(bk, m, y, end_date=end), self._ta(bk, m, y, end_date=end), self._window_label(y, start_ts, end_ts)
 
         @app.callback([Output('r3c', 'figure'), Output('r3x', 'children')],
                       [Input('r3p', 'value'), Input('r3s', 'value'), Input('r3t', 'value')])
@@ -1945,12 +1968,12 @@ class DashboardBuilder:
             ], className="os"),
         ], className="ow")
 
-    def _trend(self, bk, m, y):
+    def _trend(self, bk, m, y, end_date=None):
         isdol = is_dollar_metric(m)
         f = self.df[self.df['Bank'].isin(bk)]
         if f.empty:
             return self._ef("No data")
-        start, end = self._window_bounds(y, bank_filter=bk)
+        start, end = self._window_bounds(y, end=end_date, bank_filter=bk)
         f = f[(f['Date'] <= end) & (f['Date'] >= start)]
         if f.empty:
             return self._ef("No data for selected historical window")
@@ -1986,13 +2009,13 @@ class DashboardBuilder:
                        tickfont=dict(size=9), zeroline=True, zerolinecolor=CS['border_strong'])))
         return fig
 
-    def _ta(self, bk, m, y):
+    def _ta(self, bk, m, y, end_date=None):
         isdol = is_dollar_metric(m)
         inverse = is_inverse_metric(m)
         f = self.df[self.df['Bank'].isin(bk)]
         if f.empty:
             return html.Div("No data", className="emp")
-        start, end = self._window_bounds(y, bank_filter=bk)
+        start, end = self._window_bounds(y, end=end_date, bank_filter=bk)
         f = f[(f['Date'] <= end) & (f['Date'] >= start)]
         if f.empty:
             return html.Div("No data for selected historical window", className="emp")
@@ -2309,6 +2332,26 @@ body {
 .scope-line { display: flex; align-items: baseline; gap: 7px; min-width: 0; line-height: 1.35 }
 .scope-k { font-size: 0.58rem; font-weight: 800; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.55px; white-space: nowrap; flex-shrink: 0 }
 .scope-v { font-size: 0.68rem; color: %(text2)s; min-width: 0 }
+
+.peer-performance-card { margin-bottom: 14px; overflow: visible; background: linear-gradient(180deg, #fff 0%%, #fbfdff 100%%); border-color: rgba(0,94,184,0.10) }
+.peer-perf-top { display: flex; align-items: center; gap: 12px; padding: 12px 15px; background: linear-gradient(135deg, rgba(0,94,184,0.08) 0%%, rgba(213,228,242,0.52) 100%%); border-bottom: 1px solid rgba(0,94,184,0.10); border-radius: 12px 12px 0 0 }
+.peer-perf-title-wrap { display: flex; flex-direction: column; gap: 2px; min-width: 182px; flex-shrink: 0 }
+.peer-perf-title { color: %(primary)s; font-size: 0.84rem }
+.peer-perf-sub { font-size: 0.61rem; color: %(text2)s; font-weight: 600; line-height: 1.25; white-space: nowrap }
+.peer-metric-dd { flex: 1 1 auto; width: auto !important; min-width: 520px }
+.peer-top-control { display: flex; align-items: center; gap: 7px; margin-left: auto; flex-shrink: 0 }
+.control-label { font-size: 0.58rem; font-weight: 800; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.55px; white-space: nowrap }
+.peer-def-wrap { border-bottom: 1px solid rgba(15,23,42,0.04); background: rgba(255,255,255,0.72); padding: 7px 15px 8px }
+.peer-section { padding: 12px 14px 0 }
+.peer-section + .peer-section { border-top: 1px solid rgba(15,23,42,0.055); padding-top: 13px; background: linear-gradient(180deg, rgba(248,250,252,0.64) 0%%, transparent 35%%) }
+.peer-section-bar { display: flex; align-items: baseline; gap: 8px; margin: 0 0 8px; padding: 0 2px }
+.peer-section-label { font-size: 0.72rem; font-weight: 850; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.75px }
+.peer-section-sub { font-size: 0.64rem; color: %(text3)s; font-weight: 600 }
+.peer-panel { width: 100%%; background: #fff; border: 1px solid rgba(15,23,42,0.06); border-radius: 11px; box-shadow: 0 1px 2px rgba(15,23,42,0.025); overflow: hidden }
+.peer-panel:hover { box-shadow: 0 2px 8px rgba(0,94,184,0.045) }
+.peer-subrow { margin-left: -7px; margin-right: -7px }
+.peer-subrow > .pair-col { padding-left: 7px; padding-right: 7px }
+.peer-section-trend .peer-panel { border-color: rgba(15,23,42,0.065) }
 .paired-row { --paired-card-min-height: %(paired_card_min_height)spx; margin-bottom: 0 }
 .pair-col { display: flex }
 .pair-card { width: 100%%; min-height: var(--paired-card-min-height); display: flex; flex-direction: column }
@@ -2488,6 +2531,10 @@ body {
 @media (max-width: 1320px) { .exec-grid { grid-template-columns: repeat(4, 1fr) } }
 @media (max-width: 1100px) { .exec-grid { grid-template-columns: repeat(3, 1fr) } }
 @media (max-width: 992px) {
+    .peer-perf-top { flex-wrap: wrap; align-items: stretch }
+    .peer-perf-title-wrap { min-width: 100%% }
+    .peer-metric-dd { min-width: 100%%; width: 100%% !important }
+    .peer-top-control { margin-left: 0 }
     .main { padding: 10px 16px }
     .idd-m { width: 450px !important }
     .idd-m2 { width: 390px !important }
