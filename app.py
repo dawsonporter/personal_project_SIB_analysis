@@ -1420,7 +1420,7 @@ class DashboardBuilder:
         return 'M36', '%Y'
 
     def _tdd(self, id_):
-        return dcc.Dropdown(id=id_, options=self._to, value=4, clearable=False,
+        return dcc.Dropdown(id=id_, options=self._to, value=10, clearable=False,
                             searchable=False, className="idd-t")
 
     def _dfoot(self, id_):
@@ -1535,27 +1535,35 @@ class DashboardBuilder:
             ], className="hdr"),
             html.Div([
                 html.Div(self._exec_banner(self.peers), id='exec-banner-wrap'),
-                self._missing_data_banner(),
-                html.Div([
-                    html.Span("SIB Peers", className="tb-label"),
-                    dcc.Dropdown(id='peer-sel',
-                                 options=[{'label': p, 'value': p} for p in self.peers],
-                                 value=self.peers, multi=True, className="tb-dd"),
-                    html.Button("All", id="sel-all", className="tb-btn"),
-                    html.Button("Clear", id="sel-clear", className="tb-btn tb-btn-secondary")
-                ], className="toolbar"),
                 html.Div([
                     html.Div([
                         html.Div([
                             html.H6("Peer Performance", className="ct peer-perf-title"),
-                            html.Span("Shared metric and as-of date drive snapshot + trend", className="peer-perf-sub")
                         ], className="peer-perf-title-wrap"),
-                        self._mdd('peer-metric', c="idd-m peer-metric-dd"),
                         html.Div([
-                            html.Span("As-of Date", className="control-label"),
-                            dcc.Dropdown(id='r1d', options=self._do, value=dv, clearable=False,
-                                         searchable=False, className="idd-d")
-                        ], className="peer-top-control")
+                            html.Div([
+                                html.Span("Metric", className="peer-control-label"),
+                                self._mdd('peer-metric', c="idd-m peer-metric-dd"),
+                            ], className="peer-control peer-control-metric"),
+                            html.Div([
+                                html.Span("As-of Date", className="peer-control-label"),
+                                dcc.Dropdown(id='r1d', options=self._do, value=dv, clearable=False,
+                                             searchable=False, className="idd-d peer-date-dd")
+                            ], className="peer-control peer-control-date"),
+                            html.Div([
+                                html.Span("Selected Peers", className="peer-control-label"),
+                                html.Div([
+                                    dcc.Dropdown(id='peer-sel',
+                                                 options=[{'label': p, 'value': p} for p in self.peers],
+                                                 value=self.peers, multi=True, className="tb-dd peer-sel-dd",
+                                                 placeholder="Select SIB peers..."),
+                                    html.Div([
+                                        html.Button("All", id="sel-all", className="tb-btn peer-btn"),
+                                        html.Button("Clear", id="sel-clear", className="tb-btn tb-btn-secondary peer-btn")
+                                    ], className="peer-actions")
+                                ], className="peer-select-row")
+                            ], className="peer-control peer-control-peers"),
+                        ], className="peer-control-grid")
                     ], className="peer-perf-top"),
                     html.Div(id='peer-def', className="dfoot peer-def-wrap"),
                     html.Div([
@@ -1659,6 +1667,7 @@ class DashboardBuilder:
                     ], className="card det-card")
                 ], className="mb-4"),
                 self._reference_section(),
+                self._missing_data_banner(),
                 html.Div([
                     html.Span(f"Metric definitions use UBPR-style concepts · {len(METRIC_CATEGORIES)} categories · "
                               f"concept code reference: ffiec.gov/data/ubpr/report-user-guide",
@@ -2334,12 +2343,23 @@ body {
 .scope-v { font-size: 0.68rem; color: %(text2)s; min-width: 0 }
 
 .peer-performance-card { margin-bottom: 14px; overflow: visible; background: linear-gradient(180deg, #fff 0%%, #fbfdff 100%%); border-color: rgba(0,94,184,0.10) }
-.peer-perf-top { display: flex; align-items: center; gap: 12px; padding: 12px 15px; background: linear-gradient(135deg, rgba(0,94,184,0.08) 0%%, rgba(213,228,242,0.52) 100%%); border-bottom: 1px solid rgba(0,94,184,0.10); border-radius: 12px 12px 0 0 }
-.peer-perf-title-wrap { display: flex; flex-direction: column; gap: 2px; min-width: 182px; flex-shrink: 0 }
-.peer-perf-title { color: %(primary)s; font-size: 0.84rem }
-.peer-perf-sub { font-size: 0.61rem; color: %(text2)s; font-weight: 600; line-height: 1.25; white-space: nowrap }
-.peer-metric-dd { flex: 1 1 auto; width: auto !important; min-width: 520px }
-.peer-top-control { display: flex; align-items: center; gap: 7px; margin-left: auto; flex-shrink: 0 }
+.peer-perf-top { display: flex; align-items: center; gap: 15px; padding: 13px 16px; background: linear-gradient(135deg, rgba(0,94,184,0.08) 0%%, rgba(213,228,242,0.52) 100%%); border-bottom: 1px solid rgba(0,94,184,0.10); border-radius: 12px 12px 0 0 }
+.peer-perf-title-wrap { display: flex; align-items: center; min-width: 168px; flex-shrink: 0 }
+.peer-perf-title { color: %(primary)s; font-size: 0.86rem }
+.peer-control-grid { flex: 1 1 auto; min-width: 0; display: grid; grid-template-columns: minmax(430px, 1.05fr) 165px minmax(380px, 0.95fr); gap: 12px; align-items: end }
+.peer-control { min-width: 0; display: flex; flex-direction: column; gap: 5px }
+.peer-control-label { font-size: 0.58rem; font-weight: 850; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.62px; white-space: nowrap }
+.peer-metric-dd { width: 100%% !important; min-width: 0 !important }
+.peer-date-dd { width: 100%% !important }
+.peer-select-row { display: flex; align-items: center; gap: 8px; min-width: 0 }
+.peer-sel-dd { flex: 1 1 auto; min-width: 0 }
+.peer-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0 }
+.peer-btn { padding: 7px 10px; min-height: 34px }
+.peer-sel-dd .Select-control { min-height: 34px !important; border-radius: 8px !important; background: %(hover_bg)s !important; border-color: rgba(15,23,42,0.07) !important }
+.peer-sel-dd .Select-value-label { font-size: 0.66rem !important; font-weight: 650 !important }
+.peer-sel-dd .Select-multi-value-wrapper { display: flex !important; align-items: center; flex-wrap: nowrap !important; gap: 3px; overflow-x: auto !important; overflow-y: hidden !important; max-height: 34px; padding-right: 2px; scrollbar-width: thin }
+.peer-sel-dd .Select-multi-value-wrapper .Select-value { flex: 0 0 auto; margin-top: 4px !important; margin-bottom: 4px !important }
+.peer-sel-dd .Select-input { flex: 0 0 90px; height: 30px !important; padding-left: 2px !important }
 .control-label { font-size: 0.58rem; font-weight: 800; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.55px; white-space: nowrap }
 .peer-def-wrap { border-bottom: 1px solid rgba(15,23,42,0.04); background: rgba(255,255,255,0.72); padding: 7px 15px 8px }
 .peer-section { padding: 12px 14px 0 }
@@ -2530,11 +2550,13 @@ body {
 .dash-spinner { margin: 30px auto !important }
 @media (max-width: 1320px) { .exec-grid { grid-template-columns: repeat(4, 1fr) } }
 @media (max-width: 1100px) { .exec-grid { grid-template-columns: repeat(3, 1fr) } }
-@media (max-width: 992px) {
-    .peer-perf-top { flex-wrap: wrap; align-items: stretch }
+@media (max-width: 1200px) {
+    .peer-perf-top { align-items: stretch; flex-direction: column; gap: 10px }
     .peer-perf-title-wrap { min-width: 100%% }
-    .peer-metric-dd { min-width: 100%%; width: 100%% !important }
-    .peer-top-control { margin-left: 0 }
+    .peer-control-grid { grid-template-columns: minmax(360px, 1fr) 165px; gap: 10px }
+    .peer-control-peers { grid-column: 1 / -1 }
+}
+@media (max-width: 992px) {
     .main { padding: 10px 16px }
     .idd-m { width: 450px !important }
     .idd-m2 { width: 390px !important }
@@ -2547,6 +2569,10 @@ body {
     .main { padding: 8px 10px }
     .idd-m, .idd-m2 { width: 100%% !important }
     .toolbar { flex-wrap: wrap; gap: 6px }
+    .peer-control-grid { grid-template-columns: 1fr }
+    .peer-select-row { flex-direction: column; align-items: stretch }
+    .peer-actions { justify-content: flex-start }
+    .peer-sel-dd .Select-multi-value-wrapper { max-height: 68px; flex-wrap: wrap !important; overflow-y: auto !important }
     .ch { flex-wrap: wrap; gap: 6px }
     .ref-name { min-width: 140px }
     .ref-row { flex-direction: column; gap: 4px }
