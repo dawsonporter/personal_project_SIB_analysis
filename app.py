@@ -1372,7 +1372,7 @@ class DashboardBuilder:
 
     def _mdd(self, id_, v=None, c="idd-m"):
         return dcc.Dropdown(id=id_, options=self._mo, value=v or self._def_metric,
-                            clearable=False, optionHeight=48, className=c,
+                            clearable=False, optionHeight=56, className=c,
                             placeholder="Search metrics...")
 
     def _window_bounds(self, y, end=None, bank_filter=None):
@@ -1499,11 +1499,10 @@ class DashboardBuilder:
         return html.Div([
             html.Div([
                 html.Div([
-                    html.Span("FDIC Data Scope", className="scope-title"),
+                    html.Span("FDIC Data Scope", className="scope-title scope-title-pill"),
                     html.Span(f"{PEER_UNIVERSE_LABEL} · {len(BANK_INFO)} banks · {len(METRIC_ORDER)} metrics",
                               className="scope-meta"),
                 ], className="scope-title-wrap"),
-                html.Span("Source + comparability caveats", className="scope-chip"),
             ], className="scope-hdr"),
             html.Div([
                 html.Div([
@@ -2303,9 +2302,9 @@ body {
 }
 .scope-hdr { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 7px }
 .scope-title-wrap { display: flex; align-items: baseline; gap: 9px; min-width: 0 }
-.scope-title { font-size: 0.72rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.75px; color: %(primary)s; white-space: nowrap }
-.scope-meta { font-size: 0.62rem; font-weight: 600; color: %(text3)s; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
-.scope-chip { font-size: 0.56rem; font-weight: 700; letter-spacing: 0.45px; text-transform: uppercase; color: %(primary)s; background: #fff; border: 1px solid rgba(0,94,184,0.12); border-radius: 999px; padding: 3px 8px; white-space: nowrap; flex-shrink: 0 }
+.scope-title { font-size: 0.74rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.75px; color: %(primary)s; white-space: nowrap }
+.scope-title-pill { background: #fff; border: 1px solid rgba(0,94,184,0.16); border-radius: 999px; padding: 5px 12px; box-shadow: 0 1px 2px rgba(0,94,184,0.06); flex-shrink: 0 }
+.scope-meta { font-size: 0.63rem; font-weight: 600; color: %(text3)s; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
 .scope-lines { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px 12px }
 .scope-line { display: flex; align-items: baseline; gap: 7px; min-width: 0; line-height: 1.35 }
 .scope-k { font-size: 0.58rem; font-weight: 800; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.55px; white-space: nowrap; flex-shrink: 0 }
@@ -2368,30 +2367,30 @@ body {
 .ct { font-size: 0.78rem; font-weight: 700; color: %(text)s; margin: 0; white-space: nowrap; flex-shrink: 0; letter-spacing: -0.005em }
 .rng { font-size: 0.62rem; color: %(text2)s; white-space: nowrap; margin-left: auto }
 .vs { font-size: 0.64rem; color: %(light)s; font-weight: 500; flex-shrink: 0 }
-.idd-m { width: 500px !important; flex-shrink: 0 }
+.idd-m { width: 530px !important; flex-shrink: 0 }
 .idd-m .Select-control, .idd-m2 .Select-control {
-    min-height: 26px !important; border-radius: 7px !important;
+    min-height: 30px !important; border-radius: 7px !important;
     background: %(hover_bg)s !important; border-color: rgba(15,23,42,0.07) !important; transition: all 0.15s ease;
 }
 .idd-m .Select-control:hover, .idd-m2 .Select-control:hover { border-color: rgba(14,62,27,0.3) !important; background: #fff !important }
-.idd-m .Select-value, .idd-m2 .Select-value { line-height: 26px !important }
-.idd-m .Select-value-label, .idd-m2 .Select-value-label { font-size: 0.64rem !important; font-weight: 500 !important }
-.metric-opt { display: flex; align-items: center; gap: 6px; min-width: 0; width: 100%%; height: 24px; overflow: hidden }
-.metric-opt-dot { width: 6px; height: 6px; border-radius: 999px; flex-shrink: 0; opacity: 0.9 }
-.metric-opt-cat { font-size: 0.48rem; font-weight: 800; letter-spacing: 0.30px; text-transform: uppercase; border-radius: 999px; padding: 2px 6px; line-height: 1.1; flex-shrink: 0; border: 1px solid rgba(15,23,42,0.04); white-space: nowrap }
-.metric-opt-name { font-size: 0.64rem; font-weight: 600; color: %(text)s; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
-.idd-m .Select-value-label .metric-opt, .idd-m2 .Select-value-label .metric-opt { height: 24px }
-.idd-m .Select-value-label .metric-opt-cat, .idd-m2 .Select-value-label .metric-opt-cat { font-size: 0.45rem; padding: 2px 5px }
-.idd-m .Select-value-label .metric-opt-name, .idd-m2 .Select-value-label .metric-opt-name { font-size: 0.62rem; font-weight: 600 }
-.idd-m .Select-placeholder, .idd-m2 .Select-placeholder { font-size: 0.64rem !important }
-.idd-m .Select-input > input, .idd-m2 .Select-input > input { font-size: 0.64rem !important }
-.idd-m2 { width: 425px !important }
+.idd-m .Select-value, .idd-m2 .Select-value { line-height: 30px !important }
+.idd-m .Select-value-label, .idd-m2 .Select-value-label { font-size: 0.70rem !important; font-weight: 600 !important }
+.metric-opt { display: flex; align-items: center; gap: 7px; min-width: 0; width: 100%%; height: 28px; overflow: hidden }
+.metric-opt-dot { width: 7px; height: 7px; border-radius: 999px; flex-shrink: 0; opacity: 0.9 }
+.metric-opt-cat { font-size: 0.56rem; font-weight: 800; letter-spacing: 0.28px; text-transform: uppercase; border-radius: 999px; padding: 3px 8px; line-height: 1.08; flex-shrink: 0; border: 1px solid rgba(15,23,42,0.04); white-space: nowrap }
+.metric-opt-name { font-size: 0.72rem; font-weight: 650; color: %(text)s; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.idd-m .Select-value-label .metric-opt, .idd-m2 .Select-value-label .metric-opt { height: 28px }
+.idd-m .Select-value-label .metric-opt-cat, .idd-m2 .Select-value-label .metric-opt-cat { font-size: 0.52rem; padding: 3px 7px }
+.idd-m .Select-value-label .metric-opt-name, .idd-m2 .Select-value-label .metric-opt-name { font-size: 0.69rem; font-weight: 650 }
+.idd-m .Select-placeholder, .idd-m2 .Select-placeholder { font-size: 0.70rem !important }
+.idd-m .Select-input > input, .idd-m2 .Select-input > input { font-size: 0.70rem !important }
+.idd-m2 { width: 455px !important }
 .idd-t { width: 194px !important; min-width: 194px !important; flex-shrink: 0 }
-.idd-t .Select-control { min-height: 26px !important; border-radius: 7px !important; background: %(hover_bg)s !important; border-color: rgba(15,23,42,0.07) !important }
-.idd-t .Select-value { line-height: 26px !important }
-.idd-t .Select-value-label { font-size: 0.64rem !important; font-weight: 600 !important; color: %(primary)s !important; white-space: nowrap !important; overflow: visible !important; text-overflow: unset !important }
+.idd-t .Select-control { min-height: 30px !important; border-radius: 7px !important; background: %(hover_bg)s !important; border-color: rgba(15,23,42,0.07) !important }
+.idd-t .Select-value { line-height: 30px !important }
+.idd-t .Select-value-label { font-size: 0.68rem !important; font-weight: 600 !important; color: %(primary)s !important; white-space: nowrap !important; overflow: visible !important; text-overflow: unset !important }
 .idd-d { width: 165px !important; flex-shrink: 0 }
-.idd-d .Select-control { min-height: 26px !important; border-radius: 7px !important; background: %(hover_bg)s !important; border-color: rgba(15,23,42,0.07) !important }
+.idd-d .Select-control { min-height: 30px !important; border-radius: 7px !important; background: %(hover_bg)s !important; border-color: rgba(15,23,42,0.07) !important }
 .idd-d .Select-value { line-height: 26px !important }
 .idd-d .Select-value-label { font-size: 0.64rem !important; font-weight: 600 !important; color: %(primary)s !important }
 .idd-d-light { width: 165px !important; flex-shrink: 0 }
@@ -2478,7 +2477,7 @@ body {
 .Select-control:hover { border-color: %(primary)s !important }
 .is-focused .Select-control { border-color: %(primary)s !important; box-shadow: 0 0 0 3px %(accent_light)s !important }
 .Select-menu-outer { border-radius: 9px !important; box-shadow: 0 6px 24px rgba(15,23,42,0.12), 0 2px 6px rgba(15,23,42,0.06) !important; border: 1px solid rgba(15,23,42,0.06) !important; margin-top: 4px !important; overflow: hidden }
-.Select-option { font-size: 0.64rem !important; padding: 7px 11px !important; transition: background 0.1s ease }
+.Select-option { font-size: 0.70rem !important; padding: 8px 12px !important; transition: background 0.1s ease }
 .Select-option.is-focused { background: %(accent_light)s !important }
 .Select-option.is-selected { background: %(primary)s !important; color: #fff !important }
 .Select-option.is-selected .metric-opt-name { color: #fff !important }
@@ -2489,8 +2488,8 @@ body {
 @media (max-width: 1100px) { .exec-grid { grid-template-columns: repeat(3, 1fr) } }
 @media (max-width: 992px) {
     .main { padding: 10px 16px }
-    .idd-m { width: 420px !important }
-    .idd-m2 { width: 360px !important }
+    .idd-m { width: 450px !important }
+    .idd-m2 { width: 390px !important }
     .idd-t { width: 176px !important; min-width: 176px !important }
     .exec-grid { grid-template-columns: repeat(3, 1fr); gap: 8px }
     .exec-card { padding: 10px 11px }
