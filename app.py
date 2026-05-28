@@ -1307,7 +1307,7 @@ class DashboardBuilder:
         self._do = [{'label': d.strftime('%m/%d/%Y'), 'value': d.strftime('%Y-%m-%d')}
                     for d in reversed(self.dates)]
         self._to = (
-            [{'label': f'{y} Yr', 'value': y} for y in [1, 2, 3, 4, 5, 7, 10, 15, 20, 25]]
+            [{'label': f'{y} Yr', 'value': y} for y in [1, 2, 3, 4, 5, 7, 10, 15, 20]]
             + [{'label': 'Full History', 'value': 'FULL'}]
         )
         self._def_metric = 'Return on Assets' if 'Return on Assets' in self.metrics else self.metrics[0]
