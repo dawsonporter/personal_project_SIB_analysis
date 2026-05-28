@@ -1589,7 +1589,7 @@ class DashboardBuilder:
                             dbc.Col(html.Div([
                                 html.Div([
                                     html.H6("Peer Trend", className="ct"),
-                                    html.Span("Same metric through the selected as-of date", className="section-title-note"),
+                                    html.Span("Same metric through selected as-of date · hover one line at a time", className="section-title-note"),
                                     html.Div(style={"flex": "1"}),
                                     self._tdd('r2t'),
                                     html.Span(id='r2r', className="rng")
@@ -2022,22 +2022,32 @@ class DashboardBuilder:
                                      fillcolor='rgba(148,163,184,0.10)',
                                      showlegend=False, hoverinfo='skip'))
         ispct = is_percent_metric(m)
+        metric_label = m if len(m) <= 54 else m[:51] + "..."
         for b in pv.columns:
             ig = b == self.GHB
             hover_vals = [fmt_val(v, m, with_unit=True) for v in pv[b]]
-            ht = '<b>' + b + '</b><br>%{x|%m/%d/%Y}<br>%{customdata}<extra></extra>'
+            hover_role = "JPM Benchmark" if ig else "Selected Peer"
+            ht = (f'<b>{b}</b><br>'
+                  f'<span style="color:{CS["text3"]}">{hover_role}</span><br>'
+                  f'%{{x|%m/%d/%Y}}<br>'
+                  f'{metric_label}: <b>%{{customdata}}</b><extra></extra>')
             fig.add_trace(go.Scatter(x=pv.index, y=pv[b], customdata=hover_vals, mode='lines', name=b,
                                      line=dict(color=CS['ghb'] if ig else CS['peer'],
-                                               width=2.5 if ig else 1.2, shape='spline'),
+                                               width=2.8 if ig else 1.15, shape='spline'),
                                      opacity=1 if ig else CS['peer_op'], hovertemplate=ht))
         dt, tick_fmt = self._axis_for_window(start, end)
         tfmt = ',.0f' if isdol else '.2f'
         y_title = '$000s' if isdol else ('%' if ispct else None)
         fig.update_layout(**self._bl(
-            showlegend=False, hovermode='x unified',
+            showlegend=False,
+            # Closest-line hover keeps the tooltip readable when many SIB peers are selected.
+            # Cross-peer context is intentionally carried by the Trend Stats panel instead.
+            hovermode='closest', hoverdistance=18, spikedistance=1000,
             margin=dict(l=48, r=12, t=6, b=40),
             xaxis=dict(showgrid=False, tickformat=tick_fmt,
-                       dtick=dt, tickangle=-35, tickfont=dict(size=9)),
+                       dtick=dt, tickangle=-35, tickfont=dict(size=9),
+                       showspikes=True, spikemode='across', spikesnap='cursor',
+                       spikecolor=CS['border_strong'], spikethickness=1),
             yaxis=dict(title_text=y_title, title_font=dict(size=9, color=CS['text3']),
                        showgrid=True, gridcolor=CS['grid'], tickformat=tfmt,
                        tickfont=dict(size=9), zeroline=True, zerolinecolor=CS['border_strong'])))
