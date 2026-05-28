@@ -46,6 +46,17 @@ PAIRED_GRAPH_HEIGHT = 340
 PAIRED_CARD_MIN_HEIGHT = 432
 OVERVIEW_GAUGE_SIZE = 78
 
+# Charts are intentionally read-only from a viewport perspective. Users can
+# still hover for values, but scroll/drag zoom is disabled to avoid accidental
+# range changes and confusing reset behavior.
+GRAPH_CONFIG = {
+    'displayModeBar': False,
+    'scrollZoom': False,
+    'doubleClick': False,
+    'showTips': False,
+    'responsive': True,
+}
+
 # 45 days: safely below the ~90-day quarter gap so closest-match prior-period
 # lookups can never grab an adjacent quarter. See compute_period_deltas.
 PRIOR_PERIOD_TOLERANCE_DAYS = 45
@@ -1570,7 +1581,7 @@ class DashboardBuilder:
                                     html.Span("Point-in-time peer ranking and distribution", className="section-title-note")
                                 ], className="ch ch-wrap"),
                                 html.Div([
-                                    dcc.Loading(dcc.Graph(id='r1c', config={'displayModeBar': False},
+                                    dcc.Loading(dcc.Graph(id='r1c', config=GRAPH_CONFIG,
                                                           style=chart_style, className="viz-graph"),
                                                 type="dot", color=CS['primary'])
                                 ], className="viz-shell"),
@@ -1589,13 +1600,13 @@ class DashboardBuilder:
                             dbc.Col(html.Div([
                                 html.Div([
                                     html.H6("Peer Trend", className="ct"),
-                                    html.Span("Same metric through selected as-of date · hover one line at a time", className="section-title-note"),
+                                    html.Span("Same metric through selected as-of date", className="section-title-note"),
                                     html.Div(style={"flex": "1"}),
                                     self._tdd('r2t'),
                                     html.Span(id='r2r', className="rng")
                                 ], className="ch ch-wrap"),
                                 html.Div([
-                                    dcc.Loading(dcc.Graph(id='r2c', config={'displayModeBar': False},
+                                    dcc.Loading(dcc.Graph(id='r2c', config=GRAPH_CONFIG,
                                                           style=chart_style, className="viz-graph"),
                                                 type="dot", color=CS['primary'])
                                 ], className="viz-shell"),
@@ -1638,7 +1649,7 @@ class DashboardBuilder:
                                 html.Span("Compares the selected metrics over the chosen timeline", className="section-title-note")
                             ], className="ch ch-wrap"),
                             html.Div([
-                                dcc.Loading(dcc.Graph(id='r3c', config={'displayModeBar': False},
+                                dcc.Loading(dcc.Graph(id='r3c', config=GRAPH_CONFIG,
                                                       style=chart_style, className="viz-graph"),
                                             type="dot", color=CS['primary'])
                             ], className="viz-shell"),
@@ -1835,15 +1846,23 @@ class DashboardBuilder:
                                              font=dict(size=13, color=CS['text2']))],
                           xaxis=dict(visible=False), yaxis=dict(visible=False),
                           plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
-                          margin=dict(l=20, r=20, t=20, b=20))
-        return fig
+                          margin=dict(l=20, r=20, t=20, b=20), dragmode=False)
+        return self._lock_chart_view(fig)
 
     def _bl(self, **kw):
         return dict(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
                     font=dict(family="'Inter',sans-serif", color=CS['text'], size=11),
                     hoverlabel=dict(bgcolor="white", font_size=11, font_color=CS['text'],
                                     font_family="'Inter',sans-serif", bordercolor=CS['border']),
+                    # Prevent drag-to-zoom/select interactions while preserving hover.
+                    dragmode=False,
                     **kw)
+
+    def _lock_chart_view(self, fig):
+        """Disable axis zoom/pan on dashboard charts while preserving hover tooltips."""
+        fig.update_xaxes(fixedrange=True)
+        fig.update_yaxes(fixedrange=True)
+        return fig
 
     def _bar(self, df, m, dt):
         isdol = is_dollar_metric(m)
@@ -1898,7 +1917,7 @@ class DashboardBuilder:
                        gridcolor=CS['grid'], showline=False, tickfont=dict(size=9.5),
                        zeroline=True, zerolinecolor=CS['border_strong']),
             bargap=0.35))
-        return fig
+        return self._lock_chart_view(fig)
 
     def _ov(self, df, m, dt):
         isdol = is_dollar_metric(m)
@@ -2040,8 +2059,6 @@ class DashboardBuilder:
         y_title = '$000s' if isdol else ('%' if ispct else None)
         fig.update_layout(**self._bl(
             showlegend=False,
-            # Closest-line hover keeps the tooltip readable when many SIB peers are selected.
-            # Cross-peer context is intentionally carried by the Trend Stats panel instead.
             hovermode='closest', hoverdistance=18, spikedistance=1000,
             margin=dict(l=48, r=12, t=6, b=40),
             xaxis=dict(showgrid=False, tickformat=tick_fmt,
@@ -2051,7 +2068,7 @@ class DashboardBuilder:
             yaxis=dict(title_text=y_title, title_font=dict(size=9, color=CS['text3']),
                        showgrid=True, gridcolor=CS['grid'], tickformat=tfmt,
                        tickfont=dict(size=9), zeroline=True, zerolinecolor=CS['border_strong'])))
-        return fig
+        return self._lock_chart_view(fig)
 
     def _ta(self, bk, m, y, end_date=None):
         isdol = is_dollar_metric(m)
@@ -2180,7 +2197,7 @@ class DashboardBuilder:
                          tickformat=tfmt2, showgrid=False,
                          tickfont=dict(size=9, color=CS['ghb2']), zeroline=True,
                          zerolinecolor=CS['border_strong'], secondary_y=True)
-        return fig
+        return self._lock_chart_view(fig)
 
     def _corr(self, m1, m2, y):
         g = self.df[self.df['Bank'] == self.GHB].copy()
