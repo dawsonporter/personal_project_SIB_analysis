@@ -1477,10 +1477,10 @@ class DashboardBuilder:
 
     def _missing_data_banner(self):
         scope_lines = [
-            ("Source", "FDIC BankFind API financials endpoint; UBPR-style concepts and dashboard-computed peer metrics."),
+            ("Source", "FDIC BankFind API financials endpoint."),
             ("History", f"FDIC financial history begins with the {REQUESTED_START_DATE_DISPLAY} report period."),
-            ("Peer comparability", f"The first all-loaded-bank common reporting period is {COMMON_FULL_PEER_START_DATE_DISPLAY}; before that, peer coverage varies by charter/history."),
-            ("Peer math", "Averages, ranks, percentiles, and selected-peer counts use only banks with real FDIC data for the selected date/window."),
+            ("Peer coverage", f"Full common peer coverage starts {COMMON_FULL_PEER_START_DATE_DISPLAY}; before that, coverage varies by charter/history."),
+            ("Peer math", "Stats use only banks with real data for the selected date/window."),
         ]
         if self.common_start_date is not None and self.analysis_start_date is not None:
             computed_common = pd.Timestamp(self.common_start_date).strftime('%m/%d/%Y')
@@ -1491,7 +1491,7 @@ class DashboardBuilder:
         if self.missing_banks:
             missing = ', '.join(self.missing_banks)
             scope_lines.append(
-                ("Missing banks", f"{missing}. Peer averages, ranks, percentiles, and selected-peer counts exclude those banks until a complete FDIC fetch succeeds."))
+                ("Missing banks", f"{missing}. Stats exclude these banks until a complete FDIC fetch succeeds."))
         if (self.raw_latest_date is not None and self.analysis_end_date is not None
                 and pd.Timestamp(self.raw_latest_date) > pd.Timestamp(self.analysis_end_date)):
             scope_lines.append(
@@ -1679,10 +1679,12 @@ class DashboardBuilder:
                 html.Div([
                     self._missing_data_banner(),
                     html.Div([
-                        html.Span("Dashboard notes", className="dashboard-footer-label"),
-                        html.Span(f"Metric definitions use UBPR-style concepts across {len(METRIC_CATEGORIES)} categories; concept code reference: ffiec.gov/data/ubpr/report-user-guide. "
-                                  f"Source detail, history window, and peer-comparability assumptions are summarized above.",
-                                  className="dashboard-footer-text")
+                        html.Div("Dashboard notes", className="dashboard-footer-label"),
+                        html.Div([
+                            html.Span("Metrics follow UBPR-style definitions across "),
+                            html.Span(f"{len(METRIC_CATEGORIES)} categories", className="dashboard-footer-emph"),
+                            html.Span(". Peer ranks, percentiles, volatility, and correlation stats are dashboard-computed comparisons."),
+                        ], className="dashboard-footer-text")
                     ], className="dashboard-footer-note"),
                 ], className="dashboard-footer"),
             ], className="main")
@@ -2382,9 +2384,10 @@ body {
 .scope-line { display: flex; align-items: baseline; gap: 8px; min-width: 0; line-height: 1.38 }
 .scope-k { font-size: 0.57rem; font-weight: 850; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.58px; white-space: nowrap; flex-shrink: 0 }
 .scope-v { font-size: 0.68rem; color: %(text2)s; min-width: 0 }
-.dashboard-footer-note { margin-top: 11px; padding-top: 10px; border-top: 1px solid rgba(15,23,42,0.06); display: flex; align-items: baseline; justify-content: center; gap: 8px; text-align: center; flex-wrap: wrap }
-.dashboard-footer-label { font-size: 0.56rem; font-weight: 850; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.65px }
-.dashboard-footer-text { font-size: 0.64rem; color: %(text3)s; letter-spacing: 0.15px; line-height: 1.45 }
+.dashboard-footer-note { margin-top: 12px; padding-top: 11px; border-top: 1px solid rgba(15,23,42,0.06); display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: baseline; gap: 8px 11px; text-align: left }
+.dashboard-footer-label { font-size: 0.58rem; font-weight: 850; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.68px; white-space: nowrap }
+.dashboard-footer-text { font-size: 0.66rem; color: %(text3)s; letter-spacing: 0.10px; line-height: 1.45; min-width: 0 }
+.dashboard-footer-emph { color: %(text2)s; font-weight: 760 }
 
 .peer-performance-card { margin-bottom: 14px; overflow: visible; background: linear-gradient(180deg, #fff 0%%, #fbfdff 100%%); border-color: rgba(0,94,184,0.10) }
 .peer-perf-top { display: flex; flex-direction: column; align-items: stretch; gap: 11px; padding: 14px 16px 13px; background: linear-gradient(135deg, rgba(0,94,184,0.08) 0%%, rgba(213,228,242,0.52) 100%%); border-bottom: 1px solid rgba(0,94,184,0.10); border-radius: 12px 12px 0 0 }
@@ -2480,13 +2483,13 @@ body {
 .vs { font-size: 0.64rem; color: %(light)s; font-weight: 500; flex-shrink: 0 }
 .section-title-note { font-size: 0.64rem; color: %(text3)s; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0 }
 .jpm-corr-card { margin-bottom: 14px; overflow: visible; background: linear-gradient(180deg, #fff 0%%, #fbfdff 100%%); border-color: rgba(0,94,184,0.10) }
-.corr-header-grid { width: 100%%; min-width: 0; display: grid; grid-template-columns: minmax(255px, 0.48fr) minmax(0, 1.72fr); gap: 14px; align-items: center; padding: 10px 14px; background: linear-gradient(135deg, rgba(0,94,184,0.08) 0%%, rgba(213,228,242,0.50) 100%%); border-bottom: 1px solid rgba(0,94,184,0.10); border-radius: 12px 12px 0 0 }
+.corr-header-grid { width: 100%%; min-width: 0; display: grid; grid-template-columns: minmax(245px, 0.42fr) minmax(0, 1.82fr); gap: 14px; align-items: center; padding: 10px 14px; background: linear-gradient(135deg, rgba(0,94,184,0.08) 0%%, rgba(213,228,242,0.50) 100%%); border-bottom: 1px solid rgba(0,94,184,0.10); border-radius: 12px 12px 0 0 }
 .corr-title-block { min-width: 0; display: flex; align-items: center; justify-content: flex-start; gap: 2px; height: 100%% }
 .corr-title-eyebrow { font-size: 0.58rem; font-weight: 850; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.68px; white-space: nowrap }
 .corr-title-main { font-size: 0.90rem; font-weight: 850; color: %(text)s; letter-spacing: -0.012em; line-height: 1.1; white-space: nowrap }
 .corr-control-grid { width: 100%%; min-width: 0; display: flex; flex-wrap: wrap; gap: 9px 11px; align-items: flex-end; justify-content: flex-end }
 .corr-control-grid .peer-control { gap: 4px }
-.corr-control-metric { flex: 1 1 300px; min-width: 260px; max-width: 430px }
+.corr-control-metric { flex: 1 1 330px; min-width: 290px; max-width: 480px }
 .corr-control-timeline { flex: 0 0 194px; min-width: 176px }
 .corr-metric-dd { width: 100%% !important; min-width: 0 !important; flex-shrink: 1 }
 .corr-control-timeline .idd-t { width: 100%% !important; min-width: 0 !important }
@@ -2622,7 +2625,7 @@ body {
     .corr-header-grid { grid-template-columns: 1fr; gap: 10px; align-items: start }
     .corr-title-block { min-height: 0 }
     .corr-control-grid { justify-content: flex-start; gap: 9px 10px }
-    .corr-control-metric { flex: 1 1 320px; max-width: none }
+    .corr-control-metric { flex: 1 1 350px; max-width: none }
     .corr-control-timeline { flex: 0 0 194px }
 }
 @media (max-width: 992px) {
@@ -2664,7 +2667,7 @@ body {
     .scope-meta { white-space: normal }
     .scope-lines { grid-template-columns: 1fr; gap: 7px }
     .scope-line { flex-direction: column; gap: 1px }
-    .dashboard-footer-note { justify-content: flex-start; text-align: left }
+    .dashboard-footer-note { grid-template-columns: 1fr; gap: 4px; text-align: left }
 }
 """ % c
         return '<!DOCTYPE html>\n<html><head>{%metas%}<title>{%title%}</title>{%favicon%}{%css%}<style>' + css + '</style></head>\n<body>{%app_entry%}<footer>{%config%}{%scripts%}{%renderer%}</footer></body></html>'
