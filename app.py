@@ -233,6 +233,18 @@ CATEGORY_BG = {
     "Credit Concentration": "#f8fafc", "Growth": "#eef2ff",
 }
 
+CATEGORY_SHORT_LABELS = {
+    "Earnings & Profitability": "Earnings",
+    "Efficiency & Margin": "Margin",
+    "Capitalization": "Capital",
+    "Asset Quality": "Asset Quality",
+    "Loan & Lease Analysis": "Loans",
+    "Funding & Liquidity": "Funding",
+    "Credit Concentration": "Concentration",
+    "Growth": "Growth",
+    "Key Financials": "Financials",
+}
+
 INVERSE_METRICS = {
     'Efficiency Ratio', 'Interest Expense to Average Assets',
     'Cost of Funding Earning Assets', 'Noninterest Expense to Average Assets',
@@ -1240,6 +1252,28 @@ class DashboardBuilder:
     GHB = PRIMARY_BANK_DISPLAY_NAME
     SPARK_LOOKBACK = 12
 
+    @staticmethod
+    def _metric_option(metric):
+        """Build a category-aware dropdown option for metric selectors.
+
+        Dash supports component labels in dcc.Dropdown on modern versions. The
+        search string keeps typing behavior intuitive even though the visible
+        label is a compact chip + metric name.
+        """
+        cat = METRIC_TO_CATEGORY.get(metric, "Other")
+        short_cat = CATEGORY_SHORT_LABELS.get(cat, cat)
+        accent = CATEGORY_ACCENTS.get(cat, CS['primary'])
+        bg = CATEGORY_BG.get(cat, CS['neutral_light'])
+        return {
+            'label': html.Div([
+                html.Span("", className="metric-opt-dot", style={'backgroundColor': accent}),
+                html.Span(short_cat, className="metric-opt-cat", style={'color': accent, 'backgroundColor': bg}),
+                html.Span(metric, className="metric-opt-name"),
+            ], className="metric-opt"),
+            'value': metric,
+            'search': f"{metric} {cat} {short_cat}",
+        }
+
     def __init__(self, df, missing_banks=None):
         self.df = df
         self.missing_banks = sorted(missing_banks or [])
@@ -1269,7 +1303,7 @@ class DashboardBuilder:
 
         self.metrics = [m for m in METRIC_ORDER if m in df.columns]
         self.peers = sorted(set(df['Bank'].unique()) - {self.GHB})
-        self._mo = [{'label': m, 'value': m} for m in self.metrics]
+        self._mo = [self._metric_option(m) for m in self.metrics]
         self._do = [{'label': d.strftime('%m/%d/%Y'), 'value': d.strftime('%Y-%m-%d')}
                     for d in reversed(self.dates)]
         self._to = (
@@ -1439,34 +1473,45 @@ class DashboardBuilder:
         ], className="exec-banner")
 
     def _missing_data_banner(self):
-        messages = [
-            f"Requested FDIC financial history begins with the {REQUESTED_START_DATE_DISPLAY} report period. "
-            "Date selectors follow JPMorgan's available reporting history so the pre-crisis data is not hidden. "
-            "Peer averages, ranks, and percentiles automatically use only peers with real FDIC data for the selected date/window. "
-            f"The first all-loaded-bank common reporting period is {COMMON_FULL_PEER_START_DATE_DISPLAY}; "
-            "before that, peer coverage varies by charter/history."
+        scope_lines = [
+            ("Source", "FDIC BankFind API financials endpoint; UBPR-style concepts and dashboard-computed peer metrics."),
+            ("History", f"Requested FDIC financial history begins with the {REQUESTED_START_DATE_DISPLAY} report period. Date selectors follow JPMorgan's available reporting history so the pre-crisis data is not hidden."),
+            ("Peer comparability", f"The first all-loaded-bank common reporting period is {COMMON_FULL_PEER_START_DATE_DISPLAY}; before that, peer coverage varies by charter/history."),
+            ("Peer math", "Averages, ranks, percentiles, and selected-peer counts use only banks with real FDIC data for the selected date/window."),
         ]
         if self.common_start_date is not None and self.analysis_start_date is not None:
             computed_common = pd.Timestamp(self.common_start_date).strftime('%m/%d/%Y')
             if (pd.Timestamp(self.common_start_date) > pd.Timestamp(self.analysis_start_date)
                     and computed_common != COMMON_FULL_PEER_START_DATE_DISPLAY):
-                messages.append(
-                    "Current loaded data common-period check: all currently loaded banks share data beginning "
-                    f"{computed_common}.")
+                scope_lines.append(
+                    ("Loaded-data check", f"All currently loaded banks share data beginning {computed_common}."))
         if self.missing_banks:
             missing = ', '.join(self.missing_banks)
-            messages.append(
-                f"Missing banks: {missing}. Peer averages, ranks, percentiles, "
-                "and selected-peer counts exclude those banks until a complete "
-                "FDIC fetch succeeds.")
+            scope_lines.append(
+                ("Missing banks", f"{missing}. Peer averages, ranks, percentiles, and selected-peer counts exclude those banks until a complete FDIC fetch succeeds."))
         if (self.raw_latest_date is not None and self.analysis_end_date is not None
                 and pd.Timestamp(self.raw_latest_date) > pd.Timestamp(self.analysis_end_date)):
-            messages.append(
-                "JPMorgan's latest available report period is "
-                f"{pd.Timestamp(self.analysis_end_date).strftime('%m/%d/%Y')}; "
-                f"the raw FDIC peer set includes a newer period of {pd.Timestamp(self.raw_latest_date).strftime('%m/%d/%Y')}.")
-        return html.Div([html.Strong("FDIC data scope note. "), html.Span(" ".join(messages))],
-                        className="warn-banner")
+            scope_lines.append(
+                ("Latest-period lag", "JPMorgan's latest available report period is "
+                 f"{pd.Timestamp(self.analysis_end_date).strftime('%m/%d/%Y')}; "
+                 f"the raw FDIC peer set includes a newer period of {pd.Timestamp(self.raw_latest_date).strftime('%m/%d/%Y')}."))
+
+        return html.Div([
+            html.Div([
+                html.Div([
+                    html.Span("FDIC Data Scope", className="scope-title"),
+                    html.Span(f"{PEER_UNIVERSE_LABEL} · {len(BANK_INFO)} banks · {len(METRIC_ORDER)} metrics",
+                              className="scope-meta"),
+                ], className="scope-title-wrap"),
+                html.Span("Source + comparability caveats", className="scope-chip"),
+            ], className="scope-hdr"),
+            html.Div([
+                html.Div([
+                    html.Span(k, className="scope-k"),
+                    html.Span(v, className="scope-v"),
+                ], className="scope-line") for k, v in scope_lines
+            ], className="scope-lines")
+        ], className="data-scope-banner")
 
     def _layout(self):
         dv = self._do[0]['value'] if self._do else None
@@ -1590,9 +1635,8 @@ class DashboardBuilder:
                 ], className="mb-4"),
                 self._reference_section(),
                 html.Div([
-                    html.Span(f"Data via FDIC BankFind API · requested history since {REQUESTED_START_DATE_DISPLAY} · {PEER_UNIVERSE_LABEL} · {len(METRIC_ORDER)} metrics "
-                              f"\u00b7 {len(METRIC_CATEGORIES)} categories "
-                              f"\u00b7 UBPR concept codes verified via ffiec.gov/data/ubpr/report-user-guide",
+                    html.Span(f"Metric definitions use UBPR-style concepts · {len(METRIC_CATEGORIES)} categories · "
+                              f"concept code reference: ffiec.gov/data/ubpr/report-user-guide",
                               className="foot-txt")
                 ], className="foot"),
             ], className="main")
@@ -2252,12 +2296,20 @@ body {
 .tb-btn-secondary { background: %(neutral_light)s; color: %(text2)s; box-shadow: 0 1px 2px rgba(15,23,42,0.05) }
 .tb-btn-secondary:hover { background: %(lighter)s; color: %(text)s }
 .main { padding: 14px 28px 28px; max-width: 1600px; margin: 0 auto }
-.warn-banner {
-    margin: 0 0 14px; padding: 10px 14px; border-radius: 12px;
-    border: 1px solid %(warn)s; background: %(warn_light)s; color: %(warn_dark)s;
-    font-size: 0.74rem; line-height: 1.45; box-shadow: 0 1px 2px rgba(15,23,42,0.03);
+.data-scope-banner {
+    margin: 0 0 14px; padding: 11px 14px 12px; border-radius: 12px;
+    border: 1px solid rgba(0,94,184,0.14); background: linear-gradient(180deg, #ffffff 0%%, %(accent_light)s 100%%);
+    color: %(text)s; box-shadow: 0 1px 2px rgba(15,23,42,0.03), 0 4px 14px rgba(0,94,184,0.035);
 }
-.warn-banner strong { font-weight: 800 }
+.scope-hdr { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 7px }
+.scope-title-wrap { display: flex; align-items: baseline; gap: 9px; min-width: 0 }
+.scope-title { font-size: 0.72rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.75px; color: %(primary)s; white-space: nowrap }
+.scope-meta { font-size: 0.62rem; font-weight: 600; color: %(text3)s; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.scope-chip { font-size: 0.56rem; font-weight: 700; letter-spacing: 0.45px; text-transform: uppercase; color: %(primary)s; background: #fff; border: 1px solid rgba(0,94,184,0.12); border-radius: 999px; padding: 3px 8px; white-space: nowrap; flex-shrink: 0 }
+.scope-lines { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px 12px }
+.scope-line { display: flex; align-items: baseline; gap: 7px; min-width: 0; line-height: 1.35 }
+.scope-k { font-size: 0.58rem; font-weight: 800; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.55px; white-space: nowrap; flex-shrink: 0 }
+.scope-v { font-size: 0.68rem; color: %(text2)s; min-width: 0 }
 .paired-row { --paired-card-min-height: %(paired_card_min_height)spx; margin-bottom: 0 }
 .pair-col { display: flex }
 .pair-card { width: 100%%; min-height: var(--paired-card-min-height); display: flex; flex-direction: column }
@@ -2316,7 +2368,7 @@ body {
 .ct { font-size: 0.78rem; font-weight: 700; color: %(text)s; margin: 0; white-space: nowrap; flex-shrink: 0; letter-spacing: -0.005em }
 .rng { font-size: 0.62rem; color: %(text2)s; white-space: nowrap; margin-left: auto }
 .vs { font-size: 0.64rem; color: %(light)s; font-weight: 500; flex-shrink: 0 }
-.idd-m { width: 380px !important; flex-shrink: 0 }
+.idd-m { width: 430px !important; flex-shrink: 0 }
 .idd-m .Select-control, .idd-m2 .Select-control {
     min-height: 26px !important; border-radius: 7px !important;
     background: %(hover_bg)s !important; border-color: rgba(15,23,42,0.07) !important; transition: all 0.15s ease;
@@ -2324,10 +2376,17 @@ body {
 .idd-m .Select-control:hover, .idd-m2 .Select-control:hover { border-color: rgba(14,62,27,0.3) !important; background: #fff !important }
 .idd-m .Select-value, .idd-m2 .Select-value { line-height: 26px !important }
 .idd-m .Select-value-label, .idd-m2 .Select-value-label { font-size: 0.64rem !important; font-weight: 500 !important }
+.metric-opt { display: flex; align-items: center; gap: 6px; min-width: 0; width: 100%%; height: 24px; overflow: hidden }
+.metric-opt-dot { width: 6px; height: 6px; border-radius: 999px; flex-shrink: 0; opacity: 0.9 }
+.metric-opt-cat { font-size: 0.50rem; font-weight: 800; letter-spacing: 0.38px; text-transform: uppercase; border-radius: 999px; padding: 2px 6px; line-height: 1.1; flex-shrink: 0; border: 1px solid rgba(15,23,42,0.04) }
+.metric-opt-name { font-size: 0.64rem; font-weight: 600; color: %(text)s; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.idd-m .Select-value-label .metric-opt, .idd-m2 .Select-value-label .metric-opt { height: 24px }
+.idd-m .Select-value-label .metric-opt-cat, .idd-m2 .Select-value-label .metric-opt-cat { font-size: 0.48rem; padding: 2px 5px }
+.idd-m .Select-value-label .metric-opt-name, .idd-m2 .Select-value-label .metric-opt-name { font-size: 0.62rem; font-weight: 600 }
 .idd-m .Select-placeholder, .idd-m2 .Select-placeholder { font-size: 0.64rem !important }
 .idd-m .Select-input > input, .idd-m2 .Select-input > input { font-size: 0.64rem !important }
-.idd-m2 { width: 310px !important }
-.idd-t { width: 162px !important; min-width: 162px !important; flex-shrink: 0 }
+.idd-m2 { width: 355px !important }
+.idd-t { width: 194px !important; min-width: 194px !important; flex-shrink: 0 }
 .idd-t .Select-control { min-height: 26px !important; border-radius: 7px !important; background: %(hover_bg)s !important; border-color: rgba(15,23,42,0.07) !important }
 .idd-t .Select-value { line-height: 26px !important }
 .idd-t .Select-value-label { font-size: 0.64rem !important; font-weight: 600 !important; color: %(primary)s !important; white-space: nowrap !important; overflow: visible !important; text-overflow: unset !important }
@@ -2422,14 +2481,17 @@ body {
 .Select-option { font-size: 0.64rem !important; padding: 7px 11px !important; transition: background 0.1s ease }
 .Select-option.is-focused { background: %(accent_light)s !important }
 .Select-option.is-selected { background: %(primary)s !important; color: #fff !important }
+.Select-option.is-selected .metric-opt-name { color: #fff !important }
+.Select-option.is-selected .metric-opt-cat { color: #fff !important; background: rgba(255,255,255,0.16) !important; border-color: rgba(255,255,255,0.22) !important }
+.Select-option.is-selected .metric-opt-dot { background: #fff !important }
 .dash-spinner { margin: 30px auto !important }
 @media (max-width: 1320px) { .exec-grid { grid-template-columns: repeat(4, 1fr) } }
 @media (max-width: 1100px) { .exec-grid { grid-template-columns: repeat(3, 1fr) } }
 @media (max-width: 992px) {
     .main { padding: 10px 16px }
-    .idd-m { width: 300px !important }
-    .idd-m2 { width: 240px !important }
-    .idd-t { width: 148px !important; min-width: 148px !important }
+    .idd-m { width: 360px !important }
+    .idd-m2 { width: 300px !important }
+    .idd-t { width: 176px !important; min-width: 176px !important }
     .exec-grid { grid-template-columns: repeat(3, 1fr); gap: 8px }
     .exec-card { padding: 10px 11px }
     .dr { flex-wrap: wrap }
@@ -2450,6 +2512,10 @@ body {
     .dright { gap: 6px }
     .dspark { display: none }
     .ddelta { min-width: 40px }
+    .scope-hdr { flex-direction: column; align-items: flex-start; gap: 5px }
+    .scope-title-wrap { flex-direction: column; align-items: flex-start; gap: 2px }
+    .scope-lines { grid-template-columns: 1fr; gap: 6px }
+    .scope-line { flex-direction: column; gap: 1px }
 }
 """ % c
         return '<!DOCTYPE html>\n<html><head>{%metas%}<title>{%title%}</title>{%favicon%}{%css%}<style>' + css + '</style></head>\n<body>{%app_entry%}<footer>{%config%}{%scripts%}{%renderer%}</footer></body></html>'
