@@ -30,9 +30,9 @@ except AttributeError:
     pass
 
 BASE_URL = "https://banks.data.fdic.gov/api"
-DEFAULT_START_DATE = '20000331'
+DEFAULT_START_DATE = '20081231'
 DEFAULT_END_DATE = datetime.today().strftime('%Y%m%d')
-REQUESTED_START_DATE_DISPLAY = '03/31/2000'
+REQUESTED_START_DATE_DISPLAY = '12/31/2008'
 CACHE_DIR = 'data_cache'
 os.makedirs(CACHE_DIR, exist_ok=True)
 PRIMARY_BANK_DISPLAY_NAME = "JPMorgan Chase"
@@ -70,7 +70,7 @@ CS = {
     'spark': '#005EB8', 'spark_area': 'rgba(0,94,184,0.08)',
 }
 
-CACHE_SCHEMA_VERSION = "v7_sib_jpm_20000331"
+CACHE_SCHEMA_VERSION = "v8_sib_jpm_20081231_no_comerica"
 
 BANK_INFO = [
     # Primary FDIC-insured bank charters for the selected U.S. systemically
@@ -94,7 +94,6 @@ BANK_INFO = [
     {"cert": "588",   "display": "M&T Bank"},
     {"cert": "57957", "display": "Citizens Financial"},
     {"cert": "17534", "display": "KeyCorp"},
-    {"cert": "983",   "display": "Comerica"},
     {"cert": "57803", "display": "Ally Financial"},
 ]
 
@@ -133,7 +132,6 @@ BANK_NAME_MAPPING = {
     "CITIZENS BANK, N.A.": "Citizens Financial",
     "KEYBANK NATIONAL ASSOCIATION": "KeyCorp",
     "KEYBANK N.A.": "KeyCorp",
-    "COMERICA BANK": "Comerica",
     "ALLY BANK": "Ally Financial",
 }
 
@@ -1248,13 +1246,13 @@ class DashboardBuilder:
         self.loaded_banks = sorted(set(df['Bank'].unique()))
 
         # Historical-range design note:
-        # For a 03/31/2000 start date, do NOT limit the dashboard to the date
-        # intersection across all selected banks. Several large-bank peer charters
-        # began, merged, or changed reporting histories after 2000. Using all-bank
-        # common dates would silently hide the early JPMorgan history the dashboard
-        # is meant to show. Date selectors therefore follow JPMorgan's available
-        # reporting history. Peer charts/ranks dynamically include only banks with
-        # real FDIC data on the selected date/window.
+        # The dashboard now hard-starts at 12/31/2008, which was the first
+        # all-loaded-bank common reporting period in the prior longer-history
+        # build. That avoids showing early JPMorgan-only history while peer
+        # coverage is incomplete. Date selectors use JPMorgan's available dates
+        # from this hard-start; peer stats still automatically exclude any bank
+        # without real data for a selected period/window, which protects against
+        # future mergers, missing filings, or temporary FDIC lag.
         primary_df = df[df['Bank'] == self.GHB].sort_values('Date').reset_index(drop=True)
         self._ghb_df = primary_df
         self.primary_dates = sorted(primary_df['Date'].unique())
@@ -1440,8 +1438,8 @@ class DashboardBuilder:
 
     def _missing_data_banner(self):
         messages = [
-            f"Requested FDIC financial history begins with the {REQUESTED_START_DATE_DISPLAY} report period. "
-            "Date selectors follow JPMorgan's available reporting history so the early-2000s data is not hidden. "
+            f"Dashboard analysis starts with the {REQUESTED_START_DATE_DISPLAY} report period, "
+            "which keeps the selected SIB peer universe on a cleaner common-history baseline after removing legacy Comerica. "
             "Peer averages, ranks, and percentiles automatically use only peers with real FDIC data for the selected date/window."
         ]
         if self.common_start_date is not None and self.analysis_start_date is not None:
@@ -2270,9 +2268,9 @@ body {
 }
 .card:hover { box-shadow: 0 2px 4px rgba(15,23,42,0.04), 0 8px 24px rgba(15,23,42,0.05) }
 .exec-banner {
-    margin-bottom: 14px; background: linear-gradient(135deg, #0E3E1B 0%%, #1a5c2e 100%%);
+    margin-bottom: 14px; background: linear-gradient(135deg, %(primary_dark)s 0%%, %(primary)s 55%%, %(primary_light)s 100%%);
     border-radius: 14px; padding: 1px;
-    box-shadow: 0 4px 16px rgba(14,62,27,0.15), 0 1px 3px rgba(14,62,27,0.08);
+    box-shadow: 0 4px 18px rgba(0,94,184,0.18), 0 1px 3px rgba(0,94,184,0.10);
     position: relative; overflow: hidden;
 }
 .exec-banner::before {
@@ -2280,7 +2278,7 @@ body {
     background: radial-gradient(circle at 100%% 0%%, rgba(255,255,255,0.08) 0%%, transparent 60%%);
     pointer-events: none;
 }
-.exec-banner-inner { background: linear-gradient(180deg, rgba(9,41,18,0.98) 0%%, rgba(14,62,27,1) 100%%); border-radius: 13px; padding: 16px 22px }
+.exec-banner-inner { background: linear-gradient(180deg, rgba(0,59,115,0.98) 0%%, rgba(0,94,184,0.96) 55%%, rgba(11,79,138,0.98) 100%%); border-radius: 13px; padding: 16px 22px }
 .exec-banner-hdr { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid rgba(255,255,255,0.08) }
 .exec-banner-title { font-size: 0.78rem; font-weight: 700; color: #fff; text-transform: uppercase; letter-spacing: 1.2px }
 .exec-banner-date { font-size: 0.7rem; color: rgba(255,255,255,0.6); font-weight: 500 }
@@ -2323,10 +2321,10 @@ body {
 .idd-m .Select-placeholder, .idd-m2 .Select-placeholder { font-size: 0.64rem !important }
 .idd-m .Select-input > input, .idd-m2 .Select-input > input { font-size: 0.64rem !important }
 .idd-m2 { width: 310px !important }
-.idd-t { width: 82px !important; flex-shrink: 0 }
+.idd-t { width: 128px !important; min-width: 128px !important; flex-shrink: 0 }
 .idd-t .Select-control { min-height: 26px !important; border-radius: 7px !important; background: %(hover_bg)s !important; border-color: rgba(15,23,42,0.07) !important }
 .idd-t .Select-value { line-height: 26px !important }
-.idd-t .Select-value-label { font-size: 0.64rem !important; font-weight: 600 !important; color: %(primary)s !important }
+.idd-t .Select-value-label { font-size: 0.64rem !important; font-weight: 600 !important; color: %(primary)s !important; white-space: nowrap !important }
 .idd-d { width: 165px !important; flex-shrink: 0 }
 .idd-d .Select-control { min-height: 26px !important; border-radius: 7px !important; background: %(hover_bg)s !important; border-color: rgba(15,23,42,0.07) !important }
 .idd-d .Select-value { line-height: 26px !important }
@@ -2425,6 +2423,7 @@ body {
     .main { padding: 10px 16px }
     .idd-m { width: 300px !important }
     .idd-m2 { width: 240px !important }
+    .idd-t { width: 118px !important; min-width: 118px !important }
     .exec-grid { grid-template-columns: repeat(3, 1fr); gap: 8px }
     .exec-card { padding: 10px 11px }
     .dr { flex-wrap: wrap }
