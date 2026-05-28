@@ -37,19 +37,13 @@ COMMON_FULL_PEER_START_DATE_DISPLAY = '12/31/2008'
 CACHE_DIR = 'data_cache'
 os.makedirs(CACHE_DIR, exist_ok=True)
 PRIMARY_BANK_DISPLAY_NAME = "JPMorgan Chase"
-# Use SIB in the header mark so the app does not visually imply an official JPMorgan mark/logo.
-PRIMARY_BANK_ABBR = "SIB"
+PRIMARY_BANK_ABBR = "JPM"
 PRIMARY_BANK_FDIC_NAME = "JPMorgan Chase Bank, National Association"
-DASHBOARD_TITLE = "Personal Project — JPMorgan Chase SIB Analysis"
-DASHBOARD_SHORT_TITLE = "JPMorgan Chase Benchmark Dashboard"
+DASHBOARD_TITLE = "JPMorgan Chase — Systemically Important Banks Dashboard"
+DASHBOARD_SHORT_TITLE = "SIB Dashboard"
 PEER_UNIVERSE_LABEL = "Systemically Important Banks (SIBs)"
-PROJECT_CONTEXT_LABEL = "Personal Project"
-NON_AFFILIATION_NOTICE = (
-    "Independent personal project using public FDIC BankFind API data. "
-    "Not affiliated with, sponsored by, or endorsed by JPMorgan Chase & Co., "
-    "J.P. Morgan, JPMorgan Chase Bank, N.A., or any listed bank."
-)
-HEADER_DISCLOSURE_SHORT = "Independent personal project · public FDIC data · no JPMorgan affiliation"
+HEADER_DISCLOSURE_SHORT = "Personal project · public FDIC data · not affiliated with JPMorgan Chase"
+FOOTER_DISCLOSURE_NOTE = "Independent personal project using public FDIC data; not affiliated with or endorsed by JPMorgan Chase."
 PAIRED_GRAPH_HEIGHT = 340
 PAIRED_CARD_MIN_HEIGHT = 432
 OVERVIEW_GAUGE_SIZE = 78
@@ -1542,17 +1536,17 @@ class DashboardBuilder:
                 html.Div([
                     html.Div(PRIMARY_BANK_ABBR, className="hdr-mark"),
                     html.Div([
-                        html.Div([
-                            html.Span(PROJECT_CONTEXT_LABEL, className="hdr-project-pill"),
-                            html.Span(DASHBOARD_SHORT_TITLE, className="hdr-title"),
-                        ], className="hdr-title-row"),
-                        html.Span(HEADER_DISCLOSURE_SHORT, className="hdr-sub hdr-disclaimer")
-                    ], className="hdr-copy")
+                        html.Span(PRIMARY_BANK_DISPLAY_NAME, className="hdr-title"),
+                        html.Span(DASHBOARD_SHORT_TITLE + " · " + PEER_UNIVERSE_LABEL, className="hdr-sub")
+                    ])
                 ], className="hdr-brand"),
                 html.Div([
-                    html.Span(f"FDIC API · SIB peer set · since {REQUESTED_START_DATE_DISPLAY}", className="hdr-src"),
-                    html.Span(f"\u00b7 {len(METRIC_ORDER)} metrics", className="hdr-cnt"),
-                    html.Span(f"\u00b7 {len(BANK_INFO)} banks", className="hdr-cnt")
+                    html.Div([
+                        html.Span(f"FDIC API · SIB peer set · since {REQUESTED_START_DATE_DISPLAY}", className="hdr-src"),
+                        html.Span(f"\u00b7 {len(METRIC_ORDER)} metrics", className="hdr-cnt"),
+                        html.Span(f"\u00b7 {len(BANK_INFO)} banks", className="hdr-cnt")
+                    ], className="hdr-meta-line"),
+                    html.Span(HEADER_DISCLOSURE_SHORT, className="hdr-disclaimer")
                 ], className="hdr-meta")
             ], className="hdr"),
             html.Div([
@@ -1701,13 +1695,12 @@ class DashboardBuilder:
                 html.Div([
                     self._missing_data_banner(),
                     html.Div([
-                        html.Div("Project note", className="dashboard-footer-label"),
+                        html.Div("Dashboard notes", className="dashboard-footer-label"),
                         html.Div([
-                            html.Span(NON_AFFILIATION_NOTICE),
-                            html.Br(),
                             html.Span("Metrics follow UBPR-style definitions across "),
                             html.Span(f"{len(METRIC_CATEGORIES)} categories", className="dashboard-footer-emph"),
-                            html.Span("; peer ranks, volatility, and correlations are dashboard-computed."),
+                            html.Span(". Peer ranks, percentiles, volatility, and correlation stats are dashboard-computed comparisons. "),
+                            html.Span(FOOTER_DISCLOSURE_NOTE, className="dashboard-footer-muted"),
                         ], className="dashboard-footer-text")
                     ], className="dashboard-footer-note"),
                 ], className="dashboard-footer"),
@@ -2362,30 +2355,24 @@ body {
 ::-webkit-scrollbar-thumb { background: rgba(15,23,42,0.12); border-radius: 4px }
 ::-webkit-scrollbar-thumb:hover { background: rgba(15,23,42,0.22) }
 .hdr {
-    display: flex; align-items: center; justify-content: space-between; gap: 18px;
-    padding: 11px 28px; background: rgba(255,255,255,0.94);
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 11px 28px; background: rgba(255,255,255,0.92);
     border-bottom: 1px solid rgba(15,23,42,0.06);
     position: sticky; top: 0; z-index: 20; backdrop-filter: blur(14px);
     -webkit-backdrop-filter: blur(14px);
 }
-.hdr-brand { display: flex; align-items: center; gap: 11px; min-width: 0 }
+.hdr-brand { display: flex; align-items: center; gap: 11px }
+.hdr-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; text-align: right; min-width: 0 }
+.hdr-meta-line { display: flex; align-items: center; justify-content: flex-end; white-space: nowrap; min-width: 0 }
+.hdr-disclaimer { font-size: 0.61rem; font-weight: 650; color: %(text3)s; line-height: 1.2; white-space: nowrap }
 .hdr-mark {
     width: 36px; height: 36px; background: linear-gradient(135deg, %(primary)s 0%%, %(primary_light)s 100%%);
     color: #fff; border-radius: 9px; display: flex; align-items: center; justify-content: center;
-    font-weight: 800; font-size: 10.5px; letter-spacing: 0.6px; flex-shrink: 0;
+    font-weight: 800; font-size: 10.5px; letter-spacing: 0.6px;
     box-shadow: 0 2px 6px rgba(0,94,184,0.25), inset 0 1px 0 rgba(255,255,255,0.15);
 }
-.hdr-copy { min-width: 0 }
-.hdr-title-row { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap }
-.hdr-project-pill {
-    display: inline-flex; align-items: center; padding: 3px 8px; border-radius: 999px;
-    background: %(accent_light)s; border: 1px solid rgba(0,94,184,0.16); color: %(primary)s;
-    font-size: 0.56rem; font-weight: 850; letter-spacing: 0.54px; text-transform: uppercase; white-space: nowrap;
-}
-.hdr-title { font-size: 0.98rem; font-weight: 750; color: %(primary)s; line-height: 1.15; display: block; letter-spacing: -0.01em }
+.hdr-title { font-size: 0.98rem; font-weight: 700; color: %(primary)s; line-height: 1.15; display: block; letter-spacing: -0.01em }
 .hdr-sub { font-size: 0.68rem; color: %(text2)s; font-weight: 500; display: block; letter-spacing: 0.15px }
-.hdr-disclaimer { margin-top: 2px; max-width: 760px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
-.hdr-meta { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 0; text-align: right; flex-shrink: 0 }
 .hdr-src { font-size: 0.7rem; font-weight: 600; color: %(text2)s }
 .hdr-cnt { font-size: 0.7rem; color: %(light)s; margin-left: 4px }
 .toolbar {
@@ -2437,6 +2424,7 @@ body {
 .dashboard-footer-label { font-size: 0.58rem; font-weight: 850; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.68px; white-space: nowrap }
 .dashboard-footer-text { font-size: 0.66rem; color: %(text3)s; letter-spacing: 0.10px; line-height: 1.45; min-width: 0 }
 .dashboard-footer-emph { color: %(text2)s; font-weight: 760 }
+.dashboard-footer-muted { color: %(text3)s; font-weight: 600 }
 
 .peer-performance-card { margin-bottom: 14px; overflow: visible; background: linear-gradient(180deg, #fff 0%%, #fbfdff 100%%); border-color: rgba(0,94,184,0.10) }
 .peer-perf-top { display: flex; flex-direction: column; align-items: stretch; gap: 11px; padding: 14px 16px 13px; background: linear-gradient(135deg, rgba(0,94,184,0.08) 0%%, rgba(213,228,242,0.52) 100%%); border-bottom: 1px solid rgba(0,94,184,0.10); border-radius: 12px 12px 0 0 }
@@ -2702,9 +2690,10 @@ body {
     .ref-name { min-width: 140px }
     .ref-row { flex-direction: column; gap: 4px }
     .export-btn { font-size: 0.6rem; padding: 4px 10px }
-    .hdr { padding: 8px 14px; align-items: flex-start; flex-direction: column; gap: 6px }
-    .hdr-meta { justify-content: flex-start; text-align: left }
-    .hdr-disclaimer { white-space: normal; overflow: visible }
+    .hdr { padding: 8px 14px; gap: 10px; flex-wrap: wrap }
+    .hdr-meta { align-items: flex-start; text-align: left; width: 100%% }
+    .hdr-meta-line { justify-content: flex-start; white-space: normal; flex-wrap: wrap }
+    .hdr-disclaimer { white-space: normal }
     .det-cat-hdr { flex-wrap: wrap }
     .exec-grid { grid-template-columns: repeat(2, 1fr); gap: 7px }
     .exec-banner-inner { padding: 10px 12px }
