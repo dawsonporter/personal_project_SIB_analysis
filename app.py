@@ -1614,23 +1614,28 @@ class DashboardBuilder:
                 html.Div([
                     html.Div([
                         html.Div([
-                            html.Span("Primary Metric", className="peer-control-label"),
-                            self._mdd('r3p', self._def_r3_primary, "idd-m idd-m2 corr-metric-dd"),
-                        ], className="peer-control corr-control-metric"),
+                            html.Div("JPMorgan Correlation Analysis", className="corr-title-main"),
+                        ], className="corr-title-block"),
                         html.Div([
-                            html.Span("Secondary Metric", className="peer-control-label"),
-                            self._mdd('r3s', self._def_r3_secondary, "idd-m idd-m2 corr-metric-dd"),
-                        ], className="peer-control corr-control-metric"),
-                        html.Div([
-                            html.Span("Timeline", className="peer-control-label"),
-                            self._tdd('r3t')
-                        ], className="peer-control corr-control-timeline"),
-                    ], className="corr-control-grid"),
+                            html.Div([
+                                html.Span("Primary Metric", className="peer-control-label"),
+                                self._mdd('r3p', self._def_r3_primary, "idd-m idd-m2 corr-metric-dd"),
+                            ], className="peer-control corr-control-metric"),
+                            html.Div([
+                                html.Span("Secondary Metric", className="peer-control-label"),
+                                self._mdd('r3s', self._def_r3_secondary, "idd-m idd-m2 corr-metric-dd"),
+                            ], className="peer-control corr-control-metric"),
+                            html.Div([
+                                html.Span("Timeline", className="peer-control-label"),
+                                self._tdd('r3t')
+                            ], className="peer-control corr-control-timeline"),
+                        ], className="corr-control-grid"),
+                    ], className="corr-header-grid"),
                     dbc.Row([
                         dbc.Col(html.Div([
                             html.Div([
-                                html.H6("JPM Metric Correlation", className="ct"),
-                                html.Span("Compares two JPMorgan metrics over the selected timeline", className="section-title-note")
+                                html.H6("Metric Correlation", className="ct"),
+                                html.Span("Compares the selected metrics over the chosen timeline", className="section-title-note")
                             ], className="ch ch-wrap"),
                             html.Div([
                                 dcc.Loading(dcc.Graph(id='r3c', config={'displayModeBar': False},
@@ -1640,7 +1645,7 @@ class DashboardBuilder:
                             self._dfoot('r3f')
                         ], className="corr-panel pair-card pair-card-chart"), md=7, className="mb-3 pair-col"),
                         dbc.Col(html.Div([
-                            html.Div([html.H6("JPM Metric Correlation Stats", className="ct")], className="ch"),
+                            html.Div([html.H6("Metric Correlation Stats", className="ct")], className="ch"),
                             html.Div([
                                 dcc.Loading(html.Div(id='r3x', className="insight-shell analysis-shell"),
                                             type="dot", color=CS['primary'])
@@ -2071,6 +2076,8 @@ class DashboardBuilder:
         peer_cvs = [s['cv'] for s in peer_stats.values() if not pd.isna(s.get('cv'))]
         peer_corr = {b: s['c'] for b, s in peer_stats.items() if not pd.isna(s['c'])}
         most_similar = max(peer_corr.items(), key=lambda x: x[1]) if peer_corr else (None, np.nan)
+        least_similar = min(peer_corr.items(), key=lambda x: x[1]) if peer_corr else (None, np.nan)
+        fcorr = lambda item: f"{item[0]} ({item[1]:.2f})" if item and item[0] else "N/A"
         fg = lambda v: fmt_trend_change(v, m)
         fvol = lambda v: ("N/A" if v is None or pd.isna(v) else
                           (fmt_val(v, m, with_unit=True) if isdol else f"{v:.4f} pp"))
@@ -2086,11 +2093,15 @@ class DashboardBuilder:
             best_key = (lambda x: x[1]['g'])
             best_peer_name, best_peer_stats = (min(peer_growth.items(), key=best_key)
                                                if inverse else max(peer_growth.items(), key=best_key))
+            worst_peer_name, worst_peer_stats = (max(peer_growth.items(), key=best_key)
+                                                 if inverse else min(peer_growth.items(), key=best_key))
             avg_peer_growth = fg(np.nanmean([s['g'] for s in peer_growth.values()]))
             best_peer_text = f"{best_peer_name} ({fg(best_peer_stats['g'])})"
+            worst_peer_text = f"{worst_peer_name} ({fg(worst_peer_stats['g'])})"
         else:
             avg_peer_growth = "N/A"
             best_peer_text = "N/A"
+            worst_peer_text = "N/A"
         change_label = "Growth" if isdol else "Change"
         trend_window_label = "Full-History Trend" if str(y).upper() == "FULL" else f"{y}Y Trend"
         return html.Div([
@@ -2106,8 +2117,10 @@ class DashboardBuilder:
                 sr(f"Avg Peer {change_label}", avg_peer_growth),
                 sr("Avg Peer Volatility (std)", avg_peer_vol),
                 sr("Avg Peer Volatility (CV)", avg_peer_cv),
-                sr("Most Similar (Correlation)", f"{most_similar[0]} ({most_similar[1]:.2f})" if most_similar[0] else "N/A"),
-                sr("Best Peer Improvement" if inverse else f"Best Peer {change_label}", best_peer_text)
+                sr("Most Similar (Correlation)", fcorr(most_similar)),
+                sr("Least Similar (Correlation)", fcorr(least_similar)),
+                sr("Best Peer Improvement" if inverse else f"Best Peer {change_label}", best_peer_text),
+                sr("Worst Peer Deterioration" if inverse else f"Worst Peer {change_label}", worst_peer_text)
             ], className="os")
         ], className="ow")
 
@@ -2457,7 +2470,11 @@ body {
 .vs { font-size: 0.64rem; color: %(light)s; font-weight: 500; flex-shrink: 0 }
 .section-title-note { font-size: 0.64rem; color: %(text3)s; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0 }
 .jpm-corr-card { margin-bottom: 14px; overflow: visible; background: linear-gradient(180deg, #fff 0%%, #fbfdff 100%%); border-color: rgba(0,94,184,0.10) }
-.corr-control-grid { width: 100%%; min-width: 0; display: grid; grid-template-columns: minmax(360px, 1fr) minmax(360px, 1fr) 194px; gap: 12px; align-items: end; padding: 14px 16px 15px; background: linear-gradient(135deg, rgba(0,94,184,0.08) 0%%, rgba(213,228,242,0.50) 100%%); border-bottom: 1px solid rgba(0,94,184,0.10); border-radius: 12px 12px 0 0 }
+.corr-header-grid { width: 100%%; min-width: 0; display: grid; grid-template-columns: minmax(230px, 0.52fr) minmax(760px, 2.2fr); gap: 16px; align-items: end; padding: 14px 16px 15px; background: linear-gradient(135deg, rgba(0,94,184,0.08) 0%%, rgba(213,228,242,0.50) 100%%); border-bottom: 1px solid rgba(0,94,184,0.10); border-radius: 12px 12px 0 0 }
+.corr-title-block { min-width: 0; display: flex; flex-direction: column; justify-content: flex-end; gap: 2px; padding-bottom: 2px }
+.corr-title-eyebrow { font-size: 0.58rem; font-weight: 850; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.68px; white-space: nowrap }
+.corr-title-main { font-size: 0.95rem; font-weight: 850; color: %(text)s; letter-spacing: -0.012em; line-height: 1.08; white-space: nowrap }
+.corr-control-grid { width: 100%%; min-width: 0; display: grid; grid-template-columns: minmax(305px, 1fr) minmax(305px, 1fr) 194px; gap: 12px; align-items: end }
 .corr-metric-dd { width: 100%% !important; min-width: 0 !important; flex-shrink: 1 }
 .corr-control-timeline .idd-t { width: 100%% !important; min-width: 0 !important }
 .corr-subrow { margin-left: -7px; margin-right: -7px; padding: 14px 14px 0 }
@@ -2588,6 +2605,8 @@ body {
 @media (max-width: 1200px) {
     .peer-control-grid { grid-template-columns: minmax(360px, 1fr) 165px; gap: 10px }
     .peer-control-peers { grid-column: 1 / -1 }
+    .corr-header-grid { grid-template-columns: 1fr; gap: 11px; align-items: start }
+    .corr-title-block { padding-bottom: 0 }
     .corr-control-grid { grid-template-columns: minmax(320px, 1fr) minmax(320px, 1fr); gap: 10px }
     .corr-control-timeline { grid-column: 1 / -1; max-width: 194px }
 }
@@ -2605,6 +2624,8 @@ body {
     .idd-m, .idd-m2 { width: 100%% !important }
     .toolbar { flex-wrap: wrap; gap: 6px }
     .peer-control-grid { grid-template-columns: 1fr }
+    .corr-header-grid { grid-template-columns: 1fr }
+    .corr-title-main { white-space: normal }
     .corr-control-grid { grid-template-columns: 1fr }
     .corr-control-timeline { max-width: none }
     .peer-select-row { flex-direction: column; align-items: stretch }
