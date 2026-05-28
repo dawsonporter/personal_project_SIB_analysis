@@ -206,7 +206,7 @@ METRIC_CATEGORIES = [
     ("Efficiency & Margin", METRIC_ORDER[10:18]),
     ("Capitalization", METRIC_ORDER[18:22]),
     ("Asset Quality", METRIC_ORDER[22:32]),
-    ("Loan & Lease Analysis", METRIC_ORDER[32:37]),
+    ("Loan & Lease", METRIC_ORDER[32:37]),
     ("Funding & Liquidity", METRIC_ORDER[37:42]),
     ("Credit Concentration", METRIC_ORDER[42:64]),
     ("Growth", METRIC_ORDER[64:66]),
@@ -222,27 +222,27 @@ CATEGORY_ACCENTS = {
     "Key Financials": "#0f172a",
     "Earnings & Profitability": "#16a34a", "Efficiency & Margin": "#2563eb",
     "Capitalization": "#d97706", "Asset Quality": "#dc2626",
-    "Loan & Lease Analysis": "#7c3aed", "Funding & Liquidity": "#0891b2",
+    "Loan & Lease": "#7c3aed", "Funding & Liquidity": "#0891b2",
     "Credit Concentration": "#64748b", "Growth": "#4f46e5",
 }
 CATEGORY_BG = {
     "Key Financials": "#f1f5f9",
     "Earnings & Profitability": "#f0fdf4", "Efficiency & Margin": "#eff6ff",
     "Capitalization": "#fffbeb", "Asset Quality": "#fef2f2",
-    "Loan & Lease Analysis": "#f5f3ff", "Funding & Liquidity": "#ecfeff",
+    "Loan & Lease": "#f5f3ff", "Funding & Liquidity": "#ecfeff",
     "Credit Concentration": "#f8fafc", "Growth": "#eef2ff",
 }
 
 CATEGORY_SHORT_LABELS = {
-    "Earnings & Profitability": "Earnings",
-    "Efficiency & Margin": "Margin",
-    "Capitalization": "Capital",
+    "Earnings & Profitability": "Earnings & Profitability",
+    "Efficiency & Margin": "Efficiency & Margin",
+    "Capitalization": "Capitalization",
     "Asset Quality": "Asset Quality",
-    "Loan & Lease Analysis": "Loans",
-    "Funding & Liquidity": "Funding",
-    "Credit Concentration": "Concentration",
+    "Loan & Lease": "Loan & Lease",
+    "Funding & Liquidity": "Funding & Liquidity",
+    "Credit Concentration": "Credit Concentration",
     "Growth": "Growth",
-    "Key Financials": "Financials",
+    "Key Financials": "Key Financials",
 }
 
 INVERSE_METRICS = {
@@ -1137,7 +1137,7 @@ def build_primary_bank_export(df):
         "Efficiency & Margin": PatternFill('solid', fgColor='E0ECF4'),
         "Capitalization": PatternFill('solid', fgColor='FFF8E1'),
         "Asset Quality": PatternFill('solid', fgColor='FBE9E7'),
-        "Loan & Lease Analysis": PatternFill('solid', fgColor='F3E5F5'),
+        "Loan & Lease": PatternFill('solid', fgColor='F3E5F5'),
         "Funding & Liquidity": PatternFill('solid', fgColor='E0F2F1'),
         "Credit Concentration": PatternFill('solid', fgColor='F5F5F5'),
         "Growth": PatternFill('solid', fgColor='E8EAF6')}
@@ -1475,7 +1475,7 @@ class DashboardBuilder:
     def _missing_data_banner(self):
         scope_lines = [
             ("Source", "FDIC BankFind API financials endpoint; UBPR-style concepts and dashboard-computed peer metrics."),
-            ("History", f"Requested FDIC financial history begins with the {REQUESTED_START_DATE_DISPLAY} report period. Date selectors follow JPMorgan's available reporting history so the pre-crisis data is not hidden."),
+            ("History", f"FDIC financial history begins with the {REQUESTED_START_DATE_DISPLAY} report period."),
             ("Peer comparability", f"The first all-loaded-bank common reporting period is {COMMON_FULL_PEER_START_DATE_DISPLAY}; before that, peer coverage varies by charter/history."),
             ("Peer math", "Averages, ranks, percentiles, and selected-peer counts use only banks with real FDIC data for the selected date/window."),
         ]
@@ -2368,7 +2368,7 @@ body {
 .ct { font-size: 0.78rem; font-weight: 700; color: %(text)s; margin: 0; white-space: nowrap; flex-shrink: 0; letter-spacing: -0.005em }
 .rng { font-size: 0.62rem; color: %(text2)s; white-space: nowrap; margin-left: auto }
 .vs { font-size: 0.64rem; color: %(light)s; font-weight: 500; flex-shrink: 0 }
-.idd-m { width: 430px !important; flex-shrink: 0 }
+.idd-m { width: 500px !important; flex-shrink: 0 }
 .idd-m .Select-control, .idd-m2 .Select-control {
     min-height: 26px !important; border-radius: 7px !important;
     background: %(hover_bg)s !important; border-color: rgba(15,23,42,0.07) !important; transition: all 0.15s ease;
@@ -2378,14 +2378,14 @@ body {
 .idd-m .Select-value-label, .idd-m2 .Select-value-label { font-size: 0.64rem !important; font-weight: 500 !important }
 .metric-opt { display: flex; align-items: center; gap: 6px; min-width: 0; width: 100%%; height: 24px; overflow: hidden }
 .metric-opt-dot { width: 6px; height: 6px; border-radius: 999px; flex-shrink: 0; opacity: 0.9 }
-.metric-opt-cat { font-size: 0.50rem; font-weight: 800; letter-spacing: 0.38px; text-transform: uppercase; border-radius: 999px; padding: 2px 6px; line-height: 1.1; flex-shrink: 0; border: 1px solid rgba(15,23,42,0.04) }
+.metric-opt-cat { font-size: 0.48rem; font-weight: 800; letter-spacing: 0.30px; text-transform: uppercase; border-radius: 999px; padding: 2px 6px; line-height: 1.1; flex-shrink: 0; border: 1px solid rgba(15,23,42,0.04); white-space: nowrap }
 .metric-opt-name { font-size: 0.64rem; font-weight: 600; color: %(text)s; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
 .idd-m .Select-value-label .metric-opt, .idd-m2 .Select-value-label .metric-opt { height: 24px }
-.idd-m .Select-value-label .metric-opt-cat, .idd-m2 .Select-value-label .metric-opt-cat { font-size: 0.48rem; padding: 2px 5px }
+.idd-m .Select-value-label .metric-opt-cat, .idd-m2 .Select-value-label .metric-opt-cat { font-size: 0.45rem; padding: 2px 5px }
 .idd-m .Select-value-label .metric-opt-name, .idd-m2 .Select-value-label .metric-opt-name { font-size: 0.62rem; font-weight: 600 }
 .idd-m .Select-placeholder, .idd-m2 .Select-placeholder { font-size: 0.64rem !important }
 .idd-m .Select-input > input, .idd-m2 .Select-input > input { font-size: 0.64rem !important }
-.idd-m2 { width: 355px !important }
+.idd-m2 { width: 425px !important }
 .idd-t { width: 194px !important; min-width: 194px !important; flex-shrink: 0 }
 .idd-t .Select-control { min-height: 26px !important; border-radius: 7px !important; background: %(hover_bg)s !important; border-color: rgba(15,23,42,0.07) !important }
 .idd-t .Select-value { line-height: 26px !important }
@@ -2489,8 +2489,8 @@ body {
 @media (max-width: 1100px) { .exec-grid { grid-template-columns: repeat(3, 1fr) } }
 @media (max-width: 992px) {
     .main { padding: 10px 16px }
-    .idd-m { width: 360px !important }
-    .idd-m2 { width: 300px !important }
+    .idd-m { width: 420px !important }
+    .idd-m2 { width: 360px !important }
     .idd-t { width: 176px !important; min-width: 176px !important }
     .exec-grid { grid-template-columns: repeat(3, 1fr); gap: 8px }
     .exec-card { padding: 10px 11px }
