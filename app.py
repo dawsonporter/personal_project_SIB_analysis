@@ -30,9 +30,10 @@ except AttributeError:
     pass
 
 BASE_URL = "https://banks.data.fdic.gov/api"
-DEFAULT_START_DATE = '20081231'
+DEFAULT_START_DATE = '20030331'
 DEFAULT_END_DATE = datetime.today().strftime('%Y%m%d')
-REQUESTED_START_DATE_DISPLAY = '12/31/2008'
+REQUESTED_START_DATE_DISPLAY = '03/31/2003'
+COMMON_FULL_PEER_START_DATE_DISPLAY = '12/31/2008'
 CACHE_DIR = 'data_cache'
 os.makedirs(CACHE_DIR, exist_ok=True)
 PRIMARY_BANK_DISPLAY_NAME = "JPMorgan Chase"
@@ -70,7 +71,7 @@ CS = {
     'spark': '#005EB8', 'spark_area': 'rgba(0,94,184,0.08)',
 }
 
-CACHE_SCHEMA_VERSION = "v8_sib_jpm_20081231_no_comerica"
+CACHE_SCHEMA_VERSION = "v9_sib_jpm_20030331_no_comerica"
 
 BANK_INFO = [
     # Primary FDIC-insured bank charters for the selected U.S. systemically
@@ -1246,13 +1247,14 @@ class DashboardBuilder:
         self.loaded_banks = sorted(set(df['Bank'].unique()))
 
         # Historical-range design note:
-        # The dashboard now hard-starts at 12/31/2008, which was the first
-        # all-loaded-bank common reporting period in the prior longer-history
-        # build. That avoids showing early JPMorgan-only history while peer
-        # coverage is incomplete. Date selectors use JPMorgan's available dates
-        # from this hard-start; peer stats still automatically exclude any bank
-        # without real data for a selected period/window, which protects against
-        # future mergers, missing filings, or temporary FDIC lag.
+        # The dashboard intentionally starts at 03/31/2003 to preserve a long
+        # pre-crisis cycle for JPMorgan and any peers with available FDIC data.
+        # Full selected-peer comparability is not guaranteed until the cleaner
+        # all-loaded-bank common reporting baseline around 12/31/2008. Date
+        # selectors follow JPMorgan's available dates from this hard-start; peer
+        # stats automatically exclude banks without real data for a selected
+        # period/window, which protects against early-charter gaps, mergers,
+        # missing filings, or temporary FDIC lag.
         primary_df = df[df['Bank'] == self.GHB].sort_values('Date').reset_index(drop=True)
         self._ghb_df = primary_df
         self.primary_dates = sorted(primary_df['Date'].unique())
@@ -1438,15 +1440,19 @@ class DashboardBuilder:
 
     def _missing_data_banner(self):
         messages = [
-            f"Dashboard analysis starts with the {REQUESTED_START_DATE_DISPLAY} report period, "
-            "which keeps the selected SIB peer universe on a cleaner common-history baseline after removing legacy Comerica. "
-            "Peer averages, ranks, and percentiles automatically use only peers with real FDIC data for the selected date/window."
+            f"Requested FDIC financial history begins with the {REQUESTED_START_DATE_DISPLAY} report period. "
+            "Date selectors follow JPMorgan's available reporting history so the pre-crisis data is not hidden. "
+            "Peer averages, ranks, and percentiles automatically use only peers with real FDIC data for the selected date/window. "
+            f"The first all-loaded-bank common reporting period is {COMMON_FULL_PEER_START_DATE_DISPLAY}; "
+            "before that, peer coverage varies by charter/history."
         ]
         if self.common_start_date is not None and self.analysis_start_date is not None:
-            if pd.Timestamp(self.common_start_date) > pd.Timestamp(self.analysis_start_date):
+            computed_common = pd.Timestamp(self.common_start_date).strftime('%m/%d/%Y')
+            if (pd.Timestamp(self.common_start_date) > pd.Timestamp(self.analysis_start_date)
+                    and computed_common != COMMON_FULL_PEER_START_DATE_DISPLAY):
                 messages.append(
-                    "The first all-loaded-bank common reporting period is "
-                    f"{pd.Timestamp(self.common_start_date).strftime('%m/%d/%Y')}; before that, peer coverage varies by charter/history.")
+                    "Current loaded data common-period check: all currently loaded banks share data beginning "
+                    f"{computed_common}.")
         if self.missing_banks:
             missing = ', '.join(self.missing_banks)
             messages.append(
@@ -2321,10 +2327,10 @@ body {
 .idd-m .Select-placeholder, .idd-m2 .Select-placeholder { font-size: 0.64rem !important }
 .idd-m .Select-input > input, .idd-m2 .Select-input > input { font-size: 0.64rem !important }
 .idd-m2 { width: 310px !important }
-.idd-t { width: 128px !important; min-width: 128px !important; flex-shrink: 0 }
+.idd-t { width: 162px !important; min-width: 162px !important; flex-shrink: 0 }
 .idd-t .Select-control { min-height: 26px !important; border-radius: 7px !important; background: %(hover_bg)s !important; border-color: rgba(15,23,42,0.07) !important }
 .idd-t .Select-value { line-height: 26px !important }
-.idd-t .Select-value-label { font-size: 0.64rem !important; font-weight: 600 !important; color: %(primary)s !important; white-space: nowrap !important }
+.idd-t .Select-value-label { font-size: 0.64rem !important; font-weight: 600 !important; color: %(primary)s !important; white-space: nowrap !important; overflow: visible !important; text-overflow: unset !important }
 .idd-d { width: 165px !important; flex-shrink: 0 }
 .idd-d .Select-control { min-height: 26px !important; border-radius: 7px !important; background: %(hover_bg)s !important; border-color: rgba(15,23,42,0.07) !important }
 .idd-d .Select-value { line-height: 26px !important }
@@ -2423,7 +2429,7 @@ body {
     .main { padding: 10px 16px }
     .idd-m { width: 300px !important }
     .idd-m2 { width: 240px !important }
-    .idd-t { width: 118px !important; min-width: 118px !important }
+    .idd-t { width: 148px !important; min-width: 148px !important }
     .exec-grid { grid-template-columns: repeat(3, 1fr); gap: 8px }
     .exec-card { padding: 10px 11px }
     .dr { flex-wrap: wrap }
