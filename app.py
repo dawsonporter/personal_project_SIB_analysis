@@ -1539,7 +1539,7 @@ class DashboardBuilder:
                     html.Div([
                         html.Div([
                             html.H6("Peer Performance", className="ct peer-perf-title"),
-                        ], className="peer-perf-title-wrap"),
+                        ], className="peer-perf-heading"),
                         html.Div([
                             html.Div([
                                 html.Span("Metric", className="peer-control-label"),
@@ -1565,7 +1565,6 @@ class DashboardBuilder:
                             ], className="peer-control peer-control-peers"),
                         ], className="peer-control-grid")
                     ], className="peer-perf-top"),
-                    html.Div(id='peer-def', className="dfoot peer-def-wrap"),
                     html.Div([
                         html.Div([
                             html.Span("Snapshot", className="peer-section-label"),
@@ -1619,6 +1618,7 @@ class DashboardBuilder:
                             ], className="peer-panel pair-card pair-card-side"), md=5, className="mb-3 pair-col")
                         ], className="paired-row peer-subrow"),
                     ], className="peer-section peer-section-trend"),
+                    html.Div(id='peer-def', className="dfoot peer-def-wrap"),
                 ], className="card peer-performance-card mb-3"),
                 dbc.Row([
                     dbc.Col(html.Div([
@@ -1729,7 +1729,7 @@ class DashboardBuilder:
 
         @app.callback(Output('peer-def', 'children'), Input('peer-metric', 'value'))
         def d_peer(m):
-            return self._rdef(m)
+            return self._peer_metric_definition(m)
 
         @app.callback(Output('r3f', 'children'), [Input('r3p', 'value'), Input('r3s', 'value')])
         def d3(a, b):
@@ -1796,6 +1796,17 @@ class DashboardBuilder:
         pre = f"{label}: " if label else ""
         return html.Div([
             html.Span(f"{pre}{cat}", className="df-cat") if cat else None,
+            html.Span(f" {txt}", className="df-txt")
+        ], className="df-line")
+
+    def _peer_metric_definition(self, m):
+        d = METRIC_DEFINITIONS.get(m, '')
+        if not d:
+            return None
+        parts = d.split(' \xb7 ', 1)
+        txt = parts[1] if len(parts) == 2 else d
+        return html.Div([
+            html.Span("Metric Definition", className="df-cat"),
             html.Span(f" {txt}", className="df-txt")
         ], className="df-line")
 
@@ -2343,10 +2354,10 @@ body {
 .scope-v { font-size: 0.68rem; color: %(text2)s; min-width: 0 }
 
 .peer-performance-card { margin-bottom: 14px; overflow: visible; background: linear-gradient(180deg, #fff 0%%, #fbfdff 100%%); border-color: rgba(0,94,184,0.10) }
-.peer-perf-top { display: flex; align-items: center; gap: 15px; padding: 13px 16px; background: linear-gradient(135deg, rgba(0,94,184,0.08) 0%%, rgba(213,228,242,0.52) 100%%); border-bottom: 1px solid rgba(0,94,184,0.10); border-radius: 12px 12px 0 0 }
-.peer-perf-title-wrap { display: flex; align-items: center; min-width: 168px; flex-shrink: 0 }
-.peer-perf-title { color: %(primary)s; font-size: 0.86rem }
-.peer-control-grid { flex: 1 1 auto; min-width: 0; display: grid; grid-template-columns: minmax(430px, 1.05fr) 165px minmax(380px, 0.95fr); gap: 12px; align-items: end }
+.peer-perf-top { display: flex; flex-direction: column; align-items: stretch; gap: 11px; padding: 14px 16px 13px; background: linear-gradient(135deg, rgba(0,94,184,0.08) 0%%, rgba(213,228,242,0.52) 100%%); border-bottom: 1px solid rgba(0,94,184,0.10); border-radius: 12px 12px 0 0 }
+.peer-perf-heading { display: flex; align-items: center; justify-content: space-between; min-width: 0; padding-bottom: 2px }
+.peer-perf-title { color: %(primary)s; font-size: 0.92rem; font-weight: 800; letter-spacing: -0.01em }
+.peer-control-grid { width: 100%%; min-width: 0; display: grid; grid-template-columns: minmax(400px, 0.95fr) 165px minmax(560px, 1.55fr); gap: 12px; align-items: end }
 .peer-control { min-width: 0; display: flex; flex-direction: column; gap: 5px }
 .peer-control-label { font-size: 0.58rem; font-weight: 850; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.62px; white-space: nowrap }
 .peer-metric-dd { width: 100%% !important; min-width: 0 !important }
@@ -2361,7 +2372,10 @@ body {
 .peer-sel-dd .Select-multi-value-wrapper .Select-value { flex: 0 0 auto; margin-top: 4px !important; margin-bottom: 4px !important }
 .peer-sel-dd .Select-input { flex: 0 0 90px; height: 30px !important; padding-left: 2px !important }
 .control-label { font-size: 0.58rem; font-weight: 800; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.55px; white-space: nowrap }
-.peer-def-wrap { border-bottom: 1px solid rgba(15,23,42,0.04); background: rgba(255,255,255,0.72); padding: 7px 15px 8px }
+.peer-def-wrap { border-top: 1px solid rgba(0,94,184,0.09); background: linear-gradient(180deg, rgba(255,255,255,0.80) 0%%, rgba(248,250,252,0.92) 100%%); padding: 10px 16px 11px }
+.peer-def-wrap .df-line { display: flex; align-items: baseline; gap: 7px; line-height: 1.42 }
+.peer-def-wrap .df-cat { flex-shrink: 0; color: %(primary)s; background: #fff; border: 1px solid rgba(0,94,184,0.13); border-radius: 999px; padding: 3px 9px; font-size: 0.62rem; font-weight: 850; text-transform: uppercase; letter-spacing: 0.48px }
+.peer-def-wrap .df-txt { font-size: 0.70rem; color: %(text2)s }
 .peer-section { padding: 12px 14px 0 }
 .peer-section + .peer-section { border-top: 1px solid rgba(15,23,42,0.055); padding-top: 13px; background: linear-gradient(180deg, rgba(248,250,252,0.64) 0%%, transparent 35%%) }
 .peer-section-bar { display: flex; align-items: baseline; gap: 8px; margin: 0 0 8px; padding: 0 2px }
@@ -2431,6 +2445,7 @@ body {
 .rng { font-size: 0.62rem; color: %(text2)s; white-space: nowrap; margin-left: auto }
 .vs { font-size: 0.64rem; color: %(light)s; font-weight: 500; flex-shrink: 0 }
 .idd-m { width: 560px !important; flex-shrink: 0 }
+.idd-m.peer-metric-dd { width: 100%% !important; min-width: 0 !important; flex-shrink: 1 }
 .idd-m .Select-control, .idd-m2 .Select-control {
     min-height: 34px !important; border-radius: 8px !important;
     background: %(hover_bg)s !important; border-color: rgba(15,23,42,0.07) !important; transition: all 0.15s ease;
@@ -2551,8 +2566,6 @@ body {
 @media (max-width: 1320px) { .exec-grid { grid-template-columns: repeat(4, 1fr) } }
 @media (max-width: 1100px) { .exec-grid { grid-template-columns: repeat(3, 1fr) } }
 @media (max-width: 1200px) {
-    .peer-perf-top { align-items: stretch; flex-direction: column; gap: 10px }
-    .peer-perf-title-wrap { min-width: 100%% }
     .peer-control-grid { grid-template-columns: minmax(360px, 1fr) 165px; gap: 10px }
     .peer-control-peers { grid-column: 1 / -1 }
 }
