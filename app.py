@@ -30,8 +30,9 @@ except AttributeError:
     pass
 
 BASE_URL = "https://banks.data.fdic.gov/api"
-DEFAULT_START_DATE = '20200630'
+DEFAULT_START_DATE = '20000331'
 DEFAULT_END_DATE = datetime.today().strftime('%Y%m%d')
+REQUESTED_START_DATE_DISPLAY = '03/31/2000'
 CACHE_DIR = 'data_cache'
 os.makedirs(CACHE_DIR, exist_ok=True)
 PRIMARY_BANK_DISPLAY_NAME = "JPMorgan Chase"
@@ -69,7 +70,7 @@ CS = {
     'spark': '#005EB8', 'spark_area': 'rgba(0,94,184,0.08)',
 }
 
-CACHE_SCHEMA_VERSION = "v6_sib_jpm"
+CACHE_SCHEMA_VERSION = "v7_sib_jpm_20000331"
 
 BANK_INFO = [
     # Primary FDIC-insured bank charters for the selected U.S. systemically
@@ -1141,7 +1142,7 @@ def build_primary_bank_export(df):
     center = Alignment(horizontal='center', vertical='center', wrap_text=True)
     left = Alignment(horizontal='left', vertical='center')
 
-    ws.cell(row=1, column=1, value=PRIMARY_BANK_FDIC_NAME).font = hdr_font
+    ws.cell(row=1, column=1, value=f"{PRIMARY_BANK_FDIC_NAME} · since {REQUESTED_START_DATE_DISPLAY}").font = hdr_font
     ws.cell(row=1, column=1).fill = hdr_fill
     ws.cell(row=1, column=1).alignment = left
     col = 2
@@ -1245,25 +1246,41 @@ class DashboardBuilder:
         self.missing_banks = sorted(missing_banks or [])
         self.raw_dates = sorted(df['Date'].unique())
         self.loaded_banks = sorted(set(df['Bank'].unique()))
+
+        # Historical-range design note:
+        # For a 03/31/2000 start date, do NOT limit the dashboard to the date
+        # intersection across all selected banks. Several large-bank peer charters
+        # began, merged, or changed reporting histories after 2000. Using all-bank
+        # common dates would silently hide the early JPMorgan history the dashboard
+        # is meant to show. Date selectors therefore follow JPMorgan's available
+        # reporting history. Peer charts/ranks dynamically include only banks with
+        # real FDIC data on the selected date/window.
+        primary_df = df[df['Bank'] == self.GHB].sort_values('Date').reset_index(drop=True)
+        self._ghb_df = primary_df
+        self.primary_dates = sorted(primary_df['Date'].unique())
         date_sets = [set(df.loc[df['Bank'] == bank, 'Date']) for bank in self.loaded_banks]
         self.common_dates = sorted(set.intersection(*date_sets)) if date_sets else []
-        self.dates = self.common_dates if self.common_dates else self.raw_dates
+        self.dates = self.primary_dates if self.primary_dates else self.raw_dates
+        self.analysis_start_date = self.dates[0] if self.dates else None
         self.analysis_end_date = self.dates[-1] if self.dates else None
         self.raw_latest_date = self.raw_dates[-1] if self.raw_dates else None
+        self.common_start_date = self.common_dates[0] if self.common_dates else None
+        self.common_latest_date = self.common_dates[-1] if self.common_dates else None
 
         self.metrics = [m for m in METRIC_ORDER if m in df.columns]
         self.peers = sorted(set(df['Bank'].unique()) - {self.GHB})
         self._mo = [{'label': m, 'value': m} for m in self.metrics]
         self._do = [{'label': d.strftime('%m/%d/%Y'), 'value': d.strftime('%Y-%m-%d')}
                     for d in reversed(self.dates)]
-        self._to = [{'label': f'{y} Yr', 'value': y} for y in range(1, 7)]
+        self._to = (
+            [{'label': f'{y} Yr', 'value': y} for y in [1, 2, 3, 4, 5, 7, 10, 15, 20, 25]]
+            + [{'label': 'Full History', 'value': 'FULL'}]
+        )
         self._def_metric = 'Return on Assets' if 'Return on Assets' in self.metrics else self.metrics[0]
         self._def_r3_primary = 'Net Interest Margin' if 'Net Interest Margin' in self.metrics else self.metrics[0]
         self._def_r3_secondary = 'Cost of Funding Earning Assets' if 'Cost of Funding Earning Assets' in self.metrics else (self.metrics[1] if len(self.metrics) > 1 else self.metrics[0])
-        ghb_df = df[df['Bank'] == self.GHB].sort_values('Date').reset_index(drop=True)
-        self._ghb_df = ghb_df
-        if not ghb_df.empty:
-            self._ghb_date_index = {pd.Timestamp(d): i for i, d in enumerate(ghb_df['Date'])}
+        if not self._ghb_df.empty:
+            self._ghb_date_index = {pd.Timestamp(d): i for i, d in enumerate(self._ghb_df['Date'])}
         else:
             self._ghb_date_index = {}
 
@@ -1324,6 +1341,47 @@ class DashboardBuilder:
                             clearable=False, optionHeight=48, className=c,
                             placeholder="Search metrics...")
 
+    def _window_bounds(self, y, end=None, bank_filter=None):
+        """Return (start, end) for trend/correlation windows.
+
+        y may be an integer year lookback or 'FULL'. For full history, the
+        lower bound is the earliest real reporting date for the selected banks;
+        if no bank filter is supplied, it uses the JPMorgan analysis history.
+        """
+        if end is None:
+            end = self.analysis_end_date if self.analysis_end_date is not None else self.df['Date'].max()
+        end_ts = pd.Timestamp(end)
+        if str(y).upper() == 'FULL':
+            if bank_filter:
+                subset = self.df[self.df['Bank'].isin(bank_filter)]
+                if not subset.empty:
+                    return pd.Timestamp(subset['Date'].min()), end_ts
+            if self.analysis_start_date is not None:
+                return pd.Timestamp(self.analysis_start_date), end_ts
+            return pd.Timestamp(self.df['Date'].min()), end_ts
+        try:
+            years = int(y)
+        except (TypeError, ValueError):
+            years = 4
+        return end_ts - pd.DateOffset(years=years), end_ts
+
+    @staticmethod
+    def _window_label(y, start, end):
+        return f"{pd.Timestamp(start).strftime('%m/%Y')}–{pd.Timestamp(end).strftime('%m/%Y')}"
+
+    @staticmethod
+    def _axis_for_window(start, end):
+        span_years = max((pd.Timestamp(end) - pd.Timestamp(start)).days / 365.25, 0)
+        if span_years <= 2:
+            return 'M3', '%b %Y'
+        if span_years <= 4:
+            return 'M6', '%b %Y'
+        if span_years <= 10:
+            return 'M12', '%Y'
+        if span_years <= 18:
+            return 'M24', '%Y'
+        return 'M36', '%Y'
+
     def _tdd(self, id_):
         return dcc.Dropdown(id=id_, options=self._to, value=4, clearable=False,
                             searchable=False, className="idd-t")
@@ -1334,7 +1392,7 @@ class DashboardBuilder:
     def _exec_banner(self, selected_peers=None):
         latest_date = self.analysis_end_date
         if latest_date is None:
-            return html.Div("No common reporting date available", className="exec-banner")
+            return html.Div("No JPMorgan reporting date available", className="exec-banner")
         peer_selection = self.peers if selected_peers is None else selected_peers
         cohort = [self.GHB] + list(peer_selection)
         cohort_df = self.df[self.df['Bank'].isin(cohort)]
@@ -1366,7 +1424,9 @@ class DashboardBuilder:
                 ], className="exec-delta"),
             ], className="exec-card")
             cards.append(card)
-        peer_note = f"JPM benchmark vs selected SIB peers: {len(peer_selection)}"
+        latest_peer_rows = cohort_df[(cohort_df['Date'] == pd.Timestamp(latest_date)) & (cohort_df['Bank'] != self.GHB)]
+        available_peers = latest_peer_rows['Bank'].nunique()
+        peer_note = f"JPM benchmark vs available selected SIB peers: {available_peers}/{len(peer_selection)}"
         return html.Div([
             html.Div([
                 html.Div([
@@ -1379,7 +1439,16 @@ class DashboardBuilder:
         ], className="exec-banner")
 
     def _missing_data_banner(self):
-        messages = []
+        messages = [
+            f"Requested FDIC financial history begins with the {REQUESTED_START_DATE_DISPLAY} report period. "
+            "Date selectors follow JPMorgan's available reporting history so the early-2000s data is not hidden. "
+            "Peer averages, ranks, and percentiles automatically use only peers with real FDIC data for the selected date/window."
+        ]
+        if self.common_start_date is not None and self.analysis_start_date is not None:
+            if pd.Timestamp(self.common_start_date) > pd.Timestamp(self.analysis_start_date):
+                messages.append(
+                    "The first all-loaded-bank common reporting period is "
+                    f"{pd.Timestamp(self.common_start_date).strftime('%m/%d/%Y')}; before that, peer coverage varies by charter/history.")
         if self.missing_banks:
             missing = ', '.join(self.missing_banks)
             messages.append(
@@ -1389,12 +1458,9 @@ class DashboardBuilder:
         if (self.raw_latest_date is not None and self.analysis_end_date is not None
                 and pd.Timestamp(self.raw_latest_date) > pd.Timestamp(self.analysis_end_date)):
             messages.append(
-                "Using latest common peer period "
-                f"{pd.Timestamp(self.analysis_end_date).strftime('%m/%d/%Y')} "
-                "because not every selected bank has a filing for the newer "
-                f"raw FDIC period {pd.Timestamp(self.raw_latest_date).strftime('%m/%d/%Y')}.")
-        if not messages:
-            return None
+                "JPMorgan's latest available report period is "
+                f"{pd.Timestamp(self.analysis_end_date).strftime('%m/%d/%Y')}; "
+                f"the raw FDIC peer set includes a newer period of {pd.Timestamp(self.raw_latest_date).strftime('%m/%d/%Y')}.")
         return html.Div([html.Strong("FDIC data scope note. "), html.Span(" ".join(messages))],
                         className="warn-banner")
 
@@ -1411,7 +1477,7 @@ class DashboardBuilder:
                     ])
                 ], className="hdr-brand"),
                 html.Div([
-                    html.Span("FDIC API · SIB peer set", className="hdr-src"),
+                    html.Span(f"FDIC API · SIB peer set · since {REQUESTED_START_DATE_DISPLAY}", className="hdr-src"),
                     html.Span(f"\u00b7 {len(METRIC_ORDER)} metrics", className="hdr-cnt"),
                     html.Span(f"\u00b7 {len(BANK_INFO)} banks", className="hdr-cnt")
                 ])
@@ -1520,7 +1586,7 @@ class DashboardBuilder:
                 ], className="mb-4"),
                 self._reference_section(),
                 html.Div([
-                    html.Span(f"Data via FDIC BankFind API · {PEER_UNIVERSE_LABEL} · {len(METRIC_ORDER)} metrics "
+                    html.Span(f"Data via FDIC BankFind API · requested history since {REQUESTED_START_DATE_DISPLAY} · {PEER_UNIVERSE_LABEL} · {len(METRIC_ORDER)} metrics "
                               f"\u00b7 {len(METRIC_CATEGORIES)} categories "
                               f"\u00b7 UBPR concept codes verified via ffiec.gov/data/ubpr/report-user-guide",
                               className="foot-txt")
@@ -1610,9 +1676,8 @@ class DashboardBuilder:
                 return self._ef(""), html.Div(), ""
             bk = [self.GHB] + (p or [])
             end = self.analysis_end_date if self.analysis_end_date is not None else self.df['Date'].max()
-            end_ts = pd.Timestamp(end)
-            s = end_ts - pd.DateOffset(years=y)
-            return self._trend(bk, m, y), self._ta(bk, m, y), f"{s.strftime('%m/%Y')}\u2013{end_ts.strftime('%m/%Y')}"
+            start_ts, end_ts = self._window_bounds(y, end=end, bank_filter=bk)
+            return self._trend(bk, m, y), self._ta(bk, m, y), self._window_label(y, start_ts, end_ts)
 
         @app.callback([Output('r3c', 'figure'), Output('r3x', 'children')],
                       [Input('r3p', 'value'), Input('r3s', 'value'), Input('r3t', 'value')])
@@ -1838,10 +1903,10 @@ class DashboardBuilder:
         f = self.df[self.df['Bank'].isin(bk)]
         if f.empty:
             return self._ef("No data")
-        end = self.analysis_end_date or f['Date'].max()
-        f = f[(f['Date'] <= end) & (f['Date'] >= end - pd.DateOffset(years=y))]
+        start, end = self._window_bounds(y, bank_filter=bk)
+        f = f[(f['Date'] <= end) & (f['Date'] >= start)]
         if f.empty:
-            return self._ef("No data for common reporting period")
+            return self._ef("No data for selected historical window")
         pv = f.pivot(index='Date', columns='Bank', values=m)
         fig = go.Figure()
         peer_cols = [c for c in pv.columns if c != self.GHB]
@@ -1861,13 +1926,13 @@ class DashboardBuilder:
                                      line=dict(color=CS['ghb'] if ig else CS['peer'],
                                                width=2.5 if ig else 1.2, shape='spline'),
                                      opacity=1 if ig else CS['peer_op'], hovertemplate=ht))
-        dt = 'M3' if y <= 2 else ('M6' if y <= 4 else 'M12')
+        dt, tick_fmt = self._axis_for_window(start, end)
         tfmt = ',.0f' if isdol else '.2f'
         y_title = '$000s' if isdol else ('%' if ispct else None)
         fig.update_layout(**self._bl(
             showlegend=False, hovermode='x unified',
             margin=dict(l=48, r=12, t=6, b=40),
-            xaxis=dict(showgrid=False, tickformat='%b %Y' if y <= 4 else '%Y',
+            xaxis=dict(showgrid=False, tickformat=tick_fmt,
                        dtick=dt, tickangle=-35, tickfont=dict(size=9)),
             yaxis=dict(title_text=y_title, title_font=dict(size=9, color=CS['text3']),
                        showgrid=True, gridcolor=CS['grid'], tickformat=tfmt,
@@ -1880,10 +1945,10 @@ class DashboardBuilder:
         f = self.df[self.df['Bank'].isin(bk)]
         if f.empty:
             return html.Div("No data", className="emp")
-        end = self.analysis_end_date or f['Date'].max()
-        f = f[(f['Date'] <= end) & (f['Date'] >= end - pd.DateOffset(years=y))]
+        start, end = self._window_bounds(y, bank_filter=bk)
+        f = f[(f['Date'] <= end) & (f['Date'] >= start)]
         if f.empty:
-            return html.Div("No data for common reporting period", className="emp")
+            return html.Div("No data for selected historical window", className="emp")
         pv = f.pivot(index='Date', columns='Bank', values=m)
         if self.GHB not in pv.columns or pv[self.GHB].count() < 2:
             return html.Div("Insufficient data", className="emp")
@@ -1929,9 +1994,10 @@ class DashboardBuilder:
             avg_peer_growth = "N/A"
             best_peer_text = "N/A"
         change_label = "Growth" if isdol else "Change"
+        trend_window_label = "Full-History Trend" if str(y).upper() == "FULL" else f"{y}Y Trend"
         return html.Div([
             html.Div([
-                html.Div(f"{y}Y Trend", className="ost"),
+                html.Div(trend_window_label, className="ost"),
                 sr(f"JPM {change_label}", fg(ghb_stats.get('g')), h=True),
                 sr("Direction", ghb_stats.get('t', 'N/A')),
                 sr("Volatility (std)", fvol(ghb_stats.get('v'))),
@@ -1949,10 +2015,10 @@ class DashboardBuilder:
         g = self.df[self.df['Bank'] == self.GHB].copy()
         if g.empty:
             return self._ef("No JPMorgan data")
-        end = self.analysis_end_date or g['Date'].max()
-        g = g[(g['Date'] <= end) & (g['Date'] >= end - pd.DateOffset(years=y))]
+        start, end = self._window_bounds(y, bank_filter=[self.GHB])
+        g = g[(g['Date'] <= end) & (g['Date'] >= start)]
         if g.empty:
-            return self._ef("No JPMorgan data for common reporting period")
+            return self._ef("No JPMorgan data for selected historical window")
         fig = make_subplots(specs=[[{"secondary_y": True}]])
         isdol1 = is_dollar_metric(m1)
         isdol2 = is_dollar_metric(m2)
@@ -1966,13 +2032,13 @@ class DashboardBuilder:
         fig.add_trace(go.Scatter(x=g['Date'], y=g[m2], customdata=cd2, mode='lines', name=m2[:40],
                                  line=dict(color=CS['ghb2'], width=2.5, dash='dot', shape='spline'),
                                  hovertemplate=ht2), secondary_y=True)
-        dt = 'M3' if y <= 2 else ('M6' if y <= 4 else 'M12')
+        dt, tick_fmt = self._axis_for_window(start, end)
         fig.update_layout(**self._bl(
             showlegend=True, hovermode='x unified',
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left",
                         x=0, font=dict(size=9)),
             margin=dict(l=48, r=48, t=26, b=40),
-            xaxis=dict(showgrid=False, tickformat='%b %Y' if y <= 4 else '%Y',
+            xaxis=dict(showgrid=False, tickformat=tick_fmt,
                        dtick=dt, tickangle=-35, tickfont=dict(size=9))))
         tfmt1 = ',.0f' if isdol1 else '.2f'
         tfmt2 = ',.0f' if isdol2 else '.2f'
@@ -1992,10 +2058,10 @@ class DashboardBuilder:
         g = self.df[self.df['Bank'] == self.GHB].copy()
         if g.empty:
             return html.Div("No data", className="emp")
-        end = self.analysis_end_date or g['Date'].max()
-        g = g[(g['Date'] <= end) & (g['Date'] >= end - pd.DateOffset(years=y))]
+        start, end = self._window_bounds(y, bank_filter=[self.GHB])
+        g = g[(g['Date'] <= end) & (g['Date'] >= start)]
         if g.empty:
-            return html.Div("No JPMorgan data for common reporting period", className="emp")
+            return html.Div("No JPMorgan data for selected historical window", className="emp")
         cm = g[[m1, m2]].dropna()
         n = len(cm)
 
