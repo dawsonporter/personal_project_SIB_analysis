@@ -1372,7 +1372,7 @@ class DashboardBuilder:
 
     def _mdd(self, id_, v=None, c="idd-m"):
         return dcc.Dropdown(id=id_, options=self._mo, value=v or self._def_metric,
-                            clearable=False, optionHeight=56, className=c,
+                            clearable=False, optionHeight=66, className=c,
                             placeholder="Search metrics...")
 
     def _window_bounds(self, y, end=None, bank_filter=None):
@@ -2367,24 +2367,24 @@ body {
 .ct { font-size: 0.78rem; font-weight: 700; color: %(text)s; margin: 0; white-space: nowrap; flex-shrink: 0; letter-spacing: -0.005em }
 .rng { font-size: 0.62rem; color: %(text2)s; white-space: nowrap; margin-left: auto }
 .vs { font-size: 0.64rem; color: %(light)s; font-weight: 500; flex-shrink: 0 }
-.idd-m { width: 530px !important; flex-shrink: 0 }
+.idd-m { width: 560px !important; flex-shrink: 0 }
 .idd-m .Select-control, .idd-m2 .Select-control {
-    min-height: 30px !important; border-radius: 7px !important;
+    min-height: 34px !important; border-radius: 8px !important;
     background: %(hover_bg)s !important; border-color: rgba(15,23,42,0.07) !important; transition: all 0.15s ease;
 }
 .idd-m .Select-control:hover, .idd-m2 .Select-control:hover { border-color: rgba(14,62,27,0.3) !important; background: #fff !important }
-.idd-m .Select-value, .idd-m2 .Select-value { line-height: 30px !important }
-.idd-m .Select-value-label, .idd-m2 .Select-value-label { font-size: 0.70rem !important; font-weight: 600 !important }
-.metric-opt { display: flex; align-items: center; gap: 7px; min-width: 0; width: 100%%; height: 28px; overflow: hidden }
-.metric-opt-dot { width: 7px; height: 7px; border-radius: 999px; flex-shrink: 0; opacity: 0.9 }
-.metric-opt-cat { font-size: 0.56rem; font-weight: 800; letter-spacing: 0.28px; text-transform: uppercase; border-radius: 999px; padding: 3px 8px; line-height: 1.08; flex-shrink: 0; border: 1px solid rgba(15,23,42,0.04); white-space: nowrap }
-.metric-opt-name { font-size: 0.72rem; font-weight: 650; color: %(text)s; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
-.idd-m .Select-value-label .metric-opt, .idd-m2 .Select-value-label .metric-opt { height: 28px }
-.idd-m .Select-value-label .metric-opt-cat, .idd-m2 .Select-value-label .metric-opt-cat { font-size: 0.52rem; padding: 3px 7px }
-.idd-m .Select-value-label .metric-opt-name, .idd-m2 .Select-value-label .metric-opt-name { font-size: 0.69rem; font-weight: 650 }
-.idd-m .Select-placeholder, .idd-m2 .Select-placeholder { font-size: 0.70rem !important }
-.idd-m .Select-input > input, .idd-m2 .Select-input > input { font-size: 0.70rem !important }
-.idd-m2 { width: 455px !important }
+.idd-m .Select-value, .idd-m2 .Select-value { line-height: 34px !important }
+.idd-m .Select-value-label, .idd-m2 .Select-value-label { font-size: 0.82rem !important; font-weight: 650 !important }
+.metric-opt { display: flex; align-items: center; gap: 8px; min-width: 0; width: 100%%; height: 34px; overflow: hidden }
+.metric-opt-dot { width: 8px; height: 8px; border-radius: 999px; flex-shrink: 0; opacity: 0.9 }
+.metric-opt-cat { font-size: 0.64rem; font-weight: 800; letter-spacing: 0.24px; text-transform: uppercase; border-radius: 999px; padding: 4px 9px; line-height: 1.08; flex-shrink: 0; border: 1px solid rgba(15,23,42,0.04); white-space: nowrap }
+.metric-opt-name { font-size: 0.84rem; font-weight: 650; color: %(text)s; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
+.idd-m .Select-value-label .metric-opt, .idd-m2 .Select-value-label .metric-opt { height: 32px }
+.idd-m .Select-value-label .metric-opt-cat, .idd-m2 .Select-value-label .metric-opt-cat { font-size: 0.60rem; padding: 4px 8px }
+.idd-m .Select-value-label .metric-opt-name, .idd-m2 .Select-value-label .metric-opt-name { font-size: 0.80rem; font-weight: 650 }
+.idd-m .Select-placeholder, .idd-m2 .Select-placeholder { font-size: 0.82rem !important }
+.idd-m .Select-input > input, .idd-m2 .Select-input > input { font-size: 0.82rem !important }
+.idd-m2 { width: 485px !important }
 .idd-t { width: 194px !important; min-width: 194px !important; flex-shrink: 0 }
 .idd-t .Select-control { min-height: 30px !important; border-radius: 7px !important; background: %(hover_bg)s !important; border-color: rgba(15,23,42,0.07) !important }
 .idd-t .Select-value { line-height: 30px !important }
@@ -2478,6 +2478,7 @@ body {
 .is-focused .Select-control { border-color: %(primary)s !important; box-shadow: 0 0 0 3px %(accent_light)s !important }
 .Select-menu-outer { border-radius: 9px !important; box-shadow: 0 6px 24px rgba(15,23,42,0.12), 0 2px 6px rgba(15,23,42,0.06) !important; border: 1px solid rgba(15,23,42,0.06) !important; margin-top: 4px !important; overflow: hidden }
 .Select-option { font-size: 0.70rem !important; padding: 8px 12px !important; transition: background 0.1s ease }
+.idd-m .Select-option, .idd-m2 .Select-option { font-size: 0.82rem !important; padding: 10px 13px !important }
 .Select-option.is-focused { background: %(accent_light)s !important }
 .Select-option.is-selected { background: %(primary)s !important; color: #fff !important }
 .Select-option.is-selected .metric-opt-name { color: #fff !important }
