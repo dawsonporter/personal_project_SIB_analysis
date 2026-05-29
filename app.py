@@ -1730,8 +1730,10 @@ class DashboardBuilder:
                     html.Div([
                         html.Div([
                             html.H6("JPMorgan Chase \u2014 All Metrics", className="ct", style={"color": "#fff"}),
-                            dcc.Dropdown(id='det-date', options=self._do, value=dv,
-                                         clearable=False, searchable=False, className="idd-d-light"),
+                            html.Select(
+                                [html.Option(opt['label'], value=opt['value']) for opt in self._do],
+                                id='det-date', value=dv, className="idd-d-light det-date-select"
+                            ),
                             html.Div([
                                 html.Span("\u25b8", className="legend-dot", style={'color': CS['good']}),
                                 html.Span("Better", className="legend-txt"),
@@ -2496,21 +2498,12 @@ min-height:432px;display:flex;flex-direction:column;}
 .det-card{background:linear-gradient(110deg,#0f2a4a,#1a3a5c);}
 .det-hdr{color:#fff;}
 .det-hdr .idd-d-light{min-width:150px;}
-/* Keep the All Metrics date dropdown readable inside the dark header.
-   Without these overrides, the header's white text color can inherit into
-   Dash's React-Select selected value while the control background remains white. */
-.det-hdr .idd-d-light .Select-control{background:#fff!important;border-color:rgba(255,255,255,0.72)!important;border-radius:8px!important;min-height:34px!important;height:34px!important;box-shadow:none!important;}
-.det-hdr .idd-d-light .Select-value,.det-hdr .idd-d-light .Select-placeholder{line-height:32px!important;}
-.det-hdr .idd-d-light .Select-value-label,.det-hdr .idd-d-light .Select-placeholder{color:var(--primary-dark)!important;font-weight:700!important;}
-.det-hdr .idd-d-light .Select-input{height:32px!important;}
-.det-hdr .idd-d-light .Select-input>input{color:var(--text)!important;}
-.det-hdr .idd-d-light .Select-arrow{border-top-color:var(--primary-dark)!important;}
-.det-hdr .idd-d-light.is-open>.Select-control .Select-arrow{border-top-color:transparent!important;border-bottom-color:var(--primary-dark)!important;}
-.det-hdr .idd-d-light .Select-menu-outer{background:#fff!important;color:var(--text)!important;border:1px solid var(--border)!important;border-radius:0 0 8px 8px!important;z-index:9999!important;}
-.det-hdr .idd-d-light .VirtualizedSelectOption{background:#fff!important;color:var(--text)!important;font-weight:600!important;}
-.det-hdr .idd-d-light .VirtualizedSelectFocusedOption{background:#f1f5f9!important;color:var(--text)!important;}
-.det-hdr .idd-d-light .Select-option{background:#fff!important;color:var(--text)!important;font-weight:600!important;}
-.det-hdr .idd-d-light .Select-option.is-focused{background:#f1f5f9!important;color:var(--text)!important;}
+/* Native select for the All Metrics as-of date.
+   This avoids Dash/React-Select version-specific selected-value classes and
+   guarantees the selected date remains visible on the dark export header. */
+.det-hdr #det-date.det-date-select{min-width:154px;height:34px;padding:0 34px 0 10px;border-radius:8px;border:1px solid rgba(255,255,255,0.72);background-color:#fff;color:var(--text)!important;font-size:12px;font-weight:700;line-height:34px;cursor:pointer;outline:none;box-shadow:none;}
+.det-hdr #det-date.det-date-select:focus{border-color:#fff;box-shadow:0 0 0 2px rgba(255,255,255,0.22);}
+.det-hdr #det-date.det-date-select option{background:#fff;color:var(--text);font-weight:600;}
 .det-legend{display:flex;align-items:center;gap:6px;color:#fff;font-size:11px;}
 .legend-dot{font-size:11px;}
 .export-btn{font-size:12px;font-weight:600;padding:7px 14px;border-radius:8px;border:none;
