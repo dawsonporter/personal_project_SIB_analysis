@@ -308,7 +308,7 @@ METRIC_DEFINITIONS = {
     'Net Interest Margin': "Margin \xb7 Net interest income (TE) as % of avg earning assets. Typical: 2.50\u20133.80%. FDIC field: NIMY. UBPR Pg1 #21 (UBPRE018).",
     'Cost of Funding Earning Assets': "Margin \xb7 Interest expense as % of avg earning assets. FDIC field: INTEXPYQ. UBPR Pg1 #20 (UBPRE017).",
     'Earning Assets / Total Assets': "Margin \xb7 Earning assets as % of total assets. FDIC field: ERNASTR. UBPR Pg1 #17 (UBPRE014).",
-    'Efficiency Ratio': "Margin \xb7 NIE / (NII + noninterest income). Lower is better. FDIC field: EEFFR. UBPR Pg3 (UBPRE095).",
+    'Efficiency Ratio': "Margin \xb7 NIE / (NII + noninterest income). Lower ratio indicates greater efficiency. FDIC field: EEFFR. UBPR Pg3 (UBPRE095).",
     'Noninterest Expense to Average Assets': "Margin \xb7 Total noninterest expense as % of avg assets. FDIC field: NONIXR. UBPR Pg1 #5 (UBPRE005).",
     'Salaries and Benefits to Average Assets': "Margin \xb7 Personnel expense as % of avg assets. FDIC field: ESALR. UBPR Pg3.",
     'Noninterest Income to Average Assets': "Margin \xb7 Total fee/noninterest income as % of avg assets. FDIC field: NONIIR. UBPR Pg1 #4 (UBPRE004).",
@@ -620,14 +620,14 @@ def compute_peer_rank(df, date, metric, bank):
     if len(other_vals) == 0:
         return (1, total, None)
     if inverse:
-        better = sum(1 for v in other_vals if v < bank_val)
-        worse = sum(1 for v in other_vals if v > bank_val)
+        favorable = sum(1 for v in other_vals if v < bank_val)
+        unfavorable = sum(1 for v in other_vals if v > bank_val)
     else:
-        better = sum(1 for v in other_vals if v > bank_val)
-        worse = sum(1 for v in other_vals if v < bank_val)
-    ties = len(other_vals) - better - worse
-    rank = better + 1
-    pct = ((worse + 0.5 * ties) / len(other_vals)) * 100
+        favorable = sum(1 for v in other_vals if v > bank_val)
+        unfavorable = sum(1 for v in other_vals if v < bank_val)
+    ties = len(other_vals) - favorable - unfavorable
+    rank = favorable + 1
+    pct = ((unfavorable + 0.5 * ties) / len(other_vals)) * 100
     return (rank, total, pct)
 
 
@@ -1734,9 +1734,9 @@ class DashboardBuilder:
                                          clearable=False, searchable=False, className="idd-d-light"),
                             html.Div([
                                 html.Span("\u25b8", className="legend-dot", style={'color': CS['good']}),
-                                html.Span("Better", className="legend-txt"),
+                                html.Span("Favorable", className="legend-txt"),
                                 html.Span("\u25b8", className="legend-dot", style={'color': CS['bad']}),
-                                html.Span("Worse", className="legend-txt"),
+                                html.Span("Unfavorable", className="legend-txt"),
                             ], className="det-legend"),
                             html.Div(style={"flex": "1"}),
                             html.Button([
@@ -2032,9 +2032,9 @@ class DashboardBuilder:
             if np.isclose(gv, pmed, equal_nan=False):
                 pf, pc, pi = "At Peer Median", CS['peer_band_mid'], "\u2022"
             elif (gv < pmed and inverse) or (gv > pmed and not inverse):
-                pf, pc, pi = "Better than Peer Median", CS['peer_band_top'], "\u25b4"
+                pf, pc, pi = "Above Peer Median", CS['peer_band_top'], "\u25b4"
             else:
-                pf, pc, pi = "Worse than Peer Median", CS['peer_band_low'], "\u25be"
+                pf, pc, pi = "Below Peer Median", CS['peer_band_low'], "\u25be"
         else:
             q1, q3 = np.percentile(peer_vals, [25, 75])
             if inverse:
