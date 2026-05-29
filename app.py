@@ -84,7 +84,7 @@ CS = {
     'spark': '#005EB8', 'spark_area': 'rgba(0,94,184,0.08)',
 }
 
-CACHE_SCHEMA_VERSION = "v9_sib_jpm_20030331_no_comerica"
+CACHE_SCHEMA_VERSION = "v10_sib_jpm_20030331_financials_first"
 
 BANK_INFO = [
     # Primary FDIC-insured bank charters for the selected U.S. systemically
@@ -656,14 +656,26 @@ class FDICAPIClient:
     def __init__(self):
         self.base_url = BASE_URL
 
-    def _get(self, ep, params, attempts=3):
+    def _get(self, ep, params, attempts=4):
+        """Small hardened wrapper around BankFind API GET calls.
+
+        The FDIC API normally respects the Accept header, but including
+        format=json makes the desired response type explicit and removes one
+        more variable when the endpoint is under load or fronted by cache/CDN.
+        """
         last_error = None
+        params = dict(params or {})
+        params.setdefault("format", "json")
+
         for attempt in range(1, attempts + 1):
             try:
                 r = requests.get(
                     f"{self.base_url}/{ep}",
                     params=params,
-                    headers={"Accept": "application/json"},
+                    headers={
+                        "Accept": "application/json",
+                        "User-Agent": "DawsonPorter-SIB-Dashboard/1.0",
+                    },
                     verify=False,
                     timeout=45,
                 )
@@ -678,9 +690,12 @@ class FDICAPIClient:
                 last_error = f"request error: {e}"
             except (ValueError, KeyError) as e:
                 last_error = f"parse error: {e}"
+
             if attempt < attempts:
                 logger.warning(f"FDIC API {ep} attempt {attempt}/{attempts} failed; retrying. Reason: {last_error}")
-                time.sleep(min(2 * attempt, 5))
+                # Slightly wider backoff helps with occasional FDIC/API edge-cache hiccups.
+                time.sleep(min((2 ** attempt), 10))
+
         logger.warning(f"FDIC API failed after {attempts} attempts for {ep}. Last error: {last_error}")
         return {"data": [], "_error": last_error}
 
@@ -744,6 +759,19 @@ class BankDataRepository:
                 pass
 
     def fetch_data(self, bi, sd, ed):
+        """Fetch real FDIC financials for the configured peer set.
+
+        Important design choice:
+        - Financial records are the real data the dashboard needs.
+        - Institution records are useful metadata only.
+        - Therefore, an intermittent empty /institutions response should not
+          block a bank whose /financials records were successfully retrieved.
+
+        No synthetic financials are ever created. If a bank's financials are
+        unavailable, that bank is excluded and surfaced as missing in the
+        dashboard. If the primary benchmark bank is missing, the dashboard
+        fails closed because peer analytics without JPMorgan would be misleading.
+        """
         expected_certs = {str(b["cert"]).strip() for b in bi}
         expected_count = len(expected_certs)
 
@@ -772,52 +800,113 @@ class BankDataRepository:
                 f"financials {len(cached_fin_certs)}/{expected_count} (missing certs: {sorted(missing)}). "
                 f"Discarding and re-fetching. (pid={os.getpid()})")
 
+        cert_to_display = {str(b["cert"]).strip(): b.get("display", f"CERT {b['cert']}") for b in bi}
+        primary_cert = next(
+            (str(b["cert"]).strip() for b in bi if b.get("display") == PRIMARY_BANK_DISPLAY_NAME),
+            None
+        )
+
         inst, fins = {}, {}
-        failed = []
+        metadata_warnings = []
+        financial_failures = []
+
         for b in bi:
-            cert = b["cert"]
+            cert = str(b["cert"]).strip()
             display = b.get("display", f"CERT {cert}")
+
+            # Pull financials first. This is the canonical real-data dependency.
+            try:
+                fn = self.api.get_financials(cert, f"REPDTE:[{sd} TO {ed}]", self.FF)
+                fin_data = [f['data'] for f in fn if isinstance(f, dict) and 'data' in f]
+                fin_data = [
+                    row for row in fin_data
+                    if isinstance(row, dict) and str(row.get('CERT', '')).strip() == cert
+                ]
+            except (KeyError, TypeError, ValueError) as exc:
+                fin_data = []
+                financial_failures.append((cert, display, f"{type(exc).__name__}: {exc}"))
+
+            if not fin_data:
+                if not any(cert == failed_cert for failed_cert, _, _ in financial_failures):
+                    financial_failures.append((cert, display, f"No financial records in date range {sd}-{ed}."))
+                continue
+
+            # Institution metadata is helpful but should not be a hard blocker.
+            # The FDIC /institutions endpoint can occasionally return empty for
+            # a valid CERT even when /financials still returns real records.
+            fdic_key = display
+            bd = {"NAME": display, "CERT": cert, "_metadata_source": "configured_display_after_institution_lookup_miss"}
             try:
                 ii = self.api.get_institutions(f'CERT:{cert}', "NAME,CERT")
                 if not ii:
-                    failed.append((cert, display, "FDIC API returned no institution record."))
-                    continue
-                bk = ii[0]
-                if not (isinstance(bk, dict) and 'data' in bk):
-                    failed.append((cert, display, "FDIC API returned malformed institution response."))
-                    continue
-                bd = bk['data']
-                if 'NAME' not in bd:
-                    failed.append((cert, display, "FDIC institution response missing NAME field."))
-                    continue
-                fdic_name = bd['NAME']
-                logger.debug(f"FDIC fetched: cert {cert} -> '{fdic_name}' -> display '{display}'")
-                fn = self.api.get_financials(cert, f"REPDTE:[{sd} TO {ed}]", self.FF)
-                fin_data = [f['data'] for f in fn if isinstance(f, dict) and 'data' in f]
-                if not fin_data:
-                    failed.append((cert, display, f"No financial records in date range {sd}-{ed}."))
-                    continue
-                inst[fdic_name] = bd
-                fins[fdic_name] = fin_data
-            except (KeyError, TypeError, ValueError) as exc:
-                failed.append((cert, display, f"{type(exc).__name__}: {exc}"))
+                    # Try quoted form too. This costs one small call and covers
+                    # occasional query-parser differences between numeric/string fields.
+                    ii = self.api.get_institutions(f'CERT:"{cert}"', "NAME,CERT")
 
-        if not inst:
-            failure_summary = '; '.join(f"{d} (cert {c}): {r}" for c, d, r in failed)
+                if ii and isinstance(ii[0], dict) and 'data' in ii[0]:
+                    candidate = ii[0]['data']
+                    candidate_cert = str(candidate.get('CERT', '')).strip()
+                    if candidate_cert == cert and candidate.get('NAME'):
+                        bd = candidate
+                        fdic_key = candidate['NAME']
+                    else:
+                        metadata_warnings.append((
+                            cert, display,
+                            f"FDIC institution metadata did not validate against cert {cert}; using configured display name."
+                        ))
+                else:
+                    metadata_warnings.append((
+                        cert, display,
+                        "FDIC API returned no institution record; using configured display name because financials validated."
+                    ))
+            except (KeyError, TypeError, ValueError) as exc:
+                metadata_warnings.append((cert, display, f"Institution metadata lookup failed ({type(exc).__name__}: {exc}); using configured display name."))
+
+            logger.debug(f"FDIC fetched financials: cert {cert} -> key '{fdic_key}' -> display '{display}'")
+            inst[fdic_key] = bd
+            fins[fdic_key] = fin_data
+
+        if not fins:
+            failure_summary = '; '.join(f"{d} (cert {c}): {r}" for c, d, r in financial_failures)
             raise FDICDataUnavailableError(
-                f"FDIC BankFind API returned no usable data for any of the {len(bi)} requested banks. "
+                f"FDIC BankFind API returned no usable financial data for any of the {len(bi)} requested banks. "
                 f"Synthetic fallback has been removed by design. Failures: {failure_summary}")
+
+        if primary_cert and not any(
+            str(row.get('CERT', '')).strip() == primary_cert
+            for rows in fins.values()
+            for row in rows
+            if isinstance(row, dict)
+        ):
+            failure_summary = '; '.join(f"{d} (cert {c}): {r}" for c, d, r in financial_failures)
+            raise FDICDataUnavailableError(
+                f"Primary bank {PRIMARY_BANK_DISPLAY_NAME} (cert {primary_cert}) financials were unavailable. "
+                f"Dashboard not rendered because the benchmark bank is required. Failures: {failure_summary}")
+
+        for cert, display, reason in metadata_warnings:
+            logger.warning(f"FDIC institution metadata warning for {display} (cert {cert}): {reason}")
 
         result = {'institutions_data': inst, 'financials_data': fins}
 
-        if failed:
-            for cert, display, reason in failed:
-                logger.warning(f"FDIC fetch failed for {display} (cert {cert}): {reason}")
-            failure_summary = '; '.join(f"{d} (cert {c}): {r}" for c, d, r in failed)
-            logger.error(f"FDIC fetch INCOMPLETE: {len(failed)} of {len(bi)} banks failed. (pid={os.getpid()})")
-            raise FDICDataUnavailableError(
-                f"Incomplete FDIC BankFind fetch: {len(failed)} of {len(bi)} configured banks failed "
-                f"after retries. Failures: {failure_summary}")
+        loaded_fin_certs = set()
+        for fin_rows in fins.values():
+            for row in fin_rows:
+                if isinstance(row, dict) and row.get('CERT'):
+                    loaded_fin_certs.add(str(row['CERT']).strip())
+        missing_fin_certs = expected_certs - loaded_fin_certs
+
+        if financial_failures:
+            for cert, display, reason in financial_failures:
+                logger.warning(f"FDIC financial fetch failed for {display} (cert {cert}): {reason}")
+            missing_names = [cert_to_display.get(c, f"CERT {c}") for c in sorted(missing_fin_certs)]
+            logger.error(
+                f"FDIC fetch PARTIAL: {len(loaded_fin_certs)} of {expected_count} banks loaded. "
+                f"Missing banks: {missing_names}. Dashboard will render with available real data only. "
+                f"(pid={os.getpid()})"
+            )
+            # Do not cache partial financial pulls. That forces the next startup
+            # to retry missing banks instead of preserving a temporary outage.
+            return result
 
         logger.info(f"FDIC fetch COMPLETE: all {len(bi)} banks. Writing cache. (pid={os.getpid()})")
         self._sc(result, sd, ed)
