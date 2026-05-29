@@ -2071,13 +2071,10 @@ class DashboardBuilder:
                 sr("Peer Average", peer_avg),
                 sr("Peer Median", peer_median),
                 sr(self.GHB, f(gv) if gv is not None else "N/A", h=True),
+                sr_colored(f"{PRIMARY_BANK_ABBR} QoQ Change", qoq_text, qoq_color),
+                sr_colored(f"{PRIMARY_BANK_ABBR} YoY Change", yoy_text, yoy_color),
                 sr("Peer High", peer_high),
                 sr("Peer Low", peer_low)
-            ], className="os"),
-            html.Div([
-                html.Div("JPM Momentum", className="ost"),
-                sr_colored("QoQ Change", qoq_text, qoq_color),
-                sr_colored("YoY Change", yoy_text, yoy_color),
             ], className="os"),
         ], className="ow")
 
@@ -2447,9 +2444,14 @@ border-radius:12px;padding:16px 18px;margin-bottom:16px;}
 .exec-delta{display:flex;align-items:center;gap:6px;}
 .exec-delta-label{font-size:10px;color:var(--text3);font-weight:600;}
 .exec-delta-val{font-size:12px;font-weight:600;}
-.peer-control-grid,.corr-control-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
+.peer-control-grid{display:flex;align-items:flex-end;flex-wrap:wrap;gap:14px;margin-bottom:14px;}
+.corr-control-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
 gap:14px;margin-bottom:14px;align-items:end;}
-.peer-control-peers{grid-column:1/-1;}
+.peer-control-metric{flex:1 1 560px;min-width:420px;}
+.peer-control-date{flex:0 0 178px;min-width:160px;}
+.peer-control-peers{flex:1 0 100%;}
+.peer-metric-dd,.peer-date-dd{width:100%;}
+.peer-metric-dd .Select-value-label{white-space:normal;line-height:1.2;}
 .peer-control-label{display:block;font-size:10px;font-weight:600;text-transform:uppercase;
 letter-spacing:0.4px;color:var(--text3);margin-bottom:5px;}
 .peer-select-row{display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap;}
@@ -2537,7 +2539,8 @@ color:var(--text3);margin-bottom:4px;}
 .metric-opt-name{font-size:12px;color:var(--text);}
 .emp{color:var(--text3);font-size:12px;text-align:center;padding:20px;}
 .spark-img{display:block;}
-@media (max-width:768px){.pair-col{flex:0 0 100%;max-width:100%;}.hdr-meta{text-align:left;}}
+@media (max-width:768px){.pair-col{flex:0 0 100%;max-width:100%;}.hdr-meta{text-align:left;}
+.peer-control-grid{display:grid;grid-template-columns:1fr;}.peer-control-metric,.peer-control-date,.peer-control-peers{min-width:0;width:100%;}}
 </style>
 </head>
 <body>
