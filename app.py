@@ -2039,16 +2039,16 @@ class DashboardBuilder:
             q1, q3 = np.percentile(peer_vals, [25, 75])
             if inverse:
                 if gv <= q1:
-                    pf, pc, pi = "Top Quartile (best)", CS['peer_band_top'], "\u25b4"
+                    pf, pc, pi = "Top Quartile", CS['peer_band_top'], "\u25b4"
                 elif gv >= q3:
-                    pf, pc, pi = "Bottom Quartile (worst)", CS['peer_band_low'], "\u25be"
+                    pf, pc, pi = "Bottom Quartile", CS['peer_band_low'], "\u25be"
                 else:
                     pf, pc, pi = "Middle 50%", CS['peer_band_mid'], "\u2022"
             else:
                 if gv >= q3:
-                    pf, pc, pi = "Top Quartile (best)", CS['peer_band_top'], "\u25b4"
+                    pf, pc, pi = "Top Quartile", CS['peer_band_top'], "\u25b4"
                 elif gv <= q1:
-                    pf, pc, pi = "Bottom Quartile (worst)", CS['peer_band_low'], "\u25be"
+                    pf, pc, pi = "Bottom Quartile", CS['peer_band_low'], "\u25be"
                 else:
                     pf, pc, pi = "Middle 50%", CS['peer_band_mid'], "\u2022"
 
@@ -2206,18 +2206,16 @@ class DashboardBuilder:
                             className="or" + (" oh" if h else ""))
 
         if peer_growth:
-            best_key = (lambda x: x[1]['g'])
-            best_peer_name, best_peer_stats = (min(peer_growth.items(), key=best_key)
-                                               if inverse else max(peer_growth.items(), key=best_key))
-            worst_peer_name, worst_peer_stats = (max(peer_growth.items(), key=best_key)
-                                                 if inverse else min(peer_growth.items(), key=best_key))
+            change_key = (lambda x: x[1]['g'])
+            highest_peer_name, highest_peer_stats = max(peer_growth.items(), key=change_key)
+            lowest_peer_name, lowest_peer_stats = min(peer_growth.items(), key=change_key)
             avg_peer_growth = fg(np.nanmean([s['g'] for s in peer_growth.values()]))
-            best_peer_text = f"{best_peer_name} ({fg(best_peer_stats['g'])})"
-            worst_peer_text = f"{worst_peer_name} ({fg(worst_peer_stats['g'])})"
+            highest_peer_text = f"{highest_peer_name} ({fg(highest_peer_stats['g'])})"
+            lowest_peer_text = f"{lowest_peer_name} ({fg(lowest_peer_stats['g'])})"
         else:
             avg_peer_growth = "N/A"
-            best_peer_text = "N/A"
-            worst_peer_text = "N/A"
+            highest_peer_text = "N/A"
+            lowest_peer_text = "N/A"
         change_label = "Growth" if isdol else "Change"
         trend_window_label = "Full-History Trend" if str(y).upper() == "FULL" else f"{y}Y Trend"
         return html.Div([
@@ -2235,8 +2233,8 @@ class DashboardBuilder:
                 sr("Avg Peer Volatility (CV)", avg_peer_cv),
                 sr("Most Similar (Correlation)", fcorr(most_similar)),
                 sr("Least Similar (Correlation)", fcorr(least_similar)),
-                sr("Best Peer Improvement" if inverse else f"Best Peer {change_label}", best_peer_text),
-                sr("Worst Peer Deterioration" if inverse else f"Worst Peer {change_label}", worst_peer_text)
+                sr("Highest Peer Change", highest_peer_text),
+                sr("Lowest Peer Change", lowest_peer_text)
             ], className="os")
         ], className="ow")
 
