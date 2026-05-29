@@ -1971,8 +1971,11 @@ class DashboardBuilder:
         tfmt = ',.0f' if isdol else '.2f'
         y_title = '$000s' if isdol else ('%' if ispct else None)
         fig.update_layout(**self._bl(
-            margin=dict(l=48, r=12, t=24, b=68),
-            xaxis=dict(tickangle=-35, tickfont=dict(size=9.5), showgrid=False, showline=False),
+            margin=dict(l=48, r=12, t=24, b=78),
+            xaxis=dict(title_text="Selected SIB Peers",
+                       title_font=dict(size=9, color=CS['text3']),
+                       title_standoff=12, tickangle=-35, tickfont=dict(size=9.5),
+                       showgrid=False, showline=False),
             yaxis=dict(title_text=y_title, title_font=dict(size=9, color=CS['text3']),
                        tickformat=tfmt, range=[y_min, y_max], showgrid=True,
                        gridcolor=CS['grid'], showline=False, tickfont=dict(size=9.5),
@@ -2065,14 +2068,17 @@ class DashboardBuilder:
         ], className="pct-gauge-section")
 
         return html.Div([
+            html.Div([
+                html.Div(f"{self.GHB} Result{unit_note}", className="ost"),
+                sr(self.GHB, f(gv) if gv is not None else "N/A", h=True),
+                sr_colored(f"{PRIMARY_BANK_ABBR} QoQ Change", qoq_text, qoq_color),
+                sr_colored(f"{PRIMARY_BANK_ABBR} YoY Change", yoy_text, yoy_color),
+            ], className="os"),
             gauge_section,
             html.Div([
                 html.Div(f"Peer Snapshot{unit_note}", className="ost"),
                 sr("Peer Average", peer_avg),
                 sr("Peer Median", peer_median),
-                sr(self.GHB, f(gv) if gv is not None else "N/A", h=True),
-                sr_colored(f"{PRIMARY_BANK_ABBR} QoQ Change", qoq_text, qoq_color),
-                sr_colored(f"{PRIMARY_BANK_ABBR} YoY Change", yoy_text, yoy_color),
                 sr("Peer High", peer_high),
                 sr("Peer Low", peer_low)
             ], className="os"),
@@ -2444,12 +2450,13 @@ border-radius:12px;padding:16px 18px;margin-bottom:16px;}
 .exec-delta{display:flex;align-items:center;gap:6px;}
 .exec-delta-label{font-size:10px;color:var(--text3);font-weight:600;}
 .exec-delta-val{font-size:12px;font-weight:600;}
-.peer-control-grid{display:flex;align-items:flex-end;flex-wrap:wrap;gap:14px;margin-bottom:14px;}
+.peer-control-grid{display:grid;grid-template-columns:minmax(440px,640px) 178px;align-items:end;
+gap:14px;margin-bottom:14px;justify-content:start;}
 .corr-control-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
 gap:14px;margin-bottom:14px;align-items:end;}
-.peer-control-metric{flex:1 1 560px;min-width:420px;}
-.peer-control-date{flex:0 0 178px;min-width:160px;}
-.peer-control-peers{flex:1 0 100%;}
+.peer-control-metric{min-width:0;max-width:640px;}
+.peer-control-date{min-width:160px;}
+.peer-control-peers{grid-column:1 / -1;min-width:0;width:100%;}
 .peer-metric-dd,.peer-date-dd{width:100%;}
 .peer-metric-dd .Select-value-label{white-space:normal;line-height:1.2;}
 .peer-control-label{display:block;font-size:10px;font-weight:600;text-transform:uppercase;
@@ -2540,7 +2547,7 @@ color:var(--text3);margin-bottom:4px;}
 .emp{color:var(--text3);font-size:12px;text-align:center;padding:20px;}
 .spark-img{display:block;}
 @media (max-width:768px){.pair-col{flex:0 0 100%;max-width:100%;}.hdr-meta{text-align:left;}
-.peer-control-grid{display:grid;grid-template-columns:1fr;}.peer-control-metric,.peer-control-date,.peer-control-peers{min-width:0;width:100%;}}
+.peer-control-grid{grid-template-columns:1fr;}.peer-control-metric,.peer-control-date,.peer-control-peers{min-width:0;max-width:none;width:100%;}}
 </style>
 </head>
 <body>
