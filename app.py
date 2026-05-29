@@ -16,6 +16,8 @@ import json
 import os
 import io
 import ssl
+import glob
+import random
 import hashlib
 import time
 from dash.exceptions import PreventUpdate
@@ -39,18 +41,15 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 PRIMARY_BANK_DISPLAY_NAME = "JPMorgan Chase"
 PRIMARY_BANK_ABBR = "JPM"
 PRIMARY_BANK_FDIC_NAME = "JPMorgan Chase Bank, National Association"
-DASHBOARD_TITLE = "JPMorgan Chase — Systemically Important Banks Dashboard"
+DASHBOARD_TITLE = "JPMorgan Chase \u2014 Systemically Important Banks Dashboard"
 DASHBOARD_SHORT_TITLE = "SIB Dashboard"
 PEER_UNIVERSE_LABEL = "Systemically Important Banks (SIBs)"
-HEADER_DISCLOSURE_SHORT = "Personal project · public FDIC data · not affiliated with JPMorgan Chase"
+HEADER_DISCLOSURE_SHORT = "Personal project \u00b7 public FDIC data \u00b7 not affiliated with JPMorgan Chase"
 FOOTER_DISCLOSURE_NOTE = "Independent personal project using public FDIC data; not affiliated with or endorsed by JPMorgan Chase."
 PAIRED_GRAPH_HEIGHT = 340
 PAIRED_CARD_MIN_HEIGHT = 432
 OVERVIEW_GAUGE_SIZE = 78
 
-# Charts are intentionally read-only from a viewport perspective. Users can
-# still hover for values, but scroll/drag zoom is disabled to avoid accidental
-# range changes and confusing reset behavior.
 GRAPH_CONFIG = {
     'displayModeBar': False,
     'scrollZoom': False,
@@ -59,12 +58,9 @@ GRAPH_CONFIG = {
     'responsive': True,
 }
 
-# 45 days: safely below the ~90-day quarter gap so closest-match prior-period
-# lookups can never grab an adjacent quarter. See compute_period_deltas.
 PRIOR_PERIOD_TOLERANCE_DAYS = 45
 
 CS = {
-    # JPMorgan Chase-inspired blue theme for the primary benchmarked bank.
     'primary': '#005EB8', 'primary_light': '#2F7FD3', 'primary_dark': '#003B73',
     'secondary': '#333333', 'accent': '#0B4F8A', 'accent_light': '#E8F2FC',
     'bg': '#f4f6f9', 'bg_elevated': '#ffffff',
@@ -84,12 +80,9 @@ CS = {
     'spark': '#005EB8', 'spark_area': 'rgba(0,94,184,0.08)',
 }
 
-CACHE_SCHEMA_VERSION = "v10_sib_jpm_20030331_financials_first"
+CACHE_SCHEMA_VERSION = "v9_sib_jpm_20030331_no_comerica"
 
 BANK_INFO = [
-    # Primary FDIC-insured bank charters for the selected U.S. systemically
-    # important / large-bank peer set. Display names are intentionally concise
-    # for dashboard readability; BANK_NAME_MAPPING below preserves exact FDIC names.
     {"cert": "628",   "display": "JPMorgan Chase"},
     {"cert": "3510",  "display": "Bank of America"},
     {"cert": "3511",  "display": "Wells Fargo"},
@@ -112,6 +105,10 @@ BANK_INFO = [
 ]
 
 CERT_TO_DISPLAY = {b["cert"]: b["display"] for b in BANK_INFO}
+
+# The primary bank's cert is the one hard requirement for the dashboard to
+# render; derived from BANK_INFO so it can never drift out of sync.
+PRIMARY_BANK_CERT = next(b["cert"] for b in BANK_INFO if b["display"] == PRIMARY_BANK_DISPLAY_NAME)
 
 BANK_NAME_MAPPING = {
     "JPMORGAN CHASE BANK, NATIONAL ASSOCIATION": "JPMorgan Chase",
@@ -272,9 +269,6 @@ INVERSE_METRICS = {
     'Gross Charge-Offs (YTD)', 'Gross Charge-Offs (Quarter)', 'Noncurrent Loans',
 }
 
-# FIX #1: UBPR "X multiplier" ratios. Previously empty, so these rendered as
-# "%" (e.g. "1.50%" / "151.00%"). Now rendered with an "x" suffix. The two
-# ACL coverage ratios below are also computed at scale=1.0 in _aq.
 NON_PERCENT_RATIO_METRICS = {
     'Earnings Coverage of Net Loan Charge-Offs',
     'ACL / Nonaccrual Loans',
@@ -435,7 +429,7 @@ def fmt_val(v, m=None, with_unit=False):
     if with_unit and m:
         if is_percent_metric(m):
             return f"{out}%"
-        if is_multiplier_metric(m):       # FIX #1
+        if is_multiplier_metric(m):
             return f"{out}x"
     return out
 
@@ -457,7 +451,7 @@ def fmt_delta(curr, prev, metric=None):
     else:
         if metric and is_percent_metric(metric):
             display = f"{diff:+.2f} pp"
-        elif metric and is_multiplier_metric(metric):   # FIX #1
+        elif metric and is_multiplier_metric(metric):
             display = f"{diff:+.2f}x"
         else:
             display = f"{diff:+.2f}"
@@ -497,7 +491,7 @@ def fmt_trend_change(value, metric=None):
         return "N/A"
     if metric and is_dollar_metric(metric):
         return f"{v:+.2f}%"
-    if metric and is_multiplier_metric(metric):   # FIX #1
+    if metric and is_multiplier_metric(metric):
         return f"{v:+.2f}x"
     return f"{v:+.2f} pp"
 
@@ -591,8 +585,6 @@ def make_percentile_arc_img(pct, size=72, cls="pct-arc"):
 
 
 def compute_period_deltas(df, bank, metric, current_date):
-    """Return (qoq_prev_value, yoy_prev_value). YoY uses closest-match within
-    PRIOR_PERIOD_TOLERANCE_DAYS so an adjacent quarter can't be mis-matched."""
     bd = df[df['Bank'] == bank].sort_values('Date')
     if bd.empty: return (None, None)
     dates = list(bd['Date'])
@@ -657,54 +649,68 @@ class FDICAPIClient:
         self.base_url = BASE_URL
 
     def _get(self, ep, params, attempts=4):
-        """Small hardened wrapper around BankFind API GET calls.
+        """Resilient GET against the FDIC BankFind API.
 
-        The FDIC API normally respects the Accept header, but including
-        format=json makes the desired response type explicit and removes one
-        more variable when the endpoint is under load or fronted by cache/CDN.
+        Treats HTTP 429 and 5xx as retryable (the rate-limit / transient-server
+        cases that bite a cold, all-banks fetch), honors the server's
+        Retry-After when present, and uses exponential backoff with jitter so
+        multiple workers (e.g. several Heroku dynos waking at once) don't
+        synchronize their retries and re-hammer the API in lockstep.
+
+        On total failure it returns {"data": [], "_error": <reason>} so callers
+        can distinguish a genuine empty result from a transient failure.
         """
         last_error = None
-        params = dict(params or {})
-        params.setdefault("format", "json")
-
         for attempt in range(1, attempts + 1):
+            retry_after = None
             try:
                 r = requests.get(
                     f"{self.base_url}/{ep}",
                     params=params,
-                    headers={
-                        "Accept": "application/json",
-                        "User-Agent": "DawsonPorter-SIB-Dashboard/1.0",
-                    },
+                    headers={"Accept": "application/json"},
                     verify=False,
                     timeout=45,
                 )
-                r.raise_for_status()
-                payload = r.json()
-                if isinstance(payload, dict):
-                    return payload
-                last_error = f"non-dict JSON payload: {type(payload).__name__}"
+                if r.status_code == 429 or 500 <= r.status_code < 600:
+                    ra = r.headers.get('Retry-After')
+                    if ra:
+                        try:
+                            retry_after = float(ra)
+                        except (TypeError, ValueError):
+                            retry_after = None
+                    last_error = f"http {r.status_code} (rate-limited/transient)"
+                else:
+                    r.raise_for_status()
+                    payload = r.json()
+                    if isinstance(payload, dict):
+                        return payload
+                    last_error = f"non-dict JSON payload: {type(payload).__name__}"
             except requests.exceptions.Timeout as e:
                 last_error = f"timeout: {e}"
             except requests.exceptions.RequestException as e:
                 last_error = f"request error: {e}"
             except (ValueError, KeyError) as e:
                 last_error = f"parse error: {e}"
-
             if attempt < attempts:
-                logger.warning(f"FDIC API {ep} attempt {attempt}/{attempts} failed; retrying. Reason: {last_error}")
-                # Slightly wider backoff helps with occasional FDIC/API edge-cache hiccups.
-                time.sleep(min((2 ** attempt), 10))
-
+                backoff = retry_after if retry_after is not None else min(2 ** attempt, 12)
+                backoff += random.uniform(0, 0.5)
+                logger.warning(f"FDIC API {ep} attempt {attempt}/{attempts} failed "
+                               f"({last_error}); retrying in {backoff:.1f}s.")
+                time.sleep(backoff)
         logger.warning(f"FDIC API failed after {attempts} attempts for {ep}. Last error: {last_error}")
         return {"data": [], "_error": last_error}
 
     def get_institutions(self, f, fields):
-        return self._get("institutions", {"filters": f, "fields": fields, "limit": 10000}).get('data', [])
+        # Retained for completeness/ad-hoc use; NO LONGER called in the fetch
+        # hot path. Display names are resolved from CERT_TO_DISPLAY by cert, so
+        # this metadata lookup is unnecessary and was a redundant failure point.
+        payload = self._get("institutions", {"filters": f, "fields": fields, "limit": 10000})
+        return payload.get('data', []), payload.get('_error')
 
     def get_financials(self, cert, f, fields):
         flt = f"CERT:{cert}" + (f" AND {f}" if f else "")
-        return self._get("financials", {"filters": flt, "fields": fields, "limit": 10000}).get('data', [])
+        payload = self._get("financials", {"filters": flt, "fields": fields, "limit": 10000})
+        return payload.get('data', []), payload.get('_error')
 
 
 class BankDataRepository:
@@ -717,6 +723,15 @@ class BankDataRepository:
         "ROE,ROEQ,RBC1AAJ,RBCRWAJ,LNLSDEPR,LNLSNTV,"
         "EEFFR,ELNANTR,IDERNCVR,IDT1CER,IDT1RWAJR,INTEXPYQ,NONIIR,COREDEP,ROAPTX,"
         "NONIXR,DEPNIDOM,LNRESNCR,VOLIABR,NOIJY,ESALR,INTINCR,EINTEXPR,ELNATRR,INTINCY")
+
+    # Gentle pacing between per-bank financial calls to avoid tripping the FDIC
+    # rate limiter during a cold, full-peer-set fetch. ~0.4s x 19 banks ~ 8s
+    # added on a cold load only (cached afterward).
+    INTER_BANK_DELAY = 0.4
+    # Minimum real peer banks (excluding the primary) needed to render
+    # meaningful benchmarking statistics (quartiles need 4+). Below this, the
+    # dashboard prefers a complete cached fallback over a misleading partial.
+    MIN_PEERS_REQUIRED = 5
 
     def __init__(self):
         self.api = FDICAPIClient()
@@ -742,8 +757,8 @@ class BankDataRepository:
         return None
 
     def _sc(self, d, s, e):
-        # FIX #3: atomic write. Write to a per-PID temp file and os.replace()
-        # into place so a reader never sees a half-written cache.
+        # Atomic write: write to a per-PID temp file and os.replace() into place
+        # so a reader never sees a half-written cache.
         path = self._cp(s, e)
         tmp = f"{path}.tmp.{os.getpid()}"
         try:
@@ -758,157 +773,134 @@ class BankDataRepository:
             except OSError:
                 pass
 
+    @staticmethod
+    def _financials_complete(cache_obj, expected_certs):
+        """Return (is_complete, set_of_certs_present), judged purely on the
+        financials payload (the only data that matters for rendering)."""
+        if not isinstance(cache_obj, dict):
+            return False, set()
+        fin_certs = set()
+        for rows in cache_obj.get('financials_data', {}).values():
+            if isinstance(rows, list):
+                for row in rows:
+                    if isinstance(row, dict) and row.get('CERT'):
+                        fin_certs.add(str(row['CERT']).strip())
+        return fin_certs >= expected_certs, fin_certs
+
+    def _latest_complete_cache(self, bi):
+        """Newest on-disk cache (any date range, same bank set) that holds real
+        data for every expected bank. Used as a graceful fallback when a live
+        fetch can't meet the render thresholds. On an ephemeral filesystem
+        (e.g. Heroku) this may legitimately find nothing, in which case the
+        partial-render + retry-next-load path is the primary protection."""
+        expected = {str(b['cert']).strip() for b in bi}
+        h = self._bank_set_hash(bi)
+        pattern = os.path.join(CACHE_DIR, f"bank_data_*_{h}.json")
+        best = None
+        best_mtime = None
+        for path in glob.glob(pattern):
+            try:
+                with open(path) as f:
+                    obj = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+            complete, _ = self._financials_complete(obj, expected)
+            if not complete:
+                continue
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if best_mtime is None or mtime > best_mtime:
+                best_mtime = mtime
+                best = (obj, path)
+        return best
+
     def fetch_data(self, bi, sd, ed):
-        """Fetch real FDIC financials for the configured peer set.
-
-        Important design choice:
-        - Financial records are the real data the dashboard needs.
-        - Institution records are useful metadata only.
-        - Therefore, an intermittent empty /institutions response should not
-          block a bank whose /financials records were successfully retrieved.
-
-        No synthetic financials are ever created. If a bank's financials are
-        unavailable, that bank is excluded and surfaced as missing in the
-        dashboard. If the primary benchmark bank is missing, the dashboard
-        fails closed because peer analytics without JPMorgan would be misleading.
-        """
         expected_certs = {str(b["cert"]).strip() for b in bi}
         expected_count = len(expected_certs)
 
+        # 1) Exact-range cache hit (fully complete) -> serve immediately.
         c = self._lc(sd, ed)
         if c:
-            cached_inst_certs = {
-                str(bd['CERT']).strip()
-                for bd in c.get('institutions_data', {}).values()
-                if isinstance(bd, dict) and bd.get('CERT')
-            }
-            cached_fin_certs = set()
-            for fin_rows in c.get('financials_data', {}).values():
-                if not isinstance(fin_rows, list):
-                    continue
-                for row in fin_rows:
-                    if isinstance(row, dict) and row.get('CERT'):
-                        cached_fin_certs.add(str(row['CERT']).strip())
-            complete_inst = cached_inst_certs >= expected_certs
-            complete_fin = cached_fin_certs >= expected_certs
-            if complete_inst and complete_fin:
+            complete, cached_fin_certs = self._financials_complete(c, expected_certs)
+            if complete:
                 logger.info(f"Cache hit (pid={os.getpid()}): complete data for all {expected_count} banks.")
                 return c
-            missing = expected_certs - (cached_inst_certs & cached_fin_certs)
+            missing = expected_certs - cached_fin_certs
             logger.warning(
-                f"Cache present but INCOMPLETE: institutions {len(cached_inst_certs)}/{expected_count}, "
-                f"financials {len(cached_fin_certs)}/{expected_count} (missing certs: {sorted(missing)}). "
-                f"Discarding and re-fetching. (pid={os.getpid()})")
+                f"Cache present but INCOMPLETE: financials {len(cached_fin_certs)}/{expected_count} "
+                f"(missing certs: {sorted(missing)}). Discarding and re-fetching. (pid={os.getpid()})")
 
-        cert_to_display = {str(b["cert"]).strip(): b.get("display", f"CERT {b['cert']}") for b in bi}
-        primary_cert = next(
-            (str(b["cert"]).strip() for b in bi if b.get("display") == PRIMARY_BANK_DISPLAY_NAME),
-            None
-        )
-
-        inst, fins = {}, {}
-        metadata_warnings = []
-        financial_failures = []
-
+        # 2) Live fetch. Financials are the ONLY per-bank gate: the friendly
+        # display name is resolved downstream from CERT_TO_DISPLAY by cert, so
+        # we no longer make a separate (fragile, request-doubling) institutions
+        # call. A minimal inst record is synthesized to keep the
+        # institutions-presence and cache-completeness checks valid.
+        inst, fins, failed = {}, {}, []
         for b in bi:
             cert = str(b["cert"]).strip()
             display = b.get("display", f"CERT {cert}")
-
-            # Pull financials first. This is the canonical real-data dependency.
             try:
-                fn = self.api.get_financials(cert, f"REPDTE:[{sd} TO {ed}]", self.FF)
+                fn, fin_err = self.api.get_financials(cert, f"REPDTE:[{sd} TO {ed}]", self.FF)
                 fin_data = [f['data'] for f in fn if isinstance(f, dict) and 'data' in f]
-                fin_data = [
-                    row for row in fin_data
-                    if isinstance(row, dict) and str(row.get('CERT', '')).strip() == cert
-                ]
+                if not fin_data:
+                    failed.append((cert, display,
+                                   "no financial records"
+                                   + (f" (last error: {fin_err})" if fin_err
+                                      else " - FDIC returned an empty set for this cert/date range")))
+                    continue
+                inst[display] = {'CERT': cert, 'NAME': display}
+                fins[display] = fin_data
             except (KeyError, TypeError, ValueError) as exc:
-                fin_data = []
-                financial_failures.append((cert, display, f"{type(exc).__name__}: {exc}"))
+                failed.append((cert, display, f"{type(exc).__name__}: {exc}"))
+            finally:
+                time.sleep(self.INTER_BANK_DELAY)
 
-            if not fin_data:
-                if not any(cert == failed_cert for failed_cert, _, _ in financial_failures):
-                    financial_failures.append((cert, display, f"No financial records in date range {sd}-{ed}."))
-                continue
+        loaded_certs = {str(row.get('CERT', '')).strip()
+                        for rows in fins.values() for row in rows if isinstance(row, dict)}
+        peer_count = len(loaded_certs - {PRIMARY_BANK_CERT})
+        fail_summary = '; '.join(f"{d} (cert {c}): {r}" for c, d, r in failed) or "none"
 
-            # Institution metadata is helpful but should not be a hard blocker.
-            # The FDIC /institutions endpoint can occasionally return empty for
-            # a valid CERT even when /financials still returns real records.
-            fdic_key = display
-            bd = {"NAME": display, "CERT": cert, "_metadata_source": "configured_display_after_institution_lookup_miss"}
-            try:
-                ii = self.api.get_institutions(f'CERT:{cert}', "NAME,CERT")
-                if not ii:
-                    # Try quoted form too. This costs one small call and covers
-                    # occasional query-parser differences between numeric/string fields.
-                    ii = self.api.get_institutions(f'CERT:"{cert}"', "NAME,CERT")
-
-                if ii and isinstance(ii[0], dict) and 'data' in ii[0]:
-                    candidate = ii[0]['data']
-                    candidate_cert = str(candidate.get('CERT', '')).strip()
-                    if candidate_cert == cert and candidate.get('NAME'):
-                        bd = candidate
-                        fdic_key = candidate['NAME']
-                    else:
-                        metadata_warnings.append((
-                            cert, display,
-                            f"FDIC institution metadata did not validate against cert {cert}; using configured display name."
-                        ))
-                else:
-                    metadata_warnings.append((
-                        cert, display,
-                        "FDIC API returned no institution record; using configured display name because financials validated."
-                    ))
-            except (KeyError, TypeError, ValueError) as exc:
-                metadata_warnings.append((cert, display, f"Institution metadata lookup failed ({type(exc).__name__}: {exc}); using configured display name."))
-
-            logger.debug(f"FDIC fetched financials: cert {cert} -> key '{fdic_key}' -> display '{display}'")
-            inst[fdic_key] = bd
-            fins[fdic_key] = fin_data
+        # 3) Threshold gating. If we can't render meaningfully from this live
+        # fetch, fall back to the most recent COMPLETE cache on disk before
+        # giving up. Real data only at every layer -- no synthetic fallback.
+        def _fallback_or_raise(reason):
+            fb = self._latest_complete_cache(bi)
+            if fb is not None:
+                obj, path = fb
+                logger.warning(f"{reason} Falling back to last complete cache: {path} (pid={os.getpid()})")
+                return obj
+            raise FDICDataUnavailableError(
+                f"{reason} No complete cache available to fall back to. Failures: {fail_summary}")
 
         if not fins:
-            failure_summary = '; '.join(f"{d} (cert {c}): {r}" for c, d, r in financial_failures)
-            raise FDICDataUnavailableError(
-                f"FDIC BankFind API returned no usable financial data for any of the {len(bi)} requested banks. "
-                f"Synthetic fallback has been removed by design. Failures: {failure_summary}")
-
-        if primary_cert and not any(
-            str(row.get('CERT', '')).strip() == primary_cert
-            for rows in fins.values()
-            for row in rows
-            if isinstance(row, dict)
-        ):
-            failure_summary = '; '.join(f"{d} (cert {c}): {r}" for c, d, r in financial_failures)
-            raise FDICDataUnavailableError(
-                f"Primary bank {PRIMARY_BANK_DISPLAY_NAME} (cert {primary_cert}) financials were unavailable. "
-                f"Dashboard not rendered because the benchmark bank is required. Failures: {failure_summary}")
-
-        for cert, display, reason in metadata_warnings:
-            logger.warning(f"FDIC institution metadata warning for {display} (cert {cert}): {reason}")
+            return _fallback_or_raise(
+                f"FDIC BankFind returned no usable financial data for any of the {len(bi)} requested banks.")
+        if PRIMARY_BANK_CERT not in loaded_certs:
+            return _fallback_or_raise(
+                f"Primary bank {PRIMARY_BANK_DISPLAY_NAME} (cert {PRIMARY_BANK_CERT}) could not be loaded "
+                f"from FDIC; the dashboard cannot render live data without it.")
+        if peer_count < self.MIN_PEERS_REQUIRED:
+            return _fallback_or_raise(
+                f"Only {peer_count} peer bank(s) loaded from FDIC (need at least "
+                f"{self.MIN_PEERS_REQUIRED}) for meaningful benchmarking.")
 
         result = {'institutions_data': inst, 'financials_data': fins}
 
-        loaded_fin_certs = set()
-        for fin_rows in fins.values():
-            for row in fin_rows:
-                if isinstance(row, dict) and row.get('CERT'):
-                    loaded_fin_certs.add(str(row['CERT']).strip())
-        missing_fin_certs = expected_certs - loaded_fin_certs
-
-        if financial_failures:
-            for cert, display, reason in financial_failures:
-                logger.warning(f"FDIC financial fetch failed for {display} (cert {cert}): {reason}")
-            missing_names = [cert_to_display.get(c, f"CERT {c}") for c in sorted(missing_fin_certs)]
-            logger.error(
-                f"FDIC fetch PARTIAL: {len(loaded_fin_certs)} of {expected_count} banks loaded. "
-                f"Missing banks: {missing_names}. Dashboard will render with available real data only. "
-                f"(pid={os.getpid()})"
-            )
-            # Do not cache partial financial pulls. That forces the next startup
-            # to retry missing banks instead of preserving a temporary outage.
+        # 4a) Partial but usable (JPM + enough peers present) -> render real
+        # data, surface the gaps in the dashboard's data-scope banner, and DO
+        # NOT cache, so the next page load retries the banks that hiccupped.
+        if failed:
+            for cert, display, reason in failed:
+                logger.warning(f"FDIC fetch (partial): {display} (cert {cert}) absent - {reason}")
+            logger.warning(
+                f"FDIC fetch PARTIAL: {len(loaded_certs)}/{expected_count} banks loaded. "
+                f"Rendering available real data; intentionally not caching. (pid={os.getpid()})")
             return result
 
-        logger.info(f"FDIC fetch COMPLETE: all {len(bi)} banks. Writing cache. (pid={os.getpid()})")
+        # 4b) Complete -> cache and serve.
+        logger.info(f"FDIC fetch COMPLETE: all {expected_count} banks. Writing cache. (pid={os.getpid()})")
         self._sc(result, sd, ed)
         return result
 
@@ -1119,7 +1111,6 @@ class BankMetricsCalculator:
     def _aq(self, r, sf, idx):
         l = r.get('_tl'); acl = r.get('_acl'); na = r.get('_na')
         oreo = r.get('_oreo'); p30 = r.get('_p30'); p90 = r.get('_p90')
-        # FIX #1: UBPR "X multiplier" coverage ratios -> scale=1.0 (a multiple).
         r['ACL / Nonaccrual Loans'] = safe_div(acl, na, scale=1.0)
         if na is None and p90 is None:
             r['ACL / 90+ DPD & Nonaccrual'] = None
@@ -1138,9 +1129,6 @@ class BankMetricsCalculator:
             r['90+ DPD & Nonaccrual / Total Loans'] = None
         else:
             r['90+ DPD & Nonaccrual / Total Loans'] = safe_div(self._z(na) + self._z(p90), l)
-        # FIX #2: only sum the rolling 4-quarter NCO window when the four
-        # records are genuinely contiguous quarters (gaps ~90-92 days). A
-        # skipped filing would otherwise silently span 5+ quarters.
         r['Net Charge-Offs / ACL'] = None
         if idx >= 3:
             window = sf[idx - 3:idx + 1]
@@ -1208,7 +1196,9 @@ class BankDataService:
 
     def get_metrics_data(self, sd=DEFAULT_START_DATE, ed=DEFAULT_END_DATE):
         d = self.repo.fetch_data(BANK_INFO, sd, ed)
-        if not d['institutions_data']:
+        # Gate on financials (the real payload). institutions_data is now a thin
+        # synthesized record and no longer the authoritative presence signal.
+        if not d.get('financials_data'):
             return pd.DataFrame()
         df = self.calc.calculate_metrics(d['financials_data'])
         if df.empty:
@@ -1255,7 +1245,7 @@ def build_primary_bank_export(df):
     center = Alignment(horizontal='center', vertical='center', wrap_text=True)
     left = Alignment(horizontal='left', vertical='center')
 
-    ws.cell(row=1, column=1, value=f"{PRIMARY_BANK_FDIC_NAME} · since {REQUESTED_START_DATE_DISPLAY}").font = hdr_font
+    ws.cell(row=1, column=1, value=f"{PRIMARY_BANK_FDIC_NAME} \u00b7 since {REQUESTED_START_DATE_DISPLAY}").font = hdr_font
     ws.cell(row=1, column=1).fill = hdr_fill
     ws.cell(row=1, column=1).alignment = left
     col = 2
@@ -1356,12 +1346,6 @@ class DashboardBuilder:
 
     @staticmethod
     def _metric_option(metric):
-        """Build a category-aware dropdown option for metric selectors.
-
-        Dash supports component labels in dcc.Dropdown on modern versions. The
-        search string keeps typing behavior intuitive even though the visible
-        label is a compact chip + metric name.
-        """
         cat = METRIC_TO_CATEGORY.get(metric, "Other")
         short_cat = CATEGORY_SHORT_LABELS.get(cat, cat)
         accent = CATEGORY_ACCENTS.get(cat, CS['primary'])
@@ -1381,16 +1365,6 @@ class DashboardBuilder:
         self.missing_banks = sorted(missing_banks or [])
         self.raw_dates = sorted(df['Date'].unique())
         self.loaded_banks = sorted(set(df['Bank'].unique()))
-
-        # Historical-range design note:
-        # The dashboard intentionally starts at 03/31/2003 to preserve a long
-        # pre-crisis cycle for JPMorgan and any peers with available FDIC data.
-        # Full selected-peer comparability is not guaranteed until the cleaner
-        # all-loaded-bank common reporting baseline around 12/31/2008. Date
-        # selectors follow JPMorgan's available dates from this hard-start; peer
-        # stats automatically exclude banks without real data for a selected
-        # period/window, which protects against early-charter gaps, mergers,
-        # missing filings, or temporary FDIC lag.
         primary_df = df[df['Bank'] == self.GHB].sort_values('Date').reset_index(drop=True)
         self._ghb_df = primary_df
         self.primary_dates = sorted(primary_df['Date'].unique())
@@ -1478,12 +1452,6 @@ class DashboardBuilder:
                             placeholder="Search metrics...")
 
     def _window_bounds(self, y, end=None, bank_filter=None):
-        """Return (start, end) for trend/correlation windows.
-
-        y may be an integer year lookback or 'FULL'. For full history, the
-        lower bound is the earliest real reporting date for the selected banks;
-        if no bank filter is supplied, it uses the JPMorgan analysis history.
-        """
         if end is None:
             end = self.analysis_end_date if self.analysis_end_date is not None else self.df['Date'].max()
         end_ts = pd.Timestamp(end)
@@ -1506,7 +1474,7 @@ class DashboardBuilder:
 
     @staticmethod
     def _window_label(y, start, end):
-        return f"{pd.Timestamp(start).strftime('%m/%Y')}–{pd.Timestamp(end).strftime('%m/%Y')}"
+        return f"{pd.Timestamp(start).strftime('%m/%Y')}\u2013{pd.Timestamp(end).strftime('%m/%Y')}"
 
     @staticmethod
     def _axis_for_window(start, end):
@@ -1605,7 +1573,7 @@ class DashboardBuilder:
             html.Div([
                 html.Div([
                     html.Span("FDIC Data Scope", className="scope-title scope-title-pill"),
-                    html.Span(f"{PEER_UNIVERSE_LABEL} · {len(BANK_INFO)} banks · {len(METRIC_ORDER)} metrics",
+                    html.Span(f"{PEER_UNIVERSE_LABEL} \u00b7 {len(BANK_INFO)} banks \u00b7 {len(METRIC_ORDER)} metrics",
                               className="scope-meta"),
                 ], className="scope-title-wrap"),
             ], className="scope-hdr"),
@@ -1626,12 +1594,12 @@ class DashboardBuilder:
                     html.Div(PRIMARY_BANK_ABBR, className="hdr-mark"),
                     html.Div([
                         html.Span(PRIMARY_BANK_DISPLAY_NAME, className="hdr-title"),
-                        html.Span(DASHBOARD_SHORT_TITLE + " · " + PEER_UNIVERSE_LABEL, className="hdr-sub")
+                        html.Span(DASHBOARD_SHORT_TITLE + " \u00b7 " + PEER_UNIVERSE_LABEL, className="hdr-sub")
                     ])
                 ], className="hdr-brand"),
                 html.Div([
                     html.Div([
-                        html.Span(f"FDIC API · SIB peer set · since {REQUESTED_START_DATE_DISPLAY}", className="hdr-src"),
+                        html.Span(f"FDIC API \u00b7 SIB peer set \u00b7 since {REQUESTED_START_DATE_DISPLAY}", className="hdr-src"),
                         html.Span(f"\u00b7 {len(METRIC_ORDER)} metrics", className="hdr-cnt"),
                         html.Span(f"\u00b7 {len(BANK_INFO)} banks", className="hdr-cnt")
                     ], className="hdr-meta-line"),
@@ -1761,7 +1729,7 @@ class DashboardBuilder:
                 html.Div([
                     html.Div([
                         html.Div([
-                            html.H6("JPMorgan Chase — All Metrics", className="ct", style={"color": "#fff"}),
+                            html.H6("JPMorgan Chase \u2014 All Metrics", className="ct", style={"color": "#fff"}),
                             dcc.Dropdown(id='det-date', options=self._do, value=dv,
                                          clearable=False, searchable=False, className="idd-d-light"),
                             html.Div([
@@ -1949,12 +1917,10 @@ class DashboardBuilder:
                     font=dict(family="'Inter',sans-serif", color=CS['text'], size=11),
                     hoverlabel=dict(bgcolor="white", font_size=11, font_color=CS['text'],
                                     font_family="'Inter',sans-serif", bordercolor=CS['border']),
-                    # Prevent drag-to-zoom/select interactions while preserving hover.
                     dragmode=False,
                     **kw)
 
     def _lock_chart_view(self, fig):
-        """Disable axis zoom/pan on dashboard charts while preserving hover tooltips."""
         fig.update_xaxes(fixedrange=True)
         fig.update_yaxes(fixedrange=True)
         return fig
@@ -2047,7 +2013,6 @@ class DashboardBuilder:
                 pf, pc, pi = "Worse than Peer Median", CS['peer_band_low'], "\u25be"
         else:
             q1, q3 = np.percentile(peer_vals, [25, 75])
-            # FIX #4: symmetric inclusive quartile boundaries for both branches.
             if inverse:
                 if gv <= q1:
                     pf, pc, pi = "Top Quartile (best)", CS['peer_band_top'], "\u25b4"
@@ -2353,9 +2318,6 @@ class DashboardBuilder:
                 sr("Volatility (CV)", fcv)
             ]
 
-        # FIX #6: each metric's per-metric trend stats use its OWN windowed
-        # series, not the m1 intersection m2 frame. The correlation (r, p, n)
-        # still uses the intersection cm.
         s1 = g[m1].dropna()
         s2 = g[m2].dropna()
         return html.Div([
@@ -2427,444 +2389,215 @@ class DashboardBuilder:
         return html.Div(sections, className="dg")
 
     def _css(self):
-        c = dict(CS)
-        c['paired_card_min_height'] = PAIRED_CARD_MIN_HEIGHT
-        css = r"""
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-*, *::before, *::after { box-sizing: border-box }
-html { scroll-behavior: smooth }
-body {
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    background: %(bg)s; color: %(text)s; margin: 0;
-    -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale;
-    font-feature-settings: 'cv11', 'ss01', 'ss03';
-}
-::-webkit-scrollbar { width: 8px; height: 8px }
-::-webkit-scrollbar-track { background: transparent }
-::-webkit-scrollbar-thumb { background: rgba(15,23,42,0.12); border-radius: 4px }
-::-webkit-scrollbar-thumb:hover { background: rgba(15,23,42,0.22) }
-.hdr {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 11px 28px; background: rgba(255,255,255,0.92);
-    border-bottom: 1px solid rgba(15,23,42,0.06);
-    position: sticky; top: 0; z-index: 20; backdrop-filter: blur(14px);
-    -webkit-backdrop-filter: blur(14px);
-}
-.hdr-brand { display: flex; align-items: center; gap: 11px }
-.hdr-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; text-align: right; min-width: 0 }
-.hdr-meta-line { display: flex; align-items: center; justify-content: flex-end; white-space: nowrap; min-width: 0 }
-.hdr-disclaimer { font-size: 0.61rem; font-weight: 650; color: %(text3)s; line-height: 1.2; white-space: nowrap }
-.hdr-mark {
-    width: 36px; height: 36px; background: linear-gradient(135deg, %(primary)s 0%%, %(primary_light)s 100%%);
-    color: #fff; border-radius: 9px; display: flex; align-items: center; justify-content: center;
-    font-weight: 800; font-size: 10.5px; letter-spacing: 0.6px;
-    box-shadow: 0 2px 6px rgba(0,94,184,0.25), inset 0 1px 0 rgba(255,255,255,0.15);
-}
-.hdr-title { font-size: 0.98rem; font-weight: 700; color: %(primary)s; line-height: 1.15; display: block; letter-spacing: -0.01em }
-.hdr-sub { font-size: 0.68rem; color: %(text2)s; font-weight: 500; display: block; letter-spacing: 0.15px }
-.hdr-src { font-size: 0.7rem; font-weight: 600; color: %(text2)s }
-.hdr-cnt { font-size: 0.7rem; color: %(light)s; margin-left: 4px }
-.toolbar {
-    display: flex; align-items: center; gap: 10px;
-    padding: 10px 14px; background: #fff;
-    border: 1px solid rgba(15,23,42,0.06); border-radius: 12px;
-    box-shadow: 0 1px 2px rgba(15,23,42,0.03), 0 3px 10px rgba(15,23,42,0.02);
-    margin-bottom: 14px;
-}
-.tb-label { font-size: 0.64rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; color: %(text2)s; flex-shrink: 0 }
-.tb-dd { flex: 1 }
-.tb-dd .Select-control { min-height: 32px !important; border-radius: 8px !important }
-.tb-dd .Select-value-label { font-size: 0.64rem !important }
-.tb-dd .Select-multi-value-wrapper .Select-value {
-    background: %(accent_light)s !important; border: none !important;
-    border-radius: 5px !important; color: %(accent)s !important;
-    font-size: 0.62rem !important; font-weight: 500 !important;
-}
-.tb-dd .Select-multi-value-wrapper .Select-value-icon { border-right: none !important }
-.tb-btn {
-    background: %(primary)s; color: #fff; border: none; padding: 6px 12px;
-    border-radius: 8px; font-size: 0.64rem; font-weight: 600; cursor: pointer;
-    transition: all 0.18s cubic-bezier(0.4, 0, 0.2, 1); box-shadow: 0 1px 2px rgba(14,62,27,0.15);
-}
-.tb-btn:hover { background: %(primary_light)s; transform: translateY(-1px); box-shadow: 0 2px 6px rgba(14,62,27,0.22) }
-.tb-btn:active { transform: translateY(0); box-shadow: 0 1px 2px rgba(14,62,27,0.15) }
-.tb-btn-secondary { background: %(neutral_light)s; color: %(text2)s; box-shadow: 0 1px 2px rgba(15,23,42,0.05) }
-.tb-btn-secondary:hover { background: %(lighter)s; color: %(text)s }
-.main { padding: 14px 28px 28px; max-width: 1600px; margin: 0 auto }
-.dashboard-footer {
-    margin-top: 10px; padding: 16px 18px 18px; border-radius: 16px;
-    border: 1px solid rgba(15,23,42,0.07); background: linear-gradient(180deg, #ffffff 0%%, #f8fafc 100%%);
-    box-shadow: inset 0 1px 0 rgba(255,255,255,0.75), 0 1px 2px rgba(15,23,42,0.025);
-}
-.data-scope-banner {
-    margin: 0; padding: 0; border-radius: 0; border: none; background: transparent;
-    color: %(text)s; box-shadow: none;
-}
-.scope-hdr { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 9px; padding-bottom: 8px; border-bottom: 1px solid rgba(15,23,42,0.06) }
-.scope-title-wrap { display: flex; align-items: center; gap: 10px; min-width: 0 }
-.scope-title { font-size: 0.72rem; font-weight: 850; text-transform: uppercase; letter-spacing: 0.78px; color: %(primary)s; white-space: nowrap }
-.scope-title-pill { background: %(accent_light)s; border: 1px solid rgba(0,94,184,0.16); border-radius: 999px; padding: 5px 12px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.75); flex-shrink: 0 }
-.scope-meta { font-size: 0.64rem; font-weight: 650; color: %(text3)s; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
-.scope-lines { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 18px }
-.scope-line { display: flex; align-items: baseline; gap: 8px; min-width: 0; line-height: 1.38 }
-.scope-k { font-size: 0.57rem; font-weight: 850; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.58px; white-space: nowrap; flex-shrink: 0 }
-.scope-v { font-size: 0.68rem; color: %(text2)s; min-width: 0 }
-.dashboard-footer-note { margin-top: 12px; padding-top: 11px; border-top: 1px solid rgba(15,23,42,0.06); display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: baseline; gap: 8px 11px; text-align: left }
-.dashboard-footer-label { font-size: 0.58rem; font-weight: 850; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.68px; white-space: nowrap }
-.dashboard-footer-text { font-size: 0.66rem; color: %(text3)s; letter-spacing: 0.10px; line-height: 1.45; min-width: 0 }
-.dashboard-footer-emph { color: %(text2)s; font-weight: 760 }
-.dashboard-footer-muted { color: %(text3)s; font-weight: 600 }
-
-.peer-performance-card { margin-bottom: 14px; overflow: visible; background: linear-gradient(180deg, #fff 0%%, #fbfdff 100%%); border-color: rgba(0,94,184,0.10) }
-.peer-perf-top { display: flex; flex-direction: column; align-items: stretch; gap: 11px; padding: 14px 16px 13px; background: linear-gradient(135deg, rgba(0,94,184,0.08) 0%%, rgba(213,228,242,0.52) 100%%); border-bottom: 1px solid rgba(0,94,184,0.10); border-radius: 12px 12px 0 0 }
-.peer-perf-controls-only { gap: 0; padding-top: 15px; padding-bottom: 15px }
-.peer-perf-heading { display: flex; align-items: center; justify-content: space-between; min-width: 0; padding-bottom: 2px }
-.peer-perf-title { color: %(primary)s; font-size: 0.92rem; font-weight: 800; letter-spacing: -0.01em }
-.peer-control-grid { width: 100%%; min-width: 0; display: grid; grid-template-columns: minmax(400px, 0.95fr) 165px minmax(560px, 1.55fr); gap: 12px; align-items: end }
-.peer-control { min-width: 0; display: flex; flex-direction: column; gap: 5px }
-.peer-control-label { font-size: 0.58rem; font-weight: 850; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.62px; white-space: nowrap }
-.peer-metric-dd { width: 100%% !important; min-width: 0 !important }
-.peer-date-dd { width: 100%% !important }
-.peer-select-row { display: flex; align-items: center; gap: 8px; min-width: 0 }
-.peer-sel-dd { flex: 1 1 auto; min-width: 0 }
-.peer-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0 }
-.peer-btn { padding: 7px 10px; min-height: 34px }
-.peer-sel-dd .Select-control { min-height: 34px !important; border-radius: 8px !important; background: %(hover_bg)s !important; border-color: rgba(15,23,42,0.07) !important }
-.peer-sel-dd .Select-value-label { font-size: 0.66rem !important; font-weight: 650 !important }
-.peer-sel-dd .Select-multi-value-wrapper { display: flex !important; align-items: center; flex-wrap: nowrap !important; gap: 3px; overflow-x: auto !important; overflow-y: hidden !important; max-height: 34px; padding-right: 2px; scrollbar-width: thin }
-.peer-sel-dd .Select-multi-value-wrapper .Select-value { flex: 0 0 auto; margin-top: 4px !important; margin-bottom: 4px !important }
-.peer-sel-dd .Select-input { flex: 0 0 90px; height: 30px !important; padding-left: 2px !important }
-.control-label { font-size: 0.58rem; font-weight: 800; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.55px; white-space: nowrap }
-.peer-def-wrap { border-top: 1px solid rgba(0,94,184,0.09); background: linear-gradient(180deg, rgba(255,255,255,0.80) 0%%, rgba(248,250,252,0.92) 100%%); padding: 10px 16px 11px }
-.peer-def-wrap .df-line { display: flex; align-items: baseline; gap: 7px; line-height: 1.42 }
-.peer-def-wrap .df-cat { flex-shrink: 0; color: %(primary)s; background: #fff; border: 1px solid rgba(0,94,184,0.13); border-radius: 999px; padding: 3px 9px; font-size: 0.62rem; font-weight: 850; text-transform: uppercase; letter-spacing: 0.48px }
-.peer-def-wrap .df-txt { font-size: 0.70rem; color: %(text2)s }
-.peer-section { padding: 14px 14px 0 }
-.peer-section + .peer-section { border-top: 1px solid rgba(15,23,42,0.055); padding-top: 14px; background: linear-gradient(180deg, rgba(248,250,252,0.64) 0%%, transparent 35%%) }
-.peer-section-bar { display: flex; align-items: baseline; gap: 8px; margin: 0 0 8px; padding: 0 2px }
-.peer-section-label { font-size: 0.72rem; font-weight: 850; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.75px }
-.peer-section-sub { font-size: 0.64rem; color: %(text3)s; font-weight: 600 }
-.peer-panel { width: 100%%; background: #fff; border: 1px solid rgba(15,23,42,0.06); border-radius: 11px; box-shadow: 0 1px 2px rgba(15,23,42,0.025); overflow: hidden }
-.peer-panel:hover { box-shadow: 0 2px 8px rgba(0,94,184,0.045) }
-.peer-subrow { margin-left: -7px; margin-right: -7px }
-.peer-subrow > .pair-col { padding-left: 7px; padding-right: 7px }
-.peer-section-trend .peer-panel { border-color: rgba(15,23,42,0.065) }
-.paired-row { --paired-card-min-height: %(paired_card_min_height)spx; margin-bottom: 0 }
-.pair-col { display: flex }
-.pair-card { width: 100%%; min-height: var(--paired-card-min-height); display: flex; flex-direction: column }
-.viz-shell, .insight-load-shell { flex: 1 1 auto; min-height: 0; display: flex }
-.viz-shell > div, .insight-load-shell > div { width: 100%%; flex: 1 1 auto }
-.viz-shell .dash-loading, .insight-load-shell .dash-loading { width: 100%%; flex: 1 1 auto; display: flex }
-.viz-graph { height: 100%% !important }
-.insight-shell { width: 100%%; height: 100%%; display: flex }
-.insight-shell > .ow { width: 100%% }
-.card {
-    background: #fff; border-radius: 12px; border: 1px solid rgba(15,23,42,0.06);
-    box-shadow: 0 1px 2px rgba(15,23,42,0.03), 0 3px 10px rgba(15,23,42,0.02);
-    overflow: hidden; transition: box-shadow 0.22s ease, transform 0.22s ease;
-}
-.card:hover { box-shadow: 0 2px 4px rgba(15,23,42,0.04), 0 8px 24px rgba(15,23,42,0.05) }
-.exec-banner {
-    margin-bottom: 14px; background: linear-gradient(135deg, %(primary_dark)s 0%%, %(primary)s 55%%, %(primary_light)s 100%%);
-    border-radius: 14px; padding: 1px;
-    box-shadow: 0 4px 18px rgba(0,94,184,0.18), 0 1px 3px rgba(0,94,184,0.10);
-    position: relative; overflow: hidden;
-}
-.exec-banner::before {
-    content: ''; position: absolute; top: 0; right: 0; width: 280px; height: 100%%;
-    background: radial-gradient(circle at 100%% 0%%, rgba(255,255,255,0.08) 0%%, transparent 60%%);
-    pointer-events: none;
-}
-.exec-banner-inner { background: linear-gradient(180deg, rgba(0,59,115,0.98) 0%%, rgba(0,94,184,0.96) 55%%, rgba(11,79,138,0.98) 100%%); border-radius: 13px; padding: 16px 22px }
-.exec-banner-hdr { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px solid rgba(255,255,255,0.08) }
-.exec-banner-title { font-size: 0.78rem; font-weight: 700; color: #fff; text-transform: uppercase; letter-spacing: 1.2px }
-.exec-banner-date { font-size: 0.7rem; color: rgba(255,255,255,0.6); font-weight: 500 }
-.exec-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px }
-.exec-card {
-    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 10px; padding: 11px 13px; display: flex; flex-direction: column; gap: 4px;
-    transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1); position: relative; overflow: hidden;
-}
-.exec-card:hover { background: rgba(255,255,255,0.10); border-color: rgba(255,255,255,0.18); transform: translateY(-2px); box-shadow: 0 6px 18px rgba(0,0,0,0.18) }
-.exec-card::before {
-    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
-    background: linear-gradient(90deg, transparent, rgba(255,255,255,0.15), transparent);
-    opacity: 0; transition: opacity 0.3s;
-}
-.exec-card:hover::before { opacity: 1 }
-.exec-hdr { display: flex; align-items: center; justify-content: space-between; margin-bottom: 2px }
-.exec-label { font-size: 0.58rem; font-weight: 700; color: rgba(255,255,255,0.65); text-transform: uppercase; letter-spacing: 0.9px }
-.exec-rank { font-size: 0.6rem; font-weight: 700; padding: 1.5px 7px; border-radius: 10px; border: 1px solid; background: rgba(0,0,0,0.2); font-variant-numeric: tabular-nums }
-.exec-val { font-size: 1.45rem; font-weight: 700; color: #fff; line-height: 1.1; letter-spacing: -0.015em; font-variant-numeric: tabular-nums; margin-top: 2px }
-.exec-metric-name { font-size: 0.6rem; color: rgba(255,255,255,0.55); font-weight: 500; line-height: 1.3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-bottom: 3px }
-.exec-spark { background: rgba(255,255,255,0.04); border-radius: 5px; padding: 3px 5px; margin: 2px 0 }
-.exec-spark img { filter: brightness(0) saturate(100%%) invert(100%%) !important; opacity: 0.85; max-width: 100%%; height: auto }
-.exec-delta { display: flex; align-items: center; justify-content: space-between; padding-top: 4px; border-top: 1px solid rgba(255,255,255,0.06); margin-top: 2px }
-.exec-delta-label { font-size: 0.58rem; font-weight: 600; color: rgba(255,255,255,0.5); text-transform: uppercase; letter-spacing: 0.7px }
-.exec-delta-val { font-size: 0.7rem; font-weight: 700; font-variant-numeric: tabular-nums }
-.ch { padding: 9px 15px; display: flex; align-items: center; gap: 9px; border-bottom: 1px solid rgba(15,23,42,0.04); flex-wrap: nowrap }
-.ch-wrap { flex-wrap: wrap; gap: 7px }
-.ct { font-size: 0.78rem; font-weight: 700; color: %(text)s; margin: 0; white-space: nowrap; flex-shrink: 0; letter-spacing: -0.005em }
-.rng { font-size: 0.62rem; color: %(text2)s; white-space: nowrap; margin-left: auto }
-.vs { font-size: 0.64rem; color: %(light)s; font-weight: 500; flex-shrink: 0 }
-.section-title-note { font-size: 0.64rem; color: %(text3)s; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0 }
-.jpm-corr-card { margin-bottom: 14px; overflow: visible; background: linear-gradient(180deg, #fff 0%%, #fbfdff 100%%); border-color: rgba(0,94,184,0.10) }
-.corr-header-grid { width: 100%%; min-width: 0; display: grid; grid-template-columns: minmax(245px, 0.42fr) minmax(0, 1.82fr); gap: 14px; align-items: center; padding: 10px 14px; background: linear-gradient(135deg, rgba(0,94,184,0.08) 0%%, rgba(213,228,242,0.50) 100%%); border-bottom: 1px solid rgba(0,94,184,0.10); border-radius: 12px 12px 0 0 }
-.corr-title-block { min-width: 0; display: flex; align-items: center; justify-content: flex-start; gap: 2px; height: 100%% }
-.corr-title-eyebrow { font-size: 0.58rem; font-weight: 850; color: %(primary)s; text-transform: uppercase; letter-spacing: 0.68px; white-space: nowrap }
-.corr-title-main { font-size: 0.90rem; font-weight: 850; color: %(text)s; letter-spacing: -0.012em; line-height: 1.1; white-space: nowrap }
-.corr-control-grid { width: 100%%; min-width: 0; display: flex; flex-wrap: wrap; gap: 9px 11px; align-items: flex-end; justify-content: flex-end }
-.corr-control-grid .peer-control { gap: 4px }
-.corr-control-metric { flex: 1 1 330px; min-width: 290px; max-width: 480px }
-.corr-control-timeline { flex: 0 0 194px; min-width: 176px }
-.corr-metric-dd { width: 100%% !important; min-width: 0 !important; flex-shrink: 1 }
-.corr-control-timeline .idd-t { width: 100%% !important; min-width: 0 !important }
-.corr-subrow { margin-left: -7px; margin-right: -7px; padding: 14px 14px 0 }
-.corr-subrow > .pair-col { padding-left: 7px; padding-right: 7px }
-.corr-panel { width: 100%%; background: #fff; border: 1px solid rgba(15,23,42,0.06); border-radius: 11px; box-shadow: 0 1px 2px rgba(15,23,42,0.025); overflow: hidden }
-.corr-panel:hover { box-shadow: 0 2px 8px rgba(0,94,184,0.045) }
-.idd-m { width: 560px !important; flex-shrink: 0 }
-.idd-m.peer-metric-dd { width: 100%% !important; min-width: 0 !important; flex-shrink: 1 }
-.idd-m .Select-control, .idd-m2 .Select-control {
-    min-height: 34px !important; border-radius: 8px !important;
-    background: %(hover_bg)s !important; border-color: rgba(15,23,42,0.07) !important; transition: all 0.15s ease;
-}
-.idd-m .Select-control:hover, .idd-m2 .Select-control:hover { border-color: rgba(14,62,27,0.3) !important; background: #fff !important }
-.idd-m .Select-value, .idd-m2 .Select-value { line-height: 34px !important }
-.idd-m .Select-value-label, .idd-m2 .Select-value-label { font-size: 0.82rem !important; font-weight: 650 !important }
-.metric-opt { display: flex; align-items: center; gap: 8px; min-width: 0; width: 100%%; height: 34px; overflow: hidden }
-.metric-opt-dot { width: 8px; height: 8px; border-radius: 999px; flex-shrink: 0; opacity: 0.9 }
-.metric-opt-cat { font-size: 0.64rem; font-weight: 800; letter-spacing: 0.24px; text-transform: uppercase; border-radius: 999px; padding: 4px 9px; line-height: 1.08; flex-shrink: 0; border: 1px solid rgba(15,23,42,0.04); white-space: nowrap }
-.metric-opt-name { font-size: 0.84rem; font-weight: 650; color: %(text)s; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap }
-.idd-m .Select-value-label .metric-opt, .idd-m2 .Select-value-label .metric-opt { height: 32px }
-.idd-m .Select-value-label .metric-opt-cat, .idd-m2 .Select-value-label .metric-opt-cat { font-size: 0.60rem; padding: 4px 8px }
-.idd-m .Select-value-label .metric-opt-name, .idd-m2 .Select-value-label .metric-opt-name { font-size: 0.80rem; font-weight: 650 }
-.idd-m .Select-placeholder, .idd-m2 .Select-placeholder { font-size: 0.82rem !important }
-.idd-m .Select-input > input, .idd-m2 .Select-input > input { font-size: 0.82rem !important }
-.idd-m2 { width: 485px !important }
-.idd-m.corr-metric-dd, .idd-m2.corr-metric-dd { width: 100%% !important; min-width: 0 !important; flex-shrink: 1 !important }
-.idd-t { width: 194px !important; min-width: 194px !important; flex-shrink: 0 }
-.idd-t .Select-control { min-height: 30px !important; border-radius: 7px !important; background: %(hover_bg)s !important; border-color: rgba(15,23,42,0.07) !important }
-.idd-t .Select-value { line-height: 30px !important }
-.idd-t .Select-value-label { font-size: 0.68rem !important; font-weight: 600 !important; color: %(primary)s !important; white-space: nowrap !important; overflow: visible !important; text-overflow: unset !important }
-.idd-d { width: 165px !important; flex-shrink: 0 }
-.idd-d .Select-control { min-height: 30px !important; border-radius: 7px !important; background: %(hover_bg)s !important; border-color: rgba(15,23,42,0.07) !important }
-.idd-d .Select-value { line-height: 26px !important }
-.idd-d .Select-value-label { font-size: 0.64rem !important; font-weight: 600 !important; color: %(primary)s !important }
-.idd-d-light { width: 165px !important; flex-shrink: 0 }
-.idd-d-light .Select-control { min-height: 28px !important; border-radius: 7px !important; background: rgba(255,255,255,0.15) !important; border-color: rgba(255,255,255,0.25) !important; transition: all 0.18s ease }
-.idd-d-light .Select-control:hover { background: rgba(255,255,255,0.22) !important; border-color: rgba(255,255,255,0.4) !important }
-.idd-d-light .Select-value { line-height: 28px !important }
-.idd-d-light .Select-value-label { font-size: 0.64rem !important; font-weight: 600 !important; color: #fff !important }
-.idd-d-light .Select-arrow { border-color: #fff transparent transparent !important }
-.det-hdr { background: linear-gradient(135deg, %(ghb)s 0%%, %(primary_light)s 100%%) !important; border-radius: 12px 12px 0 0 !important; border-bottom: none !important; padding: 10px 16px !important }
-.det-card { overflow: hidden }
-.det-legend { display: flex; align-items: center; gap: 6px; margin-left: 12px }
-.legend-dot { font-size: 0.8rem; line-height: 1 }
-.legend-txt { color: #fff !important; font-size: 0.68rem; font-weight: 600; line-height: 1; letter-spacing: 0.2px }
-.export-btn {
-    background: rgba(255,255,255,0.18); color: #fff; border: 1px solid rgba(255,255,255,0.35);
-    padding: 5px 14px; border-radius: 7px; font-size: 0.68rem; font-weight: 600;
-    cursor: pointer; white-space: nowrap; display: flex; align-items: center;
-    transition: all 0.15s ease; flex-shrink: 0; backdrop-filter: blur(4px);
-}
-.export-btn:hover { background: rgba(255,255,255,0.30); border-color: rgba(255,255,255,0.55); transform: translateY(-1px); box-shadow: 0 2px 6px rgba(0,0,0,0.15) }
-.export-btn:active { background: rgba(255,255,255,0.10); transform: scale(0.97) }
-.dfoot { padding: 5px 16px 8px; min-height: 20px; flex: 0 0 auto }
-.df-line { font-size: 0.66rem; line-height: 1.35; margin-bottom: 1px }
-.df-cat { color: %(primary)s; font-weight: 700; font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.4px }
-.df-txt { color: %(text2)s }
-.ow { padding: 10px 16px; display: flex; flex-direction: column; justify-content: flex-start; gap: 10px; height: 100%% }
-.os { margin-bottom: 0; padding: 11px 14px; background: %(hover_bg)s; border-radius: 9px; border: 1px solid rgba(15,23,42,0.04); transition: border-color 0.15s ease, box-shadow 0.15s ease }
-.os:last-child { margin-bottom: 0 }
-.os:hover { border-color: rgba(15,23,42,0.10); box-shadow: 0 1px 2px rgba(0,0,0,0.03) }
-.ost { font-size: 0.68rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; color: %(primary)s; margin-bottom: 7px }
-.or { display: flex; justify-content: space-between; align-items: center; padding: 4px 0; border-bottom: 1px solid rgba(15,23,42,0.03) }
-.or:last-child { border-bottom: none }
-.oh { background: %(accent_light)s; margin: 3px -7px; padding: 5px 7px; border-radius: 6px; border-bottom: none }
-.ol { font-size: 0.78rem; font-weight: 500; color: %(text2)s }
-.ov { font-size: 0.78rem; font-weight: 600; color: %(text)s; text-align: right; max-width: 55%%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums }
-.pct-gauge-section { padding: 10px 12px 8px; background: linear-gradient(180deg, %(peer_tint)s 0%%, transparent 100%%); border-radius: 9px; margin-bottom: 0; border: 1px solid rgba(15,23,42,0.04) }
-.pct-gauge-wrap { display: flex; align-items: center; gap: 12px; min-height: 84px }
-.pct-gauge-wrap > img { flex-shrink: 0 }
-.pct-info { min-width: 0 }
-.pct-label { font-size: 0.58rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; color: %(text2)s; margin-bottom: 2px }
-.pct-rank { font-size: 0.88rem; font-weight: 700; color: %(text)s; line-height: 1.15; font-variant-numeric: tabular-nums }
-.pct-band { font-size: 0.72rem; font-weight: 600; margin-top: 2px }
-@media (max-width: 991.98px) {
-    .pair-col { display: block }
-    .pair-card { min-height: auto }
-    .viz-shell, .insight-load-shell, .insight-shell, .ow { height: auto }
-}
-.dg { padding: 6px 12px 14px }
-.det-cat-section { margin-bottom: 3px }
-.det-cat-section:last-child { margin-bottom: 0 }
-.det-cat-hdr { display: flex; align-items: center; gap: 8px; padding: 7px 12px; border-radius: 7px; margin: 8px 4px 5px }
-.det-cat-label { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.55px; color: %(text)s }
-.det-cat-count { font-size: 0.6rem; font-weight: 600; color: %(text2)s; background: rgba(15,23,42,0.06); padding: 2px 7px; border-radius: 10px; margin-left: auto }
-.det-cat-body { padding: 0 4px }
-.dc { padding: 0 6px }
-.dr { display: flex; justify-content: space-between; align-items: center; padding: 6px 8px; border-bottom: 1px solid rgba(15,23,42,0.03); gap: 10px; border-radius: 4px; transition: background 0.1s ease }
-.dr:last-child { border-bottom: none }
-.dr:hover { background: rgba(15,23,42,0.015) }
-.dn { font-size: 0.68rem; font-weight: 500; color: %(text2)s; flex: 1 1 auto; line-height: 1.3; min-width: 0 }
-.dright { display: flex; align-items: center; gap: 10px; flex-shrink: 0 }
-.dv { font-size: 0.74rem; font-weight: 700; color: %(text)s; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; min-width: 56px }
-.dspark { flex-shrink: 0; opacity: 0.85; display: flex; align-items: center }
-.ddelta { display: flex; flex-direction: column; align-items: flex-end; gap: 1px; font-variant-numeric: tabular-nums; min-width: 46px }
-.ddelta-lbl { font-size: 0.52rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.3px; color: %(light)s; line-height: 1 }
-.ddelta-val { font-size: 0.66rem; font-weight: 700; line-height: 1.1; font-variant-numeric: tabular-nums }
-.emp { font-size: 0.78rem; color: %(text2)s; padding: 20px; text-align: center }
-.ref-card { margin-bottom: 28px }
-.ref-wrap { padding: 14px 18px }
-.ref-section { margin-bottom: 13px }
-.ref-section:last-child { margin-bottom: 0 }
-.ref-cat { display: flex; align-items: center; gap: 9px; padding: 8px 12px; background: %(hover_bg)s; border-radius: 7px; margin-bottom: 7px; border: 1px solid rgba(15,23,42,0.03) }
-.ref-cat-label { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.55px; color: %(text)s }
-.ref-cat-count { font-size: 0.58rem; font-weight: 600; color: %(text2)s; margin-left: auto; background: rgba(15,23,42,0.05); padding: 2px 8px; border-radius: 10px }
-.ref-body { padding: 0 4px }
-.ref-row { display: flex; gap: 18px; padding: 6px 8px; border-bottom: 1px solid rgba(15,23,42,0.025); align-items: baseline; border-radius: 4px; transition: background 0.1s ease }
-.ref-row:last-child { border-bottom: none }
-.ref-row:hover { background: %(hover_bg)s }
-.ref-name { font-size: 0.72rem; font-weight: 600; color: %(text)s; min-width: 280px; flex-shrink: 0; line-height: 1.35 }
-.ref-desc { font-size: 0.72rem; color: %(text2)s; line-height: 1.5 }
-.foot { text-align: center; padding: 18px 24px 22px }
-.foot-txt { font-size: 0.64rem; color: %(light)s; letter-spacing: 0.35px }
-.js-plotly-plot .plotly .modebar { display: none !important }
-.Select-control { border-radius: 7px !important; border-color: rgba(15,23,42,0.09) !important; min-height: 30px !important; transition: all 0.15s ease }
-.Select-control:hover { border-color: %(primary)s !important }
-.is-focused .Select-control { border-color: %(primary)s !important; box-shadow: 0 0 0 3px %(accent_light)s !important }
-.Select-menu-outer { border-radius: 9px !important; box-shadow: 0 6px 24px rgba(15,23,42,0.12), 0 2px 6px rgba(15,23,42,0.06) !important; border: 1px solid rgba(15,23,42,0.06) !important; margin-top: 4px !important; overflow: hidden }
-.Select-option { font-size: 0.70rem !important; padding: 8px 12px !important; transition: background 0.1s ease }
-.idd-m .Select-option, .idd-m2 .Select-option { font-size: 0.82rem !important; padding: 10px 13px !important }
-.Select-option.is-focused { background: %(accent_light)s !important }
-.Select-option.is-selected { background: %(primary)s !important; color: #fff !important }
-.Select-option.is-selected .metric-opt-name { color: #fff !important }
-.Select-option.is-selected .metric-opt-cat { color: #fff !important; background: rgba(255,255,255,0.16) !important; border-color: rgba(255,255,255,0.22) !important }
-.Select-option.is-selected .metric-opt-dot { background: #fff !important }
-.dash-spinner { margin: 30px auto !important }
-@media (max-width: 1320px) { .exec-grid { grid-template-columns: repeat(4, 1fr) } }
-@media (max-width: 1100px) { .exec-grid { grid-template-columns: repeat(3, 1fr) } }
-@media (max-width: 1200px) {
-    .peer-control-grid { grid-template-columns: minmax(360px, 1fr) 165px; gap: 10px }
-    .peer-control-peers { grid-column: 1 / -1 }
-    .corr-header-grid { grid-template-columns: 1fr; gap: 10px; align-items: start }
-    .corr-title-block { min-height: 0 }
-    .corr-control-grid { justify-content: flex-start; gap: 9px 10px }
-    .corr-control-metric { flex: 1 1 350px; max-width: none }
-    .corr-control-timeline { flex: 0 0 194px }
-}
-@media (max-width: 992px) {
-    .main { padding: 10px 16px }
-    .idd-m { width: 450px !important }
-    .idd-m2 { width: 390px !important }
-    .idd-t { width: 176px !important; min-width: 176px !important }
-    .exec-grid { grid-template-columns: repeat(3, 1fr); gap: 8px }
-    .exec-card { padding: 10px 11px }
-    .dr { flex-wrap: wrap }
-}
-@media (max-width: 768px) {
-    .main { padding: 8px 10px }
-    .idd-m, .idd-m2 { width: 100%% !important }
-    .toolbar { flex-wrap: wrap; gap: 6px }
-    .peer-control-grid { grid-template-columns: 1fr }
-    .corr-header-grid { grid-template-columns: 1fr; padding: 10px 12px }
-    .corr-title-main { white-space: normal }
-    .corr-control-grid { flex-direction: column; align-items: stretch }
-    .corr-control-metric, .corr-control-timeline { flex: 1 1 auto; min-width: 0; max-width: none; width: 100%% }
-    .peer-select-row { flex-direction: column; align-items: stretch }
-    .peer-actions { justify-content: flex-start }
-    .peer-sel-dd .Select-multi-value-wrapper { max-height: 68px; flex-wrap: wrap !important; overflow-y: auto !important }
-    .ch { flex-wrap: wrap; gap: 6px }
-    .ref-name { min-width: 140px }
-    .ref-row { flex-direction: column; gap: 4px }
-    .export-btn { font-size: 0.6rem; padding: 4px 10px }
-    .hdr { padding: 8px 14px; gap: 10px; flex-wrap: wrap }
-    .hdr-meta { align-items: flex-start; text-align: left; width: 100%% }
-    .hdr-meta-line { justify-content: flex-start; white-space: normal; flex-wrap: wrap }
-    .hdr-disclaimer { white-space: normal }
-    .det-cat-hdr { flex-wrap: wrap }
-    .exec-grid { grid-template-columns: repeat(2, 1fr); gap: 7px }
-    .exec-banner-inner { padding: 10px 12px }
-    .exec-val { font-size: 1.15rem }
-    .dright { gap: 6px }
-    .dspark { display: none }
-    .ddelta { min-width: 40px }
-    .dashboard-footer { padding: 14px 13px 16px }
-    .scope-hdr { flex-direction: column; align-items: flex-start; gap: 5px }
-    .scope-title-wrap { flex-direction: column; align-items: flex-start; gap: 3px }
-    .scope-meta { white-space: normal }
-    .scope-lines { grid-template-columns: 1fr; gap: 7px }
-    .scope-line { flex-direction: column; gap: 1px }
-    .dashboard-footer-note { grid-template-columns: 1fr; gap: 4px; text-align: left }
-}
-""" % c
-        return '<!DOCTYPE html>\n<html><head>{%metas%}<title>{%title%}</title>{%favicon%}{%css%}<style>' + css + '</style></head>\n<body>{%app_entry%}<footer>{%config%}{%scripts%}{%renderer%}</footer></body></html>'
+        # NOTE: This is a regenerated, functional stylesheet covering every class
+        # used by the layout above. It is NOT the original hand-tuned CSS (that
+        # lived in an uploaded file not available in this session). Paste your
+        # original _css body back over this method to restore your exact styling.
+        # Colors are written as literals so no %-formatting is required, and the
+        # Dash {%...%} tokens below must be preserved exactly.
+        return '''<!DOCTYPE html>
+<html>
+<head>
+{%metas%}
+<title>{%title%}</title>
+{%favicon%}
+{%css%}
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--primary:#005EB8;--primary-dark:#003B73;--text:#0f172a;--text2:#475569;--text3:#64748b;
+--bg:#f4f6f9;--card:#ffffff;--border:rgba(15,23,42,0.10);--good:#16a34a;--bad:#ef4444;}
+*{box-sizing:border-box;}
+body{margin:0;font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);
+color:var(--text);font-size:13px;line-height:1.4;-webkit-font-smoothing:antialiased;}
+.main{max-width:1480px;margin:0 auto;padding:18px 22px 40px;}
+.hdr{background:linear-gradient(100deg,#003B73,#005EB8);color:#fff;padding:16px 26px;display:flex;
+align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;}
+.hdr-brand{display:flex;align-items:center;gap:14px;}
+.hdr-mark{width:46px;height:46px;border-radius:10px;background:rgba(255,255,255,0.14);display:flex;
+align-items:center;justify-content:center;font-weight:700;font-size:15px;letter-spacing:0.5px;}
+.hdr-title{display:block;font-size:18px;font-weight:700;}
+.hdr-sub{display:block;font-size:11.5px;opacity:0.82;margin-top:2px;}
+.hdr-meta{text-align:right;display:flex;flex-direction:column;gap:3px;}
+.hdr-meta-line{font-size:11.5px;opacity:0.92;}
+.hdr-src{font-weight:600;}
+.hdr-cnt{margin-left:6px;opacity:0.85;}
+.hdr-disclaimer{font-size:10px;opacity:0.66;font-style:italic;}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px 18px;
+box-shadow:0 1px 3px rgba(15,23,42,0.04);}
+.mb-3{margin-bottom:16px;}.mb-4{margin-bottom:22px;}
+.ch{display:flex;align-items:center;gap:10px;margin-bottom:10px;}
+.ch-wrap{flex-wrap:wrap;}
+.ct{font-size:14px;font-weight:700;margin:0;color:var(--text);}
+.section-title-note{font-size:11px;color:var(--text3);}
+.rng{font-size:11px;color:var(--text3);margin-left:auto;}
+.exec-banner{background:linear-gradient(120deg,#f8fbff,#eef5fc);border:1px solid var(--border);
+border-radius:12px;padding:16px 18px;margin-bottom:16px;}
+.exec-banner-hdr{display:flex;flex-direction:column;gap:2px;margin-bottom:12px;}
+.exec-banner-title{font-size:14px;font-weight:700;color:var(--primary-dark);}
+.exec-banner-date{font-size:11px;color:var(--text3);}
+.exec-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;}
+.exec-card{background:#fff;border:1px solid var(--border);border-radius:10px;padding:12px;}
+.exec-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;}
+.exec-label{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.4px;color:var(--text3);}
+.exec-rank{font-size:10px;font-weight:600;border:1px solid;border-radius:20px;padding:1px 7px;}
+.exec-val{font-size:22px;font-weight:700;color:var(--text);}
+.exec-metric-name{font-size:10.5px;color:var(--text3);margin:2px 0 6px;min-height:26px;}
+.exec-spark{margin-bottom:6px;}
+.exec-delta{display:flex;align-items:center;gap:6px;}
+.exec-delta-label{font-size:10px;color:var(--text3);font-weight:600;}
+.exec-delta-val{font-size:12px;font-weight:600;}
+.peer-control-grid,.corr-control-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
+gap:14px;margin-bottom:14px;align-items:end;}
+.peer-control-peers{grid-column:1/-1;}
+.peer-control-label{display:block;font-size:10px;font-weight:600;text-transform:uppercase;
+letter-spacing:0.4px;color:var(--text3);margin-bottom:5px;}
+.peer-select-row{display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap;}
+.peer-sel-dd{flex:1;min-width:240px;}
+.peer-actions{display:flex;gap:6px;}
+.tb-btn,.peer-btn{font-size:11px;font-weight:600;padding:6px 12px;border-radius:7px;border:1px solid var(--primary);
+background:var(--primary);color:#fff;cursor:pointer;}
+.tb-btn-secondary{background:#fff;color:var(--text2);border-color:var(--border);}
+.peer-section{margin-top:6px;}
+.paired-row{display:flex;flex-wrap:wrap;margin:0 -8px;}
+.pair-col{padding:0 8px;}
+.pair-card{background:#fff;border:1px solid var(--border);border-radius:10px;padding:14px;height:100%;
+min-height:432px;display:flex;flex-direction:column;}
+.viz-shell,.insight-load-shell{flex:1;}
+.corr-title-main{font-size:14px;font-weight:700;margin-bottom:12px;color:var(--text);}
+.det-card{background:linear-gradient(110deg,#0f2a4a,#1a3a5c);}
+.det-hdr{color:#fff;}
+.det-hdr .idd-d-light{min-width:150px;}
+.det-legend{display:flex;align-items:center;gap:6px;color:#fff;font-size:11px;}
+.legend-dot{font-size:11px;}
+.export-btn{font-size:12px;font-weight:600;padding:7px 14px;border-radius:8px;border:none;
+background:#fff;color:var(--primary-dark);cursor:pointer;display:flex;align-items:center;}
+.dg{display:flex;flex-direction:column;gap:14px;}
+.det-cat-section{background:#fff;border-radius:10px;overflow:hidden;border:1px solid var(--border);}
+.det-cat-hdr{display:flex;align-items:center;gap:8px;padding:8px 12px;font-weight:700;font-size:12.5px;}
+.det-cat-count{margin-left:auto;font-size:11px;color:var(--text3);font-weight:600;}
+.det-cat-body{padding:8px 12px;}
+.dc{display:flex;flex-direction:column;}
+.dr{display:flex;justify-content:space-between;align-items:center;padding:7px 4px;
+border-bottom:1px solid #f1f5f9;gap:10px;}
+.dn{font-size:11.5px;color:var(--text2);flex:1;}
+.dright{display:flex;align-items:center;gap:12px;}
+.dv{font-size:13px;font-weight:700;min-width:78px;text-align:right;}
+.ddelta{display:flex;flex-direction:column;align-items:flex-end;}
+.ddelta-lbl{font-size:9px;color:var(--text3);}
+.ddelta-val{font-size:11px;font-weight:600;}
+.ow{display:flex;flex-direction:column;gap:14px;}
+.os{background:#f8fafc;border:1px solid var(--border);border-radius:9px;padding:10px 12px;}
+.ost{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.4px;color:var(--text3);
+margin-bottom:7px;}
+.or{display:flex;justify-content:space-between;padding:3px 0;font-size:12px;}
+.or.oh{font-weight:700;border-top:1px solid var(--border);padding-top:6px;margin-top:3px;}
+.ol{color:var(--text2);}
+.ov{font-weight:600;color:var(--text);text-align:right;}
+.pct-gauge-section{margin-bottom:6px;}
+.pct-gauge-wrap{display:flex;align-items:center;gap:14px;background:#f8fafc;border:1px solid var(--border);
+border-radius:9px;padding:12px;}
+.pct-info{display:flex;flex-direction:column;gap:2px;}
+.pct-label{font-size:10px;text-transform:uppercase;letter-spacing:0.4px;color:var(--text3);font-weight:600;}
+.pct-rank{font-size:17px;font-weight:700;}
+.pct-band{font-size:12px;}
+.df-line{font-size:11px;color:var(--text3);margin-top:8px;line-height:1.5;}
+.df-cat{font-weight:700;color:var(--text2);}
+.dfoot{margin-top:8px;}
+.ref-wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px;}
+.ref-section{border:1px solid var(--border);border-radius:9px;overflow:hidden;}
+.ref-cat{display:flex;align-items:center;gap:8px;padding:8px 10px;background:#f8fafc;}
+.ref-cat-label{font-weight:700;font-size:12px;}
+.ref-cat-count{margin-left:auto;font-size:10.5px;color:var(--text3);}
+.ref-body{padding:6px 10px;}
+.ref-row{padding:6px 0;border-bottom:1px solid #f1f5f9;}
+.ref-name{font-size:11.5px;font-weight:600;color:var(--text);}
+.ref-desc{font-size:10.5px;color:var(--text3);line-height:1.5;margin-top:2px;}
+.dashboard-footer{margin-top:8px;}
+.data-scope-banner{background:#fff;border:1px solid var(--border);border-radius:11px;padding:14px 16px;
+margin-bottom:12px;}
+.scope-hdr{margin-bottom:10px;}
+.scope-title-wrap{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
+.scope-title-pill{background:var(--primary);color:#fff;font-size:11px;font-weight:700;padding:3px 10px;
+border-radius:20px;}
+.scope-meta{font-size:11px;color:var(--text3);}
+.scope-lines{display:flex;flex-direction:column;gap:5px;}
+.scope-line{display:flex;gap:8px;font-size:11.5px;}
+.scope-k{font-weight:700;color:var(--text2);min-width:120px;}
+.scope-v{color:var(--text3);}
+.dashboard-footer-note{padding:6px 2px;}
+.dashboard-footer-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.4px;
+color:var(--text3);margin-bottom:4px;}
+.dashboard-footer-text{font-size:11px;color:var(--text3);line-height:1.6;}
+.dashboard-footer-emph{font-weight:600;color:var(--text2);}
+.dashboard-footer-muted{font-style:italic;opacity:0.85;}
+.metric-opt{display:flex;align-items:center;gap:7px;padding:2px 0;}
+.metric-opt-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;}
+.metric-opt-cat{font-size:9px;font-weight:600;padding:1px 6px;border-radius:5px;white-space:nowrap;}
+.metric-opt-name{font-size:12px;color:var(--text);}
+.emp{color:var(--text3);font-size:12px;text-align:center;padding:20px;}
+.spark-img{display:block;}
+@media (max-width:768px){.pair-col{flex:0 0 100%;max-width:100%;}.hdr-meta{text-align:left;}}
+</style>
+</head>
+<body>
+{%app_entry%}
+<footer>{%config%}{%scripts%}{%renderer%}</footer>
+</body>
+</html>'''
 
 
 def build_error_dashboard(title, message, missing_banks=None):
+    # Functional reconstruction of the original error page. Returns a Dash app
+    # so the module footer (app = main(); server = app.server) works unchanged.
     app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP],
                     meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}])
-    app.title = "JPMorgan Chase — SIB Dashboard Data Unavailable"
-    sub_blocks = []
+    app.title = DASHBOARD_TITLE
+    extra = []
     if missing_banks:
-        sub_blocks.append(html.Div([
-            html.Div("Banks affected:", style={
-                'fontSize': '12px', 'fontWeight': '700', 'color': CS['text2'],
-                'textTransform': 'uppercase', 'letterSpacing': '0.6px',
-                'marginBottom': '8px', 'marginTop': '20px'}),
-            html.Ul([html.Li(b, style={'color': CS['text'], 'marginBottom': '4px'})
-                     for b in sorted(missing_banks)],
-                    style={'paddingLeft': '20px', 'margin': '0'})
-        ]))
-    app.layout = html.Div(
-        style={'fontFamily': "'Inter', -apple-system, BlinkMacSystemFont, sans-serif",
-               'background': CS['bg'], 'minHeight': '100vh', 'padding': '60px 24px'},
-        children=[html.Div(
-            style={'maxWidth': '720px', 'margin': '0 auto', 'background': '#fff',
-                   'borderRadius': '14px', 'padding': '36px 40px',
-                   'boxShadow': '0 4px 16px rgba(15,23,42,0.06), 0 1px 3px rgba(15,23,42,0.04)',
-                   'borderLeft': f'4px solid {CS["bad"]}'},
-            children=[
-                html.Div("\u26a0", style={'fontSize': '34px', 'color': CS['bad'], 'marginBottom': '8px', 'lineHeight': '1'}),
-                html.H2(title, style={'color': CS['text'], 'fontWeight': '700', 'marginBottom': '14px', 'fontSize': '22px'}),
-                html.P(message, style={'color': CS['text2'], 'lineHeight': '1.6', 'whiteSpace': 'pre-wrap', 'fontSize': '14px'}),
-                *sub_blocks,
-                html.Hr(style={'margin': '24px 0', 'borderColor': CS['border']}),
-                html.P([
-                    html.Strong("Real-data-only dashboard.", style={'color': CS['text']}),
-                    " No synthetic, sample, or fallback data will be substituted if the FDIC API "
-                    "is unavailable. Refresh after verifying connectivity to retry."
-                ], style={'color': CS['text3'], 'fontSize': '13px', 'lineHeight': '1.55'}),
-            ])])
+        extra.append(html.Div("Affected banks: " + ", ".join(sorted(missing_banks)),
+                              style={"marginTop": "12px", "fontSize": "13px", "color": "#475569"}))
+    app.layout = html.Div([
+        html.Div([
+            html.Div("\u26a0", style={"fontSize": "40px", "marginBottom": "8px"}),
+            html.H3(title, style={"color": "#b91c1c", "fontWeight": "700"}),
+            html.P(message, style={"color": "#334155", "maxWidth": "640px", "margin": "10px auto",
+                                   "lineHeight": "1.6"}),
+            html.P("Real-data-only dashboard. No synthetic, sample, or fallback data is substituted "
+                   "if the FDIC API is unavailable. Refresh after verifying connectivity to retry.",
+                   style={"color": "#64748b", "fontSize": "12px", "maxWidth": "640px",
+                          "margin": "10px auto", "fontStyle": "italic"}),
+        ] + extra, style={"textAlign": "center", "padding": "70px 24px", "fontFamily": "'Inter',sans-serif"})
+    ], style={"minHeight": "100vh", "background": "#f4f6f9", "display": "flex",
+              "alignItems": "center", "justifyContent": "center"})
     return app
 
 
 def main():
-    warnings.filterwarnings('ignore', message='Unverified HTTPS request')
     try:
-        df = BankDataService().get_metrics_data()
-    except FDICDataUnavailableError as e:
-        logger.error(f"FDIC data unavailable (pid={os.getpid()}): {e}")
-        return build_error_dashboard("FDIC Data Unavailable",
-                                     f"The dashboard could not retrieve data from the FDIC BankFind API.\n\n{e}")
-    except Exception as e:
-        logger.error(f"Unexpected error fetching FDIC data (pid={os.getpid()}): {type(e).__name__}: {e}")
-        return build_error_dashboard("Unexpected Error",
-                                     f"An unexpected error occurred while fetching FDIC data.\n\n{type(e).__name__}: {e}")
-    if df.empty:
-        return build_error_dashboard("No Data Returned",
-                                     "The FDIC BankFind API responded but returned no usable data for the "
-                                     "configured peer set. Check the cache directory and bank configuration, then retry.")
+        service = BankDataService()
+        df = service.get_metrics_data()
+    except FDICDataUnavailableError as exc:
+        logger.error(f"FDIC data unavailable: {exc}")
+        return build_error_dashboard("FDIC Data Unavailable", str(exc))
+    except Exception as exc:  # noqa: BLE001 - last-resort guard so the dyno serves a page, not a 500
+        logger.exception("Unexpected error building dashboard data.")
+        return build_error_dashboard("Dashboard Error",
+                                     f"An unexpected error occurred while preparing the data: {exc}")
+
+    if df is None or df.empty:
+        return build_error_dashboard(
+            "FDIC Data Unavailable",
+            "The dashboard could not retrieve usable data from the FDIC BankFind API.")
+
     expected_banks = {b['display'] for b in BANK_INFO}
     actual_banks = set(df['Bank'].unique())
     missing_banks = expected_banks - actual_banks
-    logger.info(f"Dashboard ready (pid={os.getpid()}): {len(actual_banks)} of {len(expected_banks)} banks loaded. "
-                f"Active: {sorted(actual_banks)}" + (f". MISSING: {sorted(missing_banks)}" if missing_banks else ""))
     if missing_banks:
-        logger.warning(f"FDIC data missing for: {sorted(missing_banks)}. Absent from dashboard until next "
-                       f"successful fetch. (Real data only by design.)")
-    return DashboardBuilder(df, missing_banks=missing_banks).create_dashboard()
+        logger.warning(f"Rendering with missing banks (excluded from peer stats): {sorted(missing_banks)}")
+
+    builder = DashboardBuilder(df, missing_banks=missing_banks)
+    return builder.create_dashboard()
 
 
 app = main()
