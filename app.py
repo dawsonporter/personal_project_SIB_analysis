@@ -1614,12 +1614,12 @@ class DashboardBuilder:
                             html.Div([
                                 html.Span("Metric", className="peer-control-label"),
                                 self._mdd('peer-metric', c="idd-m peer-metric-dd"),
-                            ], className="peer-control peer-control-metric"),
+                            ], className="peer-control peer-control-metric", id="peer-metric-control-wrap"),
                             html.Div([
                                 html.Span("As-of Date", className="peer-control-label"),
                                 dcc.Dropdown(id='r1d', options=self._do, value=dv, clearable=False,
                                              searchable=False, className="idd-d peer-date-dd")
-                            ], className="peer-control peer-control-date"),
+                            ], className="peer-control peer-control-date", id="peer-date-control-wrap"),
                             html.Div([
                                 html.Span("Selected Peers", className="peer-control-label"),
                                 html.Div([
@@ -1819,6 +1819,30 @@ class DashboardBuilder:
         def d_peer(m):
             return self._peer_metric_definition(m)
 
+        @app.callback(Output('peer-metric-control-wrap', 'style'), Input('peer-metric', 'value'))
+        def resize_peer_metric_control(metric):
+            """Keep the peer metric selector compact, but let it breathe.
+
+            Dash/React Select does not expose the rendered label width directly, so
+            this uses a conservative character-based width estimate and clamps it
+            to a narrow range. The surrounding flex row then naturally slides the
+            As-of Date box right/left without stretching the metric selector across
+            the full peer section.
+            """
+            label = str(metric or self._def_metric or "")
+            # Category pills inside the dropdown add a little visual width, but
+            # the selected value itself is the main driver. Keep this deliberately
+            # bounded so short metrics do not look cramped and long metrics do not
+            # run across the entire row.
+            estimated_width = 330 + (len(label) * 5.8)
+            width = int(max(460, min(610, estimated_width)))
+            return {
+                'flex': f'0 0 {width}px',
+                'maxWidth': f'{width}px',
+                'minWidth': '360px',
+                'transition': 'flex-basis 180ms ease, max-width 180ms ease',
+            }
+
         @app.callback(Output('r3f', 'children'), [Input('r3p', 'value'), Input('r3s', 'value')])
         def d3(a, b):
             return html.Div([self._rdef(a, "Primary"), self._rdef(b, "Secondary")])
@@ -1971,11 +1995,8 @@ class DashboardBuilder:
         tfmt = ',.0f' if isdol else '.2f'
         y_title = '$000s' if isdol else ('%' if ispct else None)
         fig.update_layout(**self._bl(
-            margin=dict(l=48, r=12, t=24, b=78),
-            xaxis=dict(title_text="Selected SIB Peers",
-                       title_font=dict(size=9, color=CS['text3']),
-                       title_standoff=12, tickangle=-35, tickfont=dict(size=9.5),
-                       showgrid=False, showline=False),
+            margin=dict(l=48, r=12, t=24, b=68),
+            xaxis=dict(tickangle=-35, tickfont=dict(size=9.5), showgrid=False, showline=False),
             yaxis=dict(title_text=y_title, title_font=dict(size=9, color=CS['text3']),
                        tickformat=tfmt, range=[y_min, y_max], showgrid=True,
                        gridcolor=CS['grid'], showline=False, tickfont=dict(size=9.5),
@@ -2068,19 +2089,19 @@ class DashboardBuilder:
         ], className="pct-gauge-section")
 
         return html.Div([
-            html.Div([
-                html.Div(f"{self.GHB} Result{unit_note}", className="ost"),
-                sr(self.GHB, f(gv) if gv is not None else "N/A", h=True),
-                sr_colored(f"{PRIMARY_BANK_ABBR} QoQ Change", qoq_text, qoq_color),
-                sr_colored(f"{PRIMARY_BANK_ABBR} YoY Change", yoy_text, yoy_color),
-            ], className="os"),
             gauge_section,
             html.Div([
                 html.Div(f"Peer Snapshot{unit_note}", className="ost"),
                 sr("Peer Average", peer_avg),
                 sr("Peer Median", peer_median),
+                sr(self.GHB, f(gv) if gv is not None else "N/A", h=True),
                 sr("Peer High", peer_high),
                 sr("Peer Low", peer_low)
+            ], className="os"),
+            html.Div([
+                html.Div("JPM Momentum", className="ost"),
+                sr_colored("QoQ Change", qoq_text, qoq_color),
+                sr_colored("YoY Change", yoy_text, yoy_color),
             ], className="os"),
         ], className="ow")
 
@@ -2450,15 +2471,13 @@ border-radius:12px;padding:16px 18px;margin-bottom:16px;}
 .exec-delta{display:flex;align-items:center;gap:6px;}
 .exec-delta-label{font-size:10px;color:var(--text3);font-weight:600;}
 .exec-delta-val{font-size:12px;font-weight:600;}
-.peer-control-grid{display:grid;grid-template-columns:minmax(440px,640px) 178px;align-items:end;
-gap:14px;margin-bottom:14px;justify-content:start;}
+.peer-control-grid{display:flex;flex-wrap:wrap;gap:14px;margin-bottom:14px;align-items:flex-end;}
 .corr-control-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
 gap:14px;margin-bottom:14px;align-items:end;}
-.peer-control-metric{min-width:0;max-width:640px;}
-.peer-control-date{min-width:160px;}
-.peer-control-peers{grid-column:1 / -1;min-width:0;width:100%;}
+.peer-control-metric{flex:0 0 500px;min-width:360px;max-width:610px;}
+.peer-control-date{flex:0 0 162px;min-width:150px;max-width:170px;}
+.peer-control-peers{flex:0 0 100%;width:100%;}
 .peer-metric-dd,.peer-date-dd{width:100%;}
-.peer-metric-dd .Select-value-label{white-space:normal;line-height:1.2;}
 .peer-control-label{display:block;font-size:10px;font-weight:600;text-transform:uppercase;
 letter-spacing:0.4px;color:var(--text3);margin-bottom:5px;}
 .peer-select-row{display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap;}
@@ -2547,7 +2566,7 @@ color:var(--text3);margin-bottom:4px;}
 .emp{color:var(--text3);font-size:12px;text-align:center;padding:20px;}
 .spark-img{display:block;}
 @media (max-width:768px){.pair-col{flex:0 0 100%;max-width:100%;}.hdr-meta{text-align:left;}
-.peer-control-grid{grid-template-columns:1fr;}.peer-control-metric,.peer-control-date,.peer-control-peers{min-width:0;max-width:none;width:100%;}}
+.peer-control-metric,.peer-control-date{flex:1 1 100%!important;max-width:100%!important;min-width:0!important;}}
 </style>
 </head>
 <body>
