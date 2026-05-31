@@ -592,7 +592,12 @@ def compute_period_deltas(df, bank, metric, current_date):
         idx = dates.index(pd.Timestamp(current_date))
     except ValueError:
         return (None, None)
-    qoq_val = bd.iloc[idx - 1][metric] if idx >= 1 else None
+    # QoQ only when the immediately-preceding row is truly ~1 quarter back;
+    # do not mislabel a 2+-quarter gap (a missing quarter) as "QoQ".
+    prev_dt = dates[idx - 1] if idx >= 1 else None
+    qoq_val = (bd.iloc[idx - 1][metric]
+               if idx >= 1 and 75 <= (pd.Timestamp(current_date) - prev_dt).days <= 100
+               else None)
     target_yoy = pd.Timestamp(current_date) - pd.DateOffset(years=1)
     yoy_val = None
     best_j = None
@@ -648,7 +653,7 @@ class FDICAPIClient:
     def __init__(self):
         self.base_url = BASE_URL
 
-    def _get(self, ep, params, attempts=4):
+    def _get(self, ep, params, attempts=2):
         """Resilient GET against the FDIC BankFind API.
 
         Treats HTTP 429 and 5xx as retryable (the rate-limit / transient-server
@@ -656,6 +661,12 @@ class FDICAPIClient:
         Retry-After when present, and uses exponential backoff with jitter so
         multiple workers (e.g. several Heroku dynos waking at once) don't
         synchronize their retries and re-hammer the API in lockstep.
+
+        Note: attempts defaults to 2 and timeout to 15s (was 4 / 45s). Because
+        app = main() runs at import, the full 19-bank fetch happens during
+        gunicorn worker boot; these low bounds keep a cold, unreachable boot
+        from blowing past Heroku's ~60s web-boot window. (The durable fix is to
+        load lazily / warm a persisted cache instead of fetching at import.)
 
         On total failure it returns {"data": [], "_error": <reason>} so callers
         can distinguish a genuine empty result from a transient failure.
@@ -669,7 +680,7 @@ class FDICAPIClient:
                     params=params,
                     headers={"Accept": "application/json"},
                     verify=False,
-                    timeout=45,
+                    timeout=15,
                 )
                 if r.status_code == 429 or 500 <= r.status_code < 600:
                     ra = r.headers.get('Retry-After')
@@ -949,6 +960,10 @@ class BankMetricsCalculator:
         if df.empty:
             return df
         df['Date'] = pd.to_datetime(df['Date'], format='%Y%m%d')
+        # Collapse restated/amended quarters (duplicate cert+REPDTE) to a single
+        # row, keeping the latest, so f.pivot(index='Date', columns='Bank') in
+        # _trend / _ta cannot raise "Index contains duplicate entries".
+        df = df.drop_duplicates(subset=['Bank', 'Date'], keep='last')
         return df.sort_values('Date')
 
     def _br(self, bn, fin):
@@ -1408,7 +1423,12 @@ class DashboardBuilder:
         idx = self._ghb_idx(date)
         if idx is None or self._ghb_df.empty or metric not in self._ghb_df.columns:
             return (None, None)
-        qoq_val = self._ghb_df.iloc[idx - 1][metric] if idx >= 1 else None
+        # QoQ only when the immediately-preceding row is truly ~1 quarter back
+        # (75-100 days); a missing quarter must not be mislabeled as "QoQ".
+        prev_dt = self._ghb_df.iloc[idx - 1]['Date'] if idx >= 1 else None
+        qoq_val = (self._ghb_df.iloc[idx - 1][metric]
+                   if idx >= 1 and 75 <= (pd.Timestamp(date) - prev_dt).days <= 100
+                   else None)
         target_yoy = pd.Timestamp(date) - pd.DateOffset(years=1)
         yoy_val = None
         best_j = None
@@ -2656,4 +2676,4 @@ app = main()
 server = app.server
 
 if __name__ == "__main__":
-    app.run_server(debug=False)
+    app.run(debug=False)
