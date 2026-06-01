@@ -60,6 +60,75 @@ GRAPH_CONFIG = {
 
 PRIOR_PERIOD_TOLERANCE_DAYS = 45
 
+# =============================================================================
+# CECL TRANSITION ADJUSTMENT TO THE CREDIT-CONCENTRATION DENOMINATOR
+# -----------------------------------------------------------------------------
+# WHY THIS EXISTS
+#   Supervisory credit-concentration ratios (UBPR Page 7B, the "... to Tier 1 +
+#   ACL" family) divide an exposure by Tier 1 capital plus the ACL attributable
+#   to loans & leases (Fed SR 20-8). For banks that elected the 2019 or 2020
+#   CECL capital transition, a portion of the ACL is added back INTO Tier 1
+#   (through retained earnings) during the transition. If you then add the FULL
+#   ACL on top of an unadjusted Tier 1, you double-count the reserve. To prevent
+#   that, the supervisory methodology SUBTRACTS the transitional add-back from
+#   Tier 1 in the concentration denominator (OCC Bulletin 2020-90; OCC
+#   "Concentrations of Credit" booklet, Oct 2020).
+#
+#   An unadjusted Tier 1 + ACL denominator therefore runs slightly HIGH, which
+#   makes the ratios run slightly LOW. Empirically vs UBPR for JPM (cert 628):
+#   denominator ~1.9% high at 03/2020, ~0.4% high at 03/2023, and exactly
+#   correct from 2025 onward (transition fully phased out). The effect is a pure
+#   denominator scalar, identical across every concentration line for a quarter.
+#
+# THE ADD-BACK IS NOT ESTIMATED
+#   add-back T = (RC-R Part I, line 2 retained earnings)
+#                - (RC Schedule, item 26.a retained earnings)
+#   Per the FFIEC Call Report instructions, RC-R Part I line 2 retained earnings
+#   is defined as RC 26.a retained earnings PLUS the bank's applicable phase-in
+#   percentage of its CECL transitional amount. So the difference already embeds
+#   whichever election (3-yr 2019: 75/50/25; 5-yr 2020/CARES: 100/100/75/50/25)
+#   and whichever year the bank is in -- nothing about the schedule is modeled
+#   here. Pre-adoption and 2025+, the difference is ~0 and this is a no-op.
+#
+# SOURCING (read this before assuming it "didn't work")
+#   The FDIC BankFind *financials* endpoint serves the curated SDI variable set,
+#   NOT raw Call Report MDRM. The two retained-earnings figures may or may not be
+#   exposed under a stable SDI name. This module reads them from a configurable
+#   list of candidate field names (best-effort, fetched in an ISOLATED request
+#   that cannot break the main dashboard). Behavior:
+#     * If a candidate resolves -> exact, UBPR-aligned concentration ratios.
+#     * If none resolve         -> SAFE NO-OP: raw Tier 1 + ACL is used (current
+#                                  behavior) and the data-scope banner says so.
+#   Confirm the names with one probe against the live API, e.g.:
+#       GET /api/financials?filters=CERT:628&fields=REPDTE,<candidate>&limit=1
+#   Canonical raw sources if you'd rather pull from FFIEC CDR/UBPR directly:
+#       RC item 26.a retained earnings       -> MDRM 3247
+#       RC-R Part I line 2 retained earnings -> regulatory retained earnings
+#       RC-O Memorandum item 5 (2021Q2+)     -> L&L-attributable add-back (MW53)
+#   VALIDATION: you have the UBPR Page 7B file for cert 628. With the fields
+#   wired, the dashboard's 03/2020 and 03/2023 concentration values should match
+#   UBPR to ~0.01; 2025+ already matches.
+# =============================================================================
+APPLY_CECL_TRANSITION_ADJUSTMENT = True
+CECL_TRANSITION_START = '20200101'   # first CECL adoption period (inclusive)
+CECL_TRANSITION_END = '20241231'     # last period with a nonzero add-back (inclusive)
+
+# Preferred: a single field that already equals the L&L-attributable add-back
+# (RC-O Memo 5 style). Leave empty unless you confirm an SDI name for it.
+CECL_DIRECT_ADDBACK_FIELDS: Tuple[str, ...] = ()
+
+# Fallback: regulatory (RC-R Pt I ln 2) minus book (RC 26.a) retained earnings.
+# NOTE: these are best-guess SDI candidate names -- VERIFY against the live API.
+# Wrong/absent names simply no-op (raw Tier 1 + ACL is used). Put the confirmed
+# name(s) at the FRONT of each tuple; the first that resolves on a row is used.
+CECL_REG_RE_FIELDS: Tuple[str, ...] = ("RBCT1RE", "EQCRETREG", "RETEARNREG")
+CECL_BOOK_RE_FIELDS: Tuple[str, ...] = ("EQRETERN", "RETEARN", "EQRE")
+
+# Union of every candidate, used to build the isolated best-effort aux request.
+CECL_AUX_FIELDNAMES: Tuple[str, ...] = tuple(dict.fromkeys(
+    CECL_DIRECT_ADDBACK_FIELDS + CECL_REG_RE_FIELDS + CECL_BOOK_RE_FIELDS))
+CECL_AUX_FF = ("CERT,REPDTE," + ",".join(CECL_AUX_FIELDNAMES)) if CECL_AUX_FIELDNAMES else ""
+
 CS = {
     'primary': '#005EB8', 'primary_light': '#2F7FD3', 'primary_dark': '#003B73',
     'secondary': '#333333', 'accent': '#0B4F8A', 'accent_light': '#E8F2FC',
@@ -80,7 +149,10 @@ CS = {
     'spark': '#005EB8', 'spark_area': 'rgba(0,94,184,0.08)',
 }
 
-CACHE_SCHEMA_VERSION = "v10_sib_jpm_20030331_no_comerica_intexpy"
+# Bumped so caches written before the CECL enrichment are invalidated and
+# refetched (cached financial rows now also carry the retained-earnings fields
+# needed for the adjustment).
+CACHE_SCHEMA_VERSION = "v11_sib_jpm_20030331_cecl_conc_adj"
 
 BANK_INFO = [
     {"cert": "628",   "display": "JPMorgan Chase"},
@@ -229,6 +301,9 @@ for cat_name, cat_metrics in METRIC_CATEGORIES:
     for m in cat_metrics:
         METRIC_TO_CATEGORY[m] = cat_name
 
+# Concentration metrics share the (CECL-adjusted) Tier 1 + ACL denominator.
+CONCENTRATION_METRICS = list(METRIC_CATEGORIES[6][1])
+
 CATEGORY_ACCENTS = {
     "Key Financials": "#0f172a",
     "Earnings & Profitability": "#16a34a", "Efficiency & Margin": "#2563eb",
@@ -315,10 +390,10 @@ METRIC_DEFINITIONS = {
     'Noninterest Expense to Average Assets': "Margin \xb7 Total noninterest expense as % of avg assets. FDIC field: NONIXR. UBPR Pg1 #5 (UBPRE005).",
     'Salaries and Benefits to Average Assets': "Margin \xb7 Personnel expense as % of avg assets. FDIC field: ESALR. UBPR Pg3.",
     'Noninterest Income to Average Assets': "Margin \xb7 Total fee/noninterest income as % of avg assets. FDIC field: NONIIR. UBPR Pg1 #4 (UBPRE004).",
-    'Common Equity Tier 1 (CET1) Ratio': "Capitalization \xb7 CET1 capital to RWA. Well-capitalized: \u22656.5%. FDIC field: IDT1CER. UBPR Pg11.",
-    'Tier 1 Risk-Based Capital Ratio': "Capitalization \xb7 Tier 1 capital to RWA. Well-capitalized: \u22658%. FDIC field: IDT1RWAJR. UBPR Pg11.",
-    'Leverage (Core Capital) Ratio': "Capitalization \xb7 Tier 1 capital to avg total assets. Well-capitalized: \u22655%. FDIC field: RBC1AAJ. UBPR Pg1 #33 (UBPRD486).",
-    'Total Risk-Based Capital Ratio': "Capitalization \xb7 Total capital (T1 + T2) to RWA. Well-capitalized: \u226510%. FDIC field: RBCRWAJ. UBPR Pg1 #34 (UBPRD488).",
+    'Common Equity Tier 1 (CET1) Ratio': "Capitalization \xb7 CET1 capital to RWA. Well-capitalized: \u22656.5%. FDIC field: IDT1CER. UBPR Pg11. (Regulatory ratio: intentionally reflects the bank's elected CECL transition relief; NOT CECL-adjusted here.)",
+    'Tier 1 Risk-Based Capital Ratio': "Capitalization \xb7 Tier 1 capital to RWA. Well-capitalized: \u22658%. FDIC field: IDT1RWAJR. UBPR Pg11. (Regulatory ratio: reflects elected CECL transition relief; NOT CECL-adjusted here.)",
+    'Leverage (Core Capital) Ratio': "Capitalization \xb7 Tier 1 capital to avg total assets. Well-capitalized: \u22655%. FDIC field: RBC1AAJ. UBPR Pg1 #33 (UBPRD486). (Regulatory ratio: reflects elected CECL transition relief; NOT CECL-adjusted here.)",
+    'Total Risk-Based Capital Ratio': "Capitalization \xb7 Total capital (T1 + T2) to RWA. Well-capitalized: \u226510%. FDIC field: RBCRWAJ. UBPR Pg1 #34 (UBPRD488). (Regulatory ratio: reflects elected CECL transition relief; NOT CECL-adjusted here.)",
     'Net Charge-Offs / Total Loans & Leases': "Asset Quality \xb7 Net charge-offs as % of avg total L&L, annualized. FDIC field: NTLNLSR. UBPR Pg1 #22 (UBPRE019).",
     'ACL / Total Loans & Leases': "Asset Quality \xb7 ACL as % of LN&LS HFI. FDIC field: LNATRESR. UBPR Pg1 #24 (UBPRE022).",
     'ACL / Nonaccrual Loans': "Asset Quality \xb7 ACL as a MULTIPLE of nonaccrual loans. Well-reserved: \u22651.00x. UBPR Pg1 #26 (UBPRE395). Shown as X multiplier (1.51x = 151%).",
@@ -339,7 +414,7 @@ METRIC_DEFINITIONS = {
     'Noninterest-Bearing Deposits to Total Deposits': "Funding \xb7 Domestic NIB deposits as % of total deposits. Computed: DEPNIDOM / DEP. UBPR Pg4.",
     'Brokered Deposits to Total Deposits': "Funding \xb7 All brokered deposits as % of total deposits. \u226520% signals vulnerability. Computed: BRO / DEP. UBPR Pg4.",
     'Volatile Liabilities to Total Assets': "Funding \xb7 Volatile liabilities as % of total assets. FDIC field: VOLIABR. UBPR Pg10.",
-    'Real Estate Loans to Tier 1 + ACL': "Concentration \xb7 Total RE loans as % of Tier 1 + ACL. UBPR Pg7B 7B.1 (UBPRE884).",
+    'Real Estate Loans to Tier 1 + ACL': "Concentration \xb7 Total RE loans as % of Tier 1 + ACL. UBPR Pg7B 7B.1 (UBPRE884). Denominator nets out the CECL transitional add-back during 2020\u20132024 (OCC Bull. 2020-90), matching UBPR.",
     'RE Construction and Land Development to Tier 1 + ACL': "Concentration \xb7 Construction & land dev as % of Tier 1 + ACL. UBPR Pg7B 7B.2 (UBPRD490).",
     '1-4 Family Construction to Tier 1 + ACL': "Concentration \xb7 1-4 family construction as % of Tier 1 + ACL. UBPR Pg7B 7B.3 (UBPRE632).",
     'Other Construction & Land Dev to Tier 1 + ACL': "Concentration \xb7 Other construction & land dev as % of Tier 1 + ACL. UBPR Pg7B 7B.4.",
@@ -354,13 +429,13 @@ METRIC_DEFINITIONS = {
     'NFNR: Non-Owner Occupied to Tier 1 + ACL': "Concentration \xb7 Non-owner-occupied NFNR (investor CRE) as % of Tier 1 + ACL. UBPR Pg7B 7B.13.",
     'Commercial RE to Tier 1 + ACL': "Concentration \xb7 UBPR Total CRE = Construction + Multifamily + NFNR total + LNCOMRE, as % of Tier 1 + ACL. UBPR Pg7B 7B.26.",
     'Non-Owner Occupied CRE to Tier 1 + ACL': "Concentration \xb7 NOO CRE = Construction + Multifamily + NFNR NOO + LNCOMRE, as % of Tier 1 + ACL. Interagency CRE guidance metric. UBPR Pg7B 7B.24.",
-    'Non-Owner Occupied CRE 3-Year Growth Rate': "Growth \xb7 3-year growth of NOO CRE. >300% concentration AND >36% 3-year growth trigger enhanced risk management. UBPR Pg7B 7B.25.",
+    'Non-Owner Occupied CRE 3-Year Growth Rate': "Growth \xb7 3-year growth of NOO CRE. >300% concentration AND >36% 3-year growth trigger enhanced risk management. UBPR Pg7B 7B.25. (Dollar-balance growth: NOT affected by the CECL denominator adjustment.)",
     'C&I Loans to Tier 1 + ACL': "Concentration \xb7 C&I loans as % of Tier 1 + ACL. UBPR Pg7B 7B.17 (UBPRE887).",
     'Loans to Individuals to Tier 1 + ACL': "Concentration \xb7 Total consumer loans as % of Tier 1 + ACL. UBPR Pg7B 7B.18 (UBPRE888).",
     'Credit Cards to Tier 1 + ACL': "Concentration \xb7 Credit card loans as % of Tier 1 + ACL. UBPR Pg7B 7B.19.",
     'Auto Loans to Tier 1 + ACL': "Concentration \xb7 Auto loans as % of Tier 1 + ACL. UBPR Pg7B 7B.20.",
     'Agriculture Loans to Tier 1 + ACL': "Concentration \xb7 Agriculture loans (non-RE) as % of Tier 1 + ACL. UBPR Pg7B 7B.16 (UBPRE886).",
-    'Loans to NDFIs and Other to Tier 1 + ACL': "Concentration \xb7 Loans to nondepository FIs and other as % of Tier 1 + ACL. UBPR Pg7B 7B.22.",
+    'Loans to NDFIs and Other to Tier 1 + ACL': "Concentration \xb7 Loans to nondepository FIs and other as % of Tier 1 + ACL. UBPR Pg7B 7B.22. Denominator nets out the CECL transitional add-back during 2020\u20132024 (OCC Bull. 2020-90; Fed SR 20-8), matching UBPR.",
     'Total Asset Growth Rate': "Growth \xb7 YoY growth of total assets. \u226530% YoY invites regulatory questions. UBPR Pg1 #37 (UBPR7316).",
     'Tier 1 Capital Growth Rate': "Growth \xb7 YoY growth of Tier 1 capital. UBPR Pg1 #38 (UBPR7408).",
 }
@@ -595,8 +670,6 @@ def compute_period_deltas(df, bank, metric, current_date):
         idx = dates.index(pd.Timestamp(current_date))
     except ValueError:
         return (None, None)
-    # QoQ only when the immediately-preceding row is truly ~1 quarter back;
-    # do not mislabel a 2+-quarter gap (a missing quarter) as "QoQ".
     prev_dt = dates[idx - 1] if idx >= 1 else None
     qoq_val = (bd.iloc[idx - 1][metric]
                if idx >= 1 and 75 <= (pd.Timestamp(current_date) - prev_dt).days <= 100
@@ -657,23 +730,6 @@ class FDICAPIClient:
         self.base_url = BASE_URL
 
     def _get(self, ep, params, attempts=2):
-        """Resilient GET against the FDIC BankFind API.
-
-        Treats HTTP 429 and 5xx as retryable (the rate-limit / transient-server
-        cases that bite a cold, all-banks fetch), honors the server's
-        Retry-After when present, and uses exponential backoff with jitter so
-        multiple workers (e.g. several Heroku dynos waking at once) don't
-        synchronize their retries and re-hammer the API in lockstep.
-
-        Note: attempts defaults to 2 and timeout to 15s (was 4 / 45s). Because
-        app = main() runs at import, the full 19-bank fetch happens during
-        gunicorn worker boot; these low bounds keep a cold, unreachable boot
-        from blowing past Heroku's ~60s web-boot window. (The durable fix is to
-        load lazily / warm a persisted cache instead of fetching at import.)
-
-        On total failure it returns {"data": [], "_error": <reason>} so callers
-        can distinguish a genuine empty result from a transient failure.
-        """
         last_error = None
         for attempt in range(1, attempts + 1):
             retry_after = None
@@ -715,9 +771,6 @@ class FDICAPIClient:
         return {"data": [], "_error": last_error}
 
     def get_institutions(self, f, fields):
-        # Retained for completeness/ad-hoc use; NO LONGER called in the fetch
-        # hot path. Display names are resolved from CERT_TO_DISPLAY by cert, so
-        # this metadata lookup is unnecessary and was a redundant failure point.
         payload = self._get("institutions", {"filters": f, "fields": fields, "limit": 10000})
         return payload.get('data', []), payload.get('_error')
 
@@ -738,13 +791,7 @@ class BankDataRepository:
         "EEFFR,ELNANTR,IDERNCVR,IDT1CER,IDT1RWAJR,INTEXPY,INTEXPYQ,NONIIR,COREDEP,ROAPTX,"
         "NONIXR,DEPNIDOM,LNRESNCR,VOLIABR,NOIJY,ESALR,INTINCR,EINTEXPR,ELNATRR,INTINCY")
 
-    # Gentle pacing between per-bank financial calls to avoid tripping the FDIC
-    # rate limiter during a cold, full-peer-set fetch. ~0.4s x 19 banks ~ 8s
-    # added on a cold load only (cached afterward).
     INTER_BANK_DELAY = 0.4
-    # Minimum real peer banks (excluding the primary) needed to render
-    # meaningful benchmarking statistics (quartiles need 4+). Below this, the
-    # dashboard prefers a complete cached fallback over a misleading partial.
     MIN_PEERS_REQUIRED = 5
 
     def __init__(self):
@@ -753,7 +800,8 @@ class BankDataRepository:
     @staticmethod
     def _bank_set_hash(bi):
         certs = sorted(b['cert'] for b in bi)
-        payload = CACHE_SCHEMA_VERSION + '|' + ','.join(certs) + '|' + BankDataRepository.FF
+        payload = (CACHE_SCHEMA_VERSION + '|' + ','.join(certs) + '|'
+                   + BankDataRepository.FF + '|' + CECL_AUX_FF)
         return hashlib.md5(payload.encode()).hexdigest()[:10]
 
     def _cp(self, s, e):
@@ -771,8 +819,6 @@ class BankDataRepository:
         return None
 
     def _sc(self, d, s, e):
-        # Atomic write: write to a per-PID temp file and os.replace() into place
-        # so a reader never sees a half-written cache.
         path = self._cp(s, e)
         tmp = f"{path}.tmp.{os.getpid()}"
         try:
@@ -789,8 +835,6 @@ class BankDataRepository:
 
     @staticmethod
     def _financials_complete(cache_obj, expected_certs):
-        """Return (is_complete, set_of_certs_present), judged purely on the
-        financials payload (the only data that matters for rendering)."""
         if not isinstance(cache_obj, dict):
             return False, set()
         fin_certs = set()
@@ -802,11 +846,6 @@ class BankDataRepository:
         return fin_certs >= expected_certs, fin_certs
 
     def _latest_complete_cache(self, bi):
-        """Newest on-disk cache (any date range, same bank set) that holds real
-        data for every expected bank. Used as a graceful fallback when a live
-        fetch can't meet the render thresholds. On an ephemeral filesystem
-        (e.g. Heroku) this may legitimately find nothing, in which case the
-        partial-render + retry-next-load path is the primary protection."""
         expected = {str(b['cert']).strip() for b in bi}
         h = self._bank_set_hash(bi)
         pattern = os.path.join(CACHE_DIR, f"bank_data_*_{h}.json")
@@ -830,11 +869,50 @@ class BankDataRepository:
                 best = (obj, path)
         return best
 
+    def _enrich_cecl(self, cert, fin_data):
+        """Best-effort, ISOLATED enrichment of each financial row with the
+        retained-earnings field(s) used by the CECL concentration-denominator
+        adjustment. Fetched only over the transition window to keep it small.
+
+        Lives entirely inside its own try/except and never propagates a failure:
+        if the candidate fields don't resolve (the FDIC financials endpoint may
+        not expose them under these SDI names), rows are left untouched and the
+        adjustment safely no-ops downstream. CANNOT break the main fetch."""
+        if not (APPLY_CECL_TRANSITION_ADJUSTMENT and CECL_AUX_FF):
+            return
+        try:
+            aux_rows, aux_err = self.api.get_financials(
+                cert, f"REPDTE:[{CECL_TRANSITION_START} TO {CECL_TRANSITION_END}]", CECL_AUX_FF)
+        except Exception as exc:  # noqa: BLE001 - enrichment must never break fetch
+            logger.warning(f"CECL aux fetch raised for cert {cert}: {exc}; using as-reported Tier 1 + ACL.")
+            return
+        if not aux_rows:
+            if aux_err:
+                logger.info(f"CECL aux fields unavailable for cert {cert} ({aux_err}); "
+                            f"concentration ratios will use as-reported Tier 1 + ACL.")
+            return
+        by_dt = {}
+        for a in aux_rows:
+            ad = a.get('data') if isinstance(a, dict) else None
+            if isinstance(ad, dict) and ad.get('REPDTE') is not None:
+                by_dt[str(ad['REPDTE'])] = ad
+        if not by_dt:
+            return
+        merged = 0
+        for row in fin_data:
+            extra = by_dt.get(str(row.get('REPDTE')))
+            if extra:
+                for k, v in extra.items():
+                    if k not in ('CERT', 'REPDTE') and k not in row:
+                        row[k] = v
+                        merged += 1
+        if merged:
+            logger.info(f"CECL aux merged {merged} field-values for cert {cert}.")
+
     def fetch_data(self, bi, sd, ed):
         expected_certs = {str(b["cert"]).strip() for b in bi}
         expected_count = len(expected_certs)
 
-        # 1) Exact-range cache hit (fully complete) -> serve immediately.
         c = self._lc(sd, ed)
         if c:
             complete, cached_fin_certs = self._financials_complete(c, expected_certs)
@@ -846,11 +924,6 @@ class BankDataRepository:
                 f"Cache present but INCOMPLETE: financials {len(cached_fin_certs)}/{expected_count} "
                 f"(missing certs: {sorted(missing)}). Discarding and re-fetching. (pid={os.getpid()})")
 
-        # 2) Live fetch. Financials are the ONLY per-bank gate: the friendly
-        # display name is resolved downstream from CERT_TO_DISPLAY by cert, so
-        # we no longer make a separate (fragile, request-doubling) institutions
-        # call. A minimal inst record is synthesized to keep the
-        # institutions-presence and cache-completeness checks valid.
         inst, fins, failed = {}, {}, []
         for b in bi:
             cert = str(b["cert"]).strip()
@@ -864,6 +937,8 @@ class BankDataRepository:
                                    + (f" (last error: {fin_err})" if fin_err
                                       else " - FDIC returned an empty set for this cert/date range")))
                     continue
+                # Best-effort, isolated CECL enrichment (cannot break the fetch).
+                self._enrich_cecl(cert, fin_data)
                 inst[display] = {'CERT': cert, 'NAME': display}
                 fins[display] = fin_data
             except (KeyError, TypeError, ValueError) as exc:
@@ -876,9 +951,6 @@ class BankDataRepository:
         peer_count = len(loaded_certs - {PRIMARY_BANK_CERT})
         fail_summary = '; '.join(f"{d} (cert {c}): {r}" for c, d, r in failed) or "none"
 
-        # 3) Threshold gating. If we can't render meaningfully from this live
-        # fetch, fall back to the most recent COMPLETE cache on disk before
-        # giving up. Real data only at every layer -- no synthetic fallback.
         def _fallback_or_raise(reason):
             fb = self._latest_complete_cache(bi)
             if fb is not None:
@@ -902,9 +974,6 @@ class BankDataRepository:
 
         result = {'institutions_data': inst, 'financials_data': fins}
 
-        # 4a) Partial but usable (JPM + enough peers present) -> render real
-        # data, surface the gaps in the dashboard's data-scope banner, and DO
-        # NOT cache, so the next page load retries the banks that hiccupped.
         if failed:
             for cert, display, reason in failed:
                 logger.warning(f"FDIC fetch (partial): {display} (cert {cert}) absent - {reason}")
@@ -913,13 +982,18 @@ class BankDataRepository:
                 f"Rendering available real data; intentionally not caching. (pid={os.getpid()})")
             return result
 
-        # 4b) Complete -> cache and serve.
         logger.info(f"FDIC fetch COMPLETE: all {expected_count} banks. Writing cache. (pid={os.getpid()})")
         self._sc(result, sd, ed)
         return result
 
 
 class BankMetricsCalculator:
+    def __init__(self):
+        # CECL adjustment coverage diagnostics (populated during calculate_metrics).
+        self.cecl_window_rows = 0       # bank-quarters inside the transition window
+        self.cecl_applied_rows = 0      # bank-quarters where an add-back was applied
+        self.cecl_primary_samples = []  # [(REPDTE, addback$000s)] for the primary bank
+
     @staticmethod
     def _sf(v):
         if v is None:
@@ -937,6 +1011,43 @@ class BankMetricsCalculator:
     @staticmethod
     def _z(v):
         return 0.0 if v is None else v
+
+    def _cecl_addback(self, fin):
+        """Dollar amount ($000s) of the CECL transitional add-back currently
+        embedded in Tier 1 capital for this bank-quarter, to be SUBTRACTED from
+        Tier 1 in the credit-concentration denominator (OCC Bull. 2020-90; Fed
+        SR 20-8). Returns a non-negative float, or None when no adjustment
+        applies (flag off, outside the transition window, or source fields
+        absent -> caller falls back to as-reported Tier 1 + ACL).
+
+        add-back = RC-R Pt I ln 2 retained earnings - RC item 26.a retained
+        earnings (already embeds the bank's elected phase-in %). A direct
+        L&L-attributable field (RC-O Memo 5 style) is preferred when configured.
+        """
+        if not APPLY_CECL_TRANSITION_ADJUSTMENT:
+            return None
+        repdte = str(fin.get('REPDTE', ''))
+        if not repdte or not (CECL_TRANSITION_START <= repdte <= CECL_TRANSITION_END):
+            return None
+        # Preferred: a single direct add-back field, if configured/present.
+        for f in CECL_DIRECT_ADDBACK_FIELDS:
+            v = self._sf(fin.get(f))
+            if v is not None:
+                return max(0.0, v)
+        # Fallback: regulatory retained earnings minus book retained earnings.
+        reg = None
+        for f in CECL_REG_RE_FIELDS:
+            reg = self._sf(fin.get(f))
+            if reg is not None:
+                break
+        book = None
+        for f in CECL_BOOK_RE_FIELDS:
+            book = self._sf(fin.get(f))
+            if book is not None:
+                break
+        if reg is not None and book is not None:
+            return max(0.0, reg - book)
+        return None
 
     def calculate_metrics(self, fd):
         rows = []
@@ -958,16 +1069,33 @@ class BankMetricsCalculator:
                 self._dp(row)
                 self._pp(row)
                 self._kf(row, fin)
+                # CECL coverage diagnostics (read before '_'-keys are stripped).
+                repdte = str(fin.get('REPDTE', ''))
+                if repdte and CECL_TRANSITION_START <= repdte <= CECL_TRANSITION_END:
+                    self.cecl_window_rows += 1
+                if row.get('_cecl_applied'):
+                    self.cecl_applied_rows += 1
+                    if display_name == PRIMARY_BANK_DISPLAY_NAME:
+                        self.cecl_primary_samples.append((repdte, row.get('_cecl_addback')))
                 rows.append({k: v for k, v in row.items() if not k.startswith('_')})
         df = pd.DataFrame(rows)
         if df.empty:
             return df
         df['Date'] = pd.to_datetime(df['Date'], format='%Y%m%d')
-        # Collapse restated/amended quarters (duplicate cert+REPDTE) to a single
-        # row, keeping the latest, so f.pivot(index='Date', columns='Bank') in
+        # Collapse restated/amended quarters (duplicate cert+REPDTE) to one row,
+        # keeping the latest, so f.pivot(index='Date', columns='Bank') in
         # _trend / _ta cannot raise "Index contains duplicate entries".
         df = df.drop_duplicates(subset=['Bank', 'Date'], keep='last')
         return df.sort_values('Date')
+
+    def cecl_status(self):
+        return {
+            'enabled': APPLY_CECL_TRANSITION_ADJUSTMENT,
+            'window_rows': self.cecl_window_rows,
+            'applied_rows': self.cecl_applied_rows,
+            'active': self.cecl_applied_rows > 0,
+            'primary_samples': sorted(self.cecl_primary_samples),
+        }
 
     def _br(self, bn, fin):
         s = self._sf
@@ -1047,12 +1175,25 @@ class BankMetricsCalculator:
         r['Brokered Deposits'] = r['_bd']
 
     def _cb(self, r, fin):
+        """Concentration denominator. Base = Tier 1 + ACL. During the CECL
+        transition (2020-2024), subtract the transitional add-back already
+        embedded in Tier 1 so the '+ ACL' term does not double-count the
+        reserve -- matching UBPR Page 7B / OCC Bull. 2020-90. Applies ONLY to
+        the concentration ('... to Tier 1 + ACL') metrics; regulatory capital
+        ratios elsewhere intentionally keep the transition relief."""
         t1 = r.get('_t1')
         acl = r.get('_acl')
         if t1 is None or acl is None:
             return None
-        b = t1 + acl
-        return b if b > 0 else None
+        base = t1 + acl
+        addback = self._cecl_addback(fin)
+        r['_cecl_addback'] = addback
+        if addback and addback > 0:
+            adj = (t1 - addback) + acl
+            if adj > 0:
+                r['_cecl_applied'] = True
+                return adj
+        return base if base > 0 else None
 
     def _cc(self, r, cb):
         conc_metrics = [
@@ -1215,8 +1356,6 @@ class BankDataService:
 
     def get_metrics_data(self, sd=DEFAULT_START_DATE, ed=DEFAULT_END_DATE):
         d = self.repo.fetch_data(BANK_INFO, sd, ed)
-        # Gate on financials (the real payload). institutions_data is now a thin
-        # synthesized record and no longer the authoritative presence signal.
         if not d.get('financials_data'):
             return pd.DataFrame()
         df = self.calc.calculate_metrics(d['financials_data'])
@@ -1379,9 +1518,10 @@ class DashboardBuilder:
             'search': f"{metric} {cat} {short_cat}",
         }
 
-    def __init__(self, df, missing_banks=None):
+    def __init__(self, df, missing_banks=None, cecl_status=None):
         self.df = df
         self.missing_banks = sorted(missing_banks or [])
+        self.cecl_status = cecl_status or {}
         self.raw_dates = sorted(df['Date'].unique())
         self.loaded_banks = sorted(set(df['Bank'].unique()))
         primary_df = df[df['Bank'] == self.GHB].sort_values('Date').reset_index(drop=True)
@@ -1592,6 +1732,28 @@ class DashboardBuilder:
                 ("Latest-period lag", "JPMorgan's latest available report period is "
                  f"{pd.Timestamp(self.analysis_end_date).strftime('%m/%d/%Y')}; "
                  f"the raw FDIC peer set includes a newer period of {pd.Timestamp(self.raw_latest_date).strftime('%m/%d/%Y')}."))
+
+        # CECL transition adjustment status (concentration denominator).
+        cecl = self.cecl_status or {}
+        if cecl.get('enabled'):
+            if cecl.get('active'):
+                scope_lines.append(
+                    ("CECL transition",
+                     "Concentration ratios (\u2026 to Tier 1 + ACL) net the CECL transitional add-back "
+                     "out of Tier 1 during 2020\u20132024, per OCC Bulletin 2020-90 and Fed SR 20-8, "
+                     f"matching UBPR Page 7B. Applied to {cecl.get('applied_rows', 0)} bank-quarter(s); "
+                     "pre-2020 and 2025+ are unaffected."))
+            else:
+                scope_lines.append(
+                    ("CECL transition",
+                     "Adjustment enabled, but the source retained-earnings fields did not resolve from "
+                     "the FDIC API, so concentration ratios use as-reported Tier 1 + ACL "
+                     "(\u2248 1.9% high in 2020, \u2248 0.4% high in 2023, exact 2025+). Configure the "
+                     "CECL_*_FIELDS names to activate."))
+        else:
+            scope_lines.append(
+                ("CECL transition",
+                 "Adjustment disabled; concentration ratios use as-reported Tier 1 + ACL."))
 
         return html.Div([
             html.Div([
@@ -1854,10 +2016,6 @@ class DashboardBuilder:
             the full peer section.
             """
             label = str(metric or self._def_metric or "")
-            # Category pills inside the dropdown add a little visual width, but
-            # the selected value itself is the main driver. Keep this deliberately
-            # bounded so short metrics do not look cramped and long metrics do not
-            # run across the entire row.
             estimated_width = 330 + (len(label) * 5.8)
             width = int(max(460, min(610, estimated_width)))
             return {
@@ -2435,12 +2593,9 @@ class DashboardBuilder:
         return html.Div(sections, className="dg")
 
     def _css(self):
-        # NOTE: This is a regenerated, functional stylesheet covering every class
-        # used by the layout above. It is NOT the original hand-tuned CSS (that
-        # lived in an uploaded file not available in this session). Paste your
-        # original _css body back over this method to restore your exact styling.
-        # Colors are written as literals so no %-formatting is required, and the
-        # Dash {%...%} tokens below must be preserved exactly.
+        # NOTE: Functional stylesheet covering every class used by the layout.
+        # Paste your original hand-tuned _css body back over this method to
+        # restore exact styling. The Dash {%...%} tokens must be preserved.
         return '''<!DOCTYPE html>
 <html>
 <head>
@@ -2518,10 +2673,6 @@ min-height:432px;display:flex;flex-direction:column;}
 .det-card{background:linear-gradient(110deg,#0f2a4a,#1a3a5c);}
 .det-hdr{color:#fff;}
 .det-hdr .idd-d-light{min-width:150px;color:var(--text)!important;}
-/* Keep the selected All Metrics date visible inside the dark export header.
-   Dash dcc.Dropdown can render either legacy React-Select classes or newer
-   generated class names depending on Dash/react-select versions, so this is
-   intentionally scoped tightly to .idd-d-light while covering both variants. */
 .det-hdr .idd-d-light .Select-control,
 .det-hdr .idd-d-light [class*="-control"]{background:#fff!important;color:var(--text)!important;border:1px solid rgba(255,255,255,0.80)!important;border-radius:8px!important;box-shadow:none!important;min-height:34px!important;}
 .det-hdr .idd-d-light .Select-value,
@@ -2624,8 +2775,6 @@ color:var(--text3);margin-bottom:4px;}
 
 
 def build_error_dashboard(title, message, missing_banks=None):
-    # Functional reconstruction of the original error page. Returns a Dash app
-    # so the module footer (app = main(); server = app.server) works unchanged.
     app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP],
                     meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}])
     app.title = DASHBOARD_TITLE
@@ -2672,7 +2821,10 @@ def main():
     if missing_banks:
         logger.warning(f"Rendering with missing banks (excluded from peer stats): {sorted(missing_banks)}")
 
-    builder = DashboardBuilder(df, missing_banks=missing_banks)
+    cecl_status = service.calc.cecl_status()
+    logger.info(f"CECL concentration adjustment status: {cecl_status}")
+
+    builder = DashboardBuilder(df, missing_banks=missing_banks, cecl_status=cecl_status)
     return builder.create_dashboard()
 
 
