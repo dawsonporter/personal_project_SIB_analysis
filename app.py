@@ -80,7 +80,7 @@ CS = {
     'spark': '#005EB8', 'spark_area': 'rgba(0,94,184,0.08)',
 }
 
-CACHE_SCHEMA_VERSION = "v9_sib_jpm_20030331_no_comerica"
+CACHE_SCHEMA_VERSION = "v10_sib_jpm_20030331_no_comerica_intexpy"
 
 BANK_INFO = [
     {"cert": "628",   "display": "JPMorgan Chase"},
@@ -171,7 +171,8 @@ METRIC_ORDER = [
     'Net Operating Income to Assets', 'Interest Income to Average Assets',
     'Interest Expense to Average Assets', 'Pre-Provision Net Revenue to Average Assets',
     'Provision for Credit Losses to Average Assets',
-    'Yield on Earning Assets', 'Net Interest Margin', 'Cost of Funding Earning Assets',
+    'Yield on Earning Assets', 'Net Interest Margin',
+    'Cost of Funding Earning Assets (YTD)', 'Cost of Funding Earning Assets (Quarterly)',
     'Earning Assets / Total Assets', 'Efficiency Ratio',
     'Noninterest Expense to Average Assets', 'Salaries and Benefits to Average Assets',
     'Noninterest Income to Average Assets',
@@ -213,14 +214,14 @@ METRIC_ORDER = [
 
 METRIC_CATEGORIES = [
     ("Earnings & Profitability", METRIC_ORDER[0:10]),
-    ("Efficiency & Margin", METRIC_ORDER[10:18]),
-    ("Capitalization", METRIC_ORDER[18:22]),
-    ("Asset Quality", METRIC_ORDER[22:32]),
-    ("Loan & Lease", METRIC_ORDER[32:37]),
-    ("Funding & Liquidity", METRIC_ORDER[37:42]),
-    ("Credit Concentration", METRIC_ORDER[42:64]),
-    ("Growth", METRIC_ORDER[64:66]),
-    ("Key Financials", METRIC_ORDER[66:84]),
+    ("Efficiency & Margin", METRIC_ORDER[10:19]),
+    ("Capitalization", METRIC_ORDER[19:23]),
+    ("Asset Quality", METRIC_ORDER[23:33]),
+    ("Loan & Lease", METRIC_ORDER[33:38]),
+    ("Funding & Liquidity", METRIC_ORDER[38:43]),
+    ("Credit Concentration", METRIC_ORDER[43:65]),
+    ("Growth", METRIC_ORDER[65:67]),
+    ("Key Financials", METRIC_ORDER[67:85]),
 ]
 
 METRIC_TO_CATEGORY = {}
@@ -257,7 +258,8 @@ CATEGORY_SHORT_LABELS = {
 
 INVERSE_METRICS = {
     'Efficiency Ratio', 'Interest Expense to Average Assets',
-    'Cost of Funding Earning Assets', 'Noninterest Expense to Average Assets',
+    'Cost of Funding Earning Assets (YTD)', 'Cost of Funding Earning Assets (Quarterly)',
+    'Noninterest Expense to Average Assets',
     'Salaries and Benefits to Average Assets',
     'Provision for Credit Losses to Average Assets',
     'Net Charge-Offs / Total Loans & Leases',
@@ -306,7 +308,8 @@ METRIC_DEFINITIONS = {
     'Provision for Credit Losses to Average Assets': "Earnings \xb7 Provision for credit losses as % of avg assets. FDIC field: ELNATRR. UBPR Pg1 #7 (UBPRE006).",
     'Yield on Earning Assets': "Margin \xb7 Interest income (TE, annualized) as % of avg earning assets. FDIC field: INTINCY. UBPR Pg1 #19 (UBPRE016).",
     'Net Interest Margin': "Margin \xb7 Net interest income (TE) as % of avg earning assets. Typical: 2.50\u20133.80%. FDIC field: NIMY. UBPR Pg1 #21 (UBPRE018).",
-    'Cost of Funding Earning Assets': "Margin \xb7 Interest expense as % of avg earning assets. FDIC field: INTEXPYQ. UBPR Pg1 #20 (UBPRE017).",
+    'Cost of Funding Earning Assets (YTD)': "Margin \xb7 YTD/annualized interest expense as % of avg earning assets. FDIC field: INTEXPY. Source formula: EINTEXPA / ERNAST5. This is the YTD cost-of-funding companion to INTEXPYQ.",
+    'Cost of Funding Earning Assets (Quarterly)': "Margin \xb7 Current-quarter interest expense as % of avg earning assets. FDIC field: INTEXPYQ. UBPR Pg1 #20 (UBPRE017).",
     'Earning Assets / Total Assets': "Margin \xb7 Earning assets as % of total assets. FDIC field: ERNASTR. UBPR Pg1 #17 (UBPRE014).",
     'Efficiency Ratio': "Margin \xb7 NIE / (NII + noninterest income). Lower ratio indicates greater efficiency. FDIC field: EEFFR. UBPR Pg3 (UBPRE095).",
     'Noninterest Expense to Average Assets': "Margin \xb7 Total noninterest expense as % of avg assets. FDIC field: NONIXR. UBPR Pg1 #5 (UBPRE005).",
@@ -732,7 +735,7 @@ class BankDataRepository:
         "LNATRES,NALNLS,OREOTH,P3LNLS,P9LNLS,RBCT1J,CT1BADJ,EQ,EQPP,DRLNLS,DRLNLSQ,"
         "CRLNLS,CRLNLSQ,NTLNLSQ,NETINC,NETINCQ,ERNASTR,NIMY,NTLNLSR,LNATRESR,ROA,ROAQ,"
         "ROE,ROEQ,RBC1AAJ,RBCRWAJ,LNLSDEPR,LNLSNTV,"
-        "EEFFR,ELNANTR,IDERNCVR,IDT1CER,IDT1RWAJR,INTEXPYQ,NONIIR,COREDEP,ROAPTX,"
+        "EEFFR,ELNANTR,IDERNCVR,IDT1CER,IDT1RWAJR,INTEXPY,INTEXPYQ,NONIIR,COREDEP,ROAPTX,"
         "NONIXR,DEPNIDOM,LNRESNCR,VOLIABR,NOIJY,ESALR,INTINCR,EINTEXPR,ELNATRR,INTINCY")
 
     # Gentle pacing between per-bank financial calls to avoid tripping the FDIC
@@ -1006,7 +1009,8 @@ class BankMetricsCalculator:
             'Net Interest Margin': s(fin.get('NIMY')),
             'Common Equity Tier 1 (CET1) Ratio': s(fin.get('IDT1CER')),
             'Tier 1 Risk-Based Capital Ratio': s(fin.get('IDT1RWAJR')),
-            'Cost of Funding Earning Assets': s(fin.get('INTEXPYQ')),
+            'Cost of Funding Earning Assets (YTD)': s(fin.get('INTEXPY')),
+            'Cost of Funding Earning Assets (Quarterly)': s(fin.get('INTEXPYQ')),
             'Noninterest Income to Average Assets': s(fin.get('NONIIR')),
             'Pretax Return on Assets': s(fin.get('ROAPTX')),
             'Noninterest Expense to Average Assets': s(fin.get('NONIXR')),
@@ -1403,7 +1407,7 @@ class DashboardBuilder:
         )
         self._def_metric = 'Return on Assets' if 'Return on Assets' in self.metrics else self.metrics[0]
         self._def_r3_primary = 'Net Interest Margin' if 'Net Interest Margin' in self.metrics else self.metrics[0]
-        self._def_r3_secondary = 'Cost of Funding Earning Assets' if 'Cost of Funding Earning Assets' in self.metrics else (self.metrics[1] if len(self.metrics) > 1 else self.metrics[0])
+        self._def_r3_secondary = 'Cost of Funding Earning Assets (YTD)' if 'Cost of Funding Earning Assets (YTD)' in self.metrics else (self.metrics[1] if len(self.metrics) > 1 else self.metrics[0])
         if not self._ghb_df.empty:
             self._ghb_date_index = {pd.Timestamp(d): i for i, d in enumerate(self._ghb_df['Date'])}
         else:
