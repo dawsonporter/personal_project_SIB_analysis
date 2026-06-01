@@ -90,44 +90,48 @@ PRIOR_PERIOD_TOLERANCE_DAYS = 45
 #   and whichever year the bank is in -- nothing about the schedule is modeled
 #   here. Pre-adoption and 2025+, the difference is ~0 and this is a no-op.
 #
-# SOURCING (read this before assuming it "didn't work")
-#   The FDIC BankFind *financials* endpoint serves the curated SDI variable set,
-#   NOT raw Call Report MDRM. The two retained-earnings figures may or may not be
-#   exposed under a stable SDI name. This module reads them from a configurable
-#   list of candidate field names (best-effort, fetched in an ISOLATED request
-#   that cannot break the main dashboard). Behavior:
-#     * If a candidate resolves -> exact, UBPR-aligned concentration ratios.
-#     * If none resolve         -> SAFE NO-OP: raw Tier 1 + ACL is used (current
-#                                  behavior) and the data-scope banner says so.
-#   Confirm the names with one probe against the live API, e.g.:
-#       GET /api/financials?filters=CERT:628&fields=REPDTE,<candidate>&limit=1
-#   Canonical raw sources if you'd rather pull from FFIEC CDR/UBPR directly:
-#       RC item 26.a retained earnings       -> MDRM 3247
-#       RC-R Part I line 2 retained earnings -> regulatory retained earnings
-#       RC-O Memorandum item 5 (2021Q2+)     -> L&L-attributable add-back (MW53)
-#   VALIDATION: you have the UBPR Page 7B file for cert 628. With the fields
-#   wired, the dashboard's 03/2020 and 03/2023 concentration values should match
-#   UBPR to ~0.01; 2025+ already matches.
+# SOURCING (field names confirmed against risview_properties.yaml, the FDIC
+# financials field dictionary)
+#   The FDIC financials endpoint exposes NO CECL/transition field, but it DOES
+#   expose the two retained-earnings stocks the OCC formula needs:
+#       RBCEQUP = "RETAINED EARNINGS - RBC"  -> RC-R Part I line 2 (regulatory;
+#                  includes the applicable % of the CECL transitional amount).
+#       EQUPGR  = "UNDIVIDED PROFITS"        -> Schedule RC item 26.a (book RE).
+#   add-back T = RBCEQUP - EQUPGR  (>=0 in transition, ~0 otherwise). Both are in
+#   $000s, consistent with RBCT1J (Tier 1) and LNATRES (ACL). They are pulled in
+#   the MAIN financials projection (see BankDataRepository.FF) -- no extra calls.
+#   Behavior:
+#     * Fields present for a row -> exact, UBPR-aligned concentration ratios.
+#     * Fields null/absent       -> SAFE NO-OP for that row: raw Tier 1 + ACL
+#                                   (current behavior); banner reports coverage.
+#   NOTE: risview descriptions are blank, so RBCEQUP/EQUPGR are mapped from their
+#   titles. The acceptance test settles it: you have the UBPR Page 7B file for
+#   cert 628 -- with these live, the dashboard's 03/2020 and 03/2023 NDFI values
+#   should hit 88.21 and 93.66 (every 7B line in proportion); 2025+ already
+#   matches. If they don't, the semantics differ -- re-check before trusting it.
+#   (Raw FFIEC CDR fallbacks if ever needed: RC 26.a = MDRM 3247; RC-O Memo 5,
+#   2021Q2+, = the L&L-attributable add-back MW53.)
 # =============================================================================
 APPLY_CECL_TRANSITION_ADJUSTMENT = True
 CECL_TRANSITION_START = '20200101'   # first CECL adoption period (inclusive)
 CECL_TRANSITION_END = '20241231'     # last period with a nonzero add-back (inclusive)
 
-# Preferred: a single field that already equals the L&L-attributable add-back
-# (RC-O Memo 5 style). Leave empty unless you confirm an SDI name for it.
+# No single direct add-back field exists in the FDIC financials API, so the
+# add-back is derived from the two retained-earnings stocks below.
 CECL_DIRECT_ADDBACK_FIELDS: Tuple[str, ...] = ()
 
-# Fallback: regulatory (RC-R Pt I ln 2) minus book (RC 26.a) retained earnings.
-# NOTE: these are best-guess SDI candidate names -- VERIFY against the live API.
-# Wrong/absent names simply no-op (raw Tier 1 + ACL is used). Put the confirmed
-# name(s) at the FRONT of each tuple; the first that resolves on a row is used.
-CECL_REG_RE_FIELDS: Tuple[str, ...] = ("RBCT1RE", "EQCRETREG", "RETEARNREG")
-CECL_BOOK_RE_FIELDS: Tuple[str, ...] = ("EQRETERN", "RETEARN", "EQRE")
+# CONFIRMED field names (risview_properties.yaml):
+#   RBCEQUP -> RC-R Part I line 2 regulatory retained earnings (transition-incl.)
+#   EQUPGR  -> Schedule RC item 26.a book retained earnings (undivided profits)
+# First field that resolves on a row is used; absent -> safe no-op for that row.
+CECL_REG_RE_FIELDS: Tuple[str, ...] = ("RBCEQUP",)
+CECL_BOOK_RE_FIELDS: Tuple[str, ...] = ("EQUPGR",)
 
-# Union of every candidate, used to build the isolated best-effort aux request.
-CECL_AUX_FIELDNAMES: Tuple[str, ...] = tuple(dict.fromkeys(
-    CECL_DIRECT_ADDBACK_FIELDS + CECL_REG_RE_FIELDS + CECL_BOOK_RE_FIELDS))
-CECL_AUX_FF = ("CERT,REPDTE," + ",".join(CECL_AUX_FIELDNAMES)) if CECL_AUX_FIELDNAMES else ""
+# These two fields ride in the MAIN financials projection (BankDataRepository.FF),
+# so the separate aux request is unnecessary. The aux machinery is left in place
+# but inert (empty field list -> _enrich_cecl returns immediately).
+CECL_AUX_FIELDNAMES: Tuple[str, ...] = ()
+CECL_AUX_FF = ""
 
 CS = {
     'primary': '#005EB8', 'primary_light': '#2F7FD3', 'primary_dark': '#003B73',
@@ -152,7 +156,7 @@ CS = {
 # Bumped so caches written before the CECL enrichment are invalidated and
 # refetched (cached financial rows now also carry the retained-earnings fields
 # needed for the adjustment).
-CACHE_SCHEMA_VERSION = "v11_sib_jpm_20030331_cecl_conc_adj"
+CACHE_SCHEMA_VERSION = "v12_sib_jpm_cecl_conc_adj_rbcequp_equpgr"
 
 BANK_INFO = [
     {"cert": "628",   "display": "JPMorgan Chase"},
@@ -789,7 +793,8 @@ class BankDataRepository:
         "CRLNLS,CRLNLSQ,NTLNLSQ,NETINC,NETINCQ,ERNASTR,NIMY,NTLNLSR,LNATRESR,ROA,ROAQ,"
         "ROE,ROEQ,RBC1AAJ,RBCRWAJ,LNLSDEPR,LNLSNTV,"
         "EEFFR,ELNANTR,IDERNCVR,IDT1CER,IDT1RWAJR,INTEXPY,INTEXPYQ,NONIIR,COREDEP,ROAPTX,"
-        "NONIXR,DEPNIDOM,LNRESNCR,VOLIABR,NOIJY,ESALR,INTINCR,EINTEXPR,ELNATRR,INTINCY")
+        "NONIXR,DEPNIDOM,LNRESNCR,VOLIABR,NOIJY,ESALR,INTINCR,EINTEXPR,ELNATRR,INTINCY,"
+        "RBCEQUP,EQUPGR")  # RBCEQUP/EQUPGR: CECL concentration add-back (RC-R ln2 - RC 26.a)
 
     INTER_BANK_DELAY = 0.4
     MIN_PEERS_REQUIRED = 5
