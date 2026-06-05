@@ -3041,7 +3041,7 @@ color:var(--text3);margin-bottom:4px;}
 .pair-card-chart,.pair-card-side{min-height:432px;}
 .viz-graph{width:100%;}
 .insight-shell,.analysis-shell,.overview-shell{display:flex;flex-direction:column;gap:14px;
-overflow-y:auto;max-height:340px;padding-right:2px;}
+height:auto;min-height:0;overflow:visible;}
 .det-cat-label{font-weight:700;font-size:12.5px;}
 .df-txt{color:var(--text3);}
 .dspark{display:flex;align-items:center;}
