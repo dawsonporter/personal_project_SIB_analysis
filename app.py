@@ -153,10 +153,11 @@ CS = {
     'spark': '#005EB8', 'spark_area': 'rgba(0,94,184,0.08)',
 }
 
-# Bumped so caches written before the CECL enrichment are invalidated and
-# refetched (cached financial rows now also carry the retained-earnings fields
-# needed for the adjustment).
-CACHE_SCHEMA_VERSION = "v12_sib_jpm_cecl_conc_adj_rbcequp_equpgr"
+# Bumped so caches written before the segment-level asset-quality fields existed
+# are invalidated and refetched (the financials projection now also carries the
+# RC-N nonaccrual / 90+ / 30-89 detail, segment net charge-offs, and the CAVG5
+# average-balance denominators). Also retains the CECL retained-earnings fields.
+CACHE_SCHEMA_VERSION = "v13_sib_jpm_segment_assetquality_nco_na_p9_p3_cecl"
 
 BANK_INFO = [
     {"cert": "628",   "display": "JPMorgan Chase"},
@@ -231,6 +232,97 @@ EXECUTIVE_KPIS = [
     ('Net Loan Growth Rate', 'Growth'),
 ]
 
+# =============================================================================
+# SEGMENT-LEVEL ASSET QUALITY
+# (Net Charge-Offs / Nonaccrual / 90+ DPD / 30-89 DPD, broken out by loan type)
+# -----------------------------------------------------------------------------
+# SINGLE SOURCE OF TRUTH. Each tuple supplies the FDIC fields needed to build,
+# for one loan segment, the full asset-quality picture that the Piermont
+# stability builder produces per tab -- but here for all 19 SIB peers at once:
+#
+#   * STOCK rates (point-in-time): Nonaccrual, 90+ DPD still accruing, and
+#     30-89 DPD, each as a % of that segment's END-OF-PERIOD loan balance.
+#     Sources are RC-N column C (nonaccrual), column B (90+), column A (30-89).
+#
+#   * FLOW rate: YTD net charge-offs, ANNUALIZED, over the segment's 5-quarter
+#     average balance (CAVG5) -- i.e. UBPR "PCTOFANN":
+#         rate = NCO_ytd * (4 / quarter) / CAVG5 * 100
+#     Emitted ONLY where a CAVG5 average-balance field exists (cavg5 is None
+#     otherwise; we never substitute an EOP denominator for a flow measure, so
+#     no segment NCO rate is shown for segments lacking CAVG5 -- their $ values
+#     are still shown). This mirrors the published total NTLNLSR exactly.
+#
+#   * Dollar balances ($000s) for each of the four problem buckets.
+#
+# Generating the metric names, categories, dollar/inverse membership, metric
+# definitions, the FDIC field projection (FF), AND the calculator from this one
+# table guarantees none of them can ever drift apart.
+#
+# Every field below is confirmed present in risview_properties.yaml (the FDIC
+# financials field dictionary). Note: several segment splits have limited
+# history -- the owner-occ / non-owner-occ NFNR split begins 2007Q1, and the
+# auto loan breakout begins 2011Q1; before those dates the source fields are
+# null and the affected metrics correctly read N/A (never fabricated).
+#
+#   (label, loan_balance, nonaccrual, p90, p30, nco_ytd, cavg5_or_None)
+# =============================================================================
+ASSET_QUALITY_SEGMENTS = [
+    ("Real Estate",            "LNRE",     "NARE",     "P9RE",     "P3RE",     "NTRE",     "LNRE5"),
+    ("RE 1-4 Family",          "LNRERES",  "NARERES",  "P9RERES",  "P3RERES",  "NTRERES",  "LNRERES5"),
+    ("RE Multifamily",         "LNREMULT", "NAREMULT", "P9REMULT", "P3REMULT", "NTREMULT", None),
+    ("RE Construction",        "LNRECONS", "NARECONS", "P9RECONS", "P3RECONS", "NTRECONS", None),
+    ("RE Farmland",            "LNREAG",   "NAREAG",   "P9REAG",   "P3REAG",   "NTREAG",   None),
+    ("RE Commercial (NFNR)",   "LNRENRES", "NARENRES", "P9RENRES", "P3RENRES", "NTRENRES", None),
+    ("RE NFNR Owner-Occ",      "LNRENROW", "NARENROW", "P9RENROW", "P3RENROW", "NTRENROW", None),
+    ("RE NFNR Non-Owner-Occ",  "LNRENROT", "NARENROT", "P9RENROT", "P3RENROT", "NTRENROT", None),
+    ("C&I",                    "LNCI",     "NACI",     "P9CI",     "P3CI",     "NTCI",     "LNCI5"),
+    ("Credit Cards",           "LNCRCD",   "NACRCD",   "P9CRCD",   "P3CRCD",   "NTCRCD",   "LNCRCD5"),
+    ("Auto",                   "LNAUTO",   "NAAUTO",   "P9AUTO",   "P3AUTO",   "NTAUTO",   "LNAUTO5"),
+    ("Consumer (Total)",       "LNCON",    "NACON",    "P9CON",    "P3CON",    "NTCON",    "LNCON5"),
+    ("Agriculture",            "LNAG",     "NAAG",     "P9AG",     "P3AG",     "NTAG",     "LNAG5"),
+    ("Leases",                 "LS",       "NALS",     "P9LS",     "P3LS",     "NTLS",     None),
+    ("Other Loans",            "LNOTHER",  "NAOTHLN",  "P9OTHLN",  "P3OTHLN",  "NTOTHER",  None),
+]
+
+SEG_LABELS = [s[0] for s in ASSET_QUALITY_SEGMENTS]
+# Only segments with a real CAVG5 average-balance field get a flow NCO rate.
+SEG_NCO_RATE_LABELS = [s[0] for s in ASSET_QUALITY_SEGMENTS if s[6] is not None]
+
+
+# --- Metric-name builders: the ONLY place these strings are defined. ---------
+def _nm_na_rate(seg):  return f"Nonaccrual / {seg}"
+def _nm_p9_rate(seg):  return f"90+ DPD / {seg}"
+def _nm_p3_rate(seg):  return f"30-89 DPD / {seg}"
+def _nm_nco_rate(seg): return f"Net Charge-Offs / {seg}"
+def _nm_na_usd(seg):   return f"Nonaccrual ($) \u2014 {seg}"
+def _nm_p9_usd(seg):   return f"90+ DPD ($) \u2014 {seg}"
+def _nm_p3_usd(seg):   return f"30-89 DPD ($) \u2014 {seg}"
+def _nm_nco_usd(seg):  return f"Net Charge-Offs YTD ($) \u2014 {seg}"
+
+
+GROSS_RECOVERY_RATE_METRIC = "Gross Recovery Rate (YTD)"
+
+NCO_SEG_RATE_METRICS = [_nm_nco_rate(s) for s in SEG_NCO_RATE_LABELS]
+NCO_SEG_USD_METRICS = [_nm_nco_usd(s) for s in SEG_LABELS]
+NCO_SEG_METRICS = NCO_SEG_RATE_METRICS + [GROSS_RECOVERY_RATE_METRIC] + NCO_SEG_USD_METRICS
+
+NA_SEG_RATE_METRICS = [_nm_na_rate(s) for s in SEG_LABELS]
+NA_SEG_USD_METRICS = [_nm_na_usd(s) for s in SEG_LABELS]
+NA_SEG_METRICS = NA_SEG_RATE_METRICS + NA_SEG_USD_METRICS
+
+P9_SEG_RATE_METRICS = [_nm_p9_rate(s) for s in SEG_LABELS]
+P9_SEG_USD_METRICS = [_nm_p9_usd(s) for s in SEG_LABELS]
+P9_SEG_METRICS = P9_SEG_RATE_METRICS + P9_SEG_USD_METRICS
+
+P3_SEG_RATE_METRICS = [_nm_p3_rate(s) for s in SEG_LABELS]
+P3_SEG_USD_METRICS = [_nm_p3_usd(s) for s in SEG_LABELS]
+P3_SEG_METRICS = P3_SEG_RATE_METRICS + P3_SEG_USD_METRICS
+
+ALL_SEG_RATE_METRICS = (NCO_SEG_RATE_METRICS + NA_SEG_RATE_METRICS
+                        + P9_SEG_RATE_METRICS + P3_SEG_RATE_METRICS)
+ALL_SEG_USD_METRICS = (NCO_SEG_USD_METRICS + NA_SEG_USD_METRICS
+                       + P9_SEG_USD_METRICS + P3_SEG_USD_METRICS)
+
 DOLLAR_METRICS = {
     'Total Assets', 'Total Deposits', 'Gross Loans & Leases', 'Net Loans & Leases',
     'Total Securities', 'Total Earning Assets', 'Total Equity Capital', 'Tier 1 Capital',
@@ -239,66 +331,86 @@ DOLLAR_METRICS = {
     'Gross Charge-Offs (YTD)', 'Gross Charge-Offs (Quarter)',
     'Gross Recoveries (YTD)', 'Gross Recoveries (Quarter)',
     'Brokered Deposits',
-}
+} | set(ALL_SEG_USD_METRICS)
 
-METRIC_ORDER = [
-    'Return on Assets', 'Quarterly Return on Assets', 'Pretax Return on Assets',
-    'Return on Equity', 'Quarterly Return on Equity',
-    'Net Operating Income to Assets', 'Interest Income to Average Assets',
-    'Interest Expense to Average Assets', 'Pre-Provision Net Revenue to Average Assets',
-    'Provision for Credit Losses to Average Assets',
-    'Yield on Earning Assets', 'Net Interest Margin',
-    'Cost of Funding Earning Assets (YTD)', 'Cost of Funding Earning Assets (Quarterly)',
-    'Earning Assets / Total Assets', 'Efficiency Ratio',
-    'Noninterest Expense to Average Assets', 'Salaries and Benefits to Average Assets',
-    'Noninterest Income to Average Assets',
-    'Common Equity Tier 1 (CET1) Ratio', 'Tier 1 Risk-Based Capital Ratio',
-    'Leverage (Core Capital) Ratio', 'Total Risk-Based Capital Ratio',
-    'Net Charge-Offs / Total Loans & Leases', 'ACL / Total Loans & Leases',
-    'ACL / Nonaccrual Loans', 'ACL / 90+ DPD & Nonaccrual',
-    'Loan Loss Reserve / Noncurrent Loans', 'Nonaccrual & OREO / Total Loans & OREO',
-    '30-89 DPD / Total Loans', '90+ DPD / Total Loans',
-    'Nonaccrual / Total Loans', '90+ DPD & Nonaccrual / Total Loans',
-    'Net Loan Growth Rate', 'Earnings Coverage of Net Loan Charge-Offs',
-    'Loan and Lease Loss Provision to Net Charge-Offs', 'Net Charge-Offs / ACL',
-    'Net Loans and Leases to Assets',
-    'Net Loans and Leases to Deposits', 'Core Deposits to Total Deposits',
-    'Noninterest-Bearing Deposits to Total Deposits', 'Brokered Deposits to Total Deposits',
-    'Volatile Liabilities to Total Assets',
-    'Real Estate Loans to Tier 1 + ACL',
-    'RE Construction and Land Development to Tier 1 + ACL',
-    '1-4 Family Construction to Tier 1 + ACL',
-    'Other Construction & Land Dev to Tier 1 + ACL',
-    'Secured by Farmland to Tier 1 + ACL', '1-4 Family Residential to Tier 1 + ACL',
-    'Revolving Home Equity to Tier 1 + ACL', 'Closed-End 1st Lien to Tier 1 + ACL',
-    'Closed-End Jr Lien to Tier 1 + ACL', 'Multifamily RE to Tier 1 + ACL',
-    'Non-Farm Non-Residential RE to Tier 1 + ACL', 'NFNR: Owner Occupied to Tier 1 + ACL',
-    'NFNR: Non-Owner Occupied to Tier 1 + ACL', 'Commercial RE to Tier 1 + ACL',
-    'Non-Owner Occupied CRE to Tier 1 + ACL',
-    'Non-Owner Occupied CRE 3-Year Growth Rate', 'C&I Loans to Tier 1 + ACL',
-    'Loans to Individuals to Tier 1 + ACL', 'Credit Cards to Tier 1 + ACL',
-    'Auto Loans to Tier 1 + ACL', 'Agriculture Loans to Tier 1 + ACL',
-    'Loans to NDFIs and Other to Tier 1 + ACL',
-    'Total Asset Growth Rate', 'Tier 1 Capital Growth Rate',
-    'Total Assets', 'Total Deposits', 'Gross Loans & Leases', 'Net Loans & Leases',
-    'Total Securities', 'Total Earning Assets', 'Total Equity Capital', 'Tier 1 Capital',
-    'Risk-Weighted Assets', 'Net Income (YTD)', 'Net Income (Quarter)',
-    'Allowance for Credit Losses', 'Gross Charge-Offs (YTD)',
-    'Gross Charge-Offs (Quarter)', 'Gross Recoveries (YTD)',
-    'Gross Recoveries (Quarter)', 'Noncurrent Loans', 'Brokered Deposits',
-]
-
+# -----------------------------------------------------------------------------
+# Categories now hold EXPLICIT metric lists (previously index slices of
+# METRIC_ORDER, which silently mis-aligned whenever a metric was added). The
+# canonical METRIC_ORDER is now DERIVED by flattening the categories, so the two
+# can never disagree.
+# -----------------------------------------------------------------------------
 METRIC_CATEGORIES = [
-    ("Earnings & Profitability", METRIC_ORDER[0:10]),
-    ("Efficiency & Margin", METRIC_ORDER[10:19]),
-    ("Capitalization", METRIC_ORDER[19:23]),
-    ("Asset Quality", METRIC_ORDER[23:33]),
-    ("Loan & Lease", METRIC_ORDER[33:38]),
-    ("Funding & Liquidity", METRIC_ORDER[38:43]),
-    ("Credit Concentration", METRIC_ORDER[43:65]),
-    ("Growth", METRIC_ORDER[65:67]),
-    ("Key Financials", METRIC_ORDER[67:85]),
+    ("Earnings & Profitability", [
+        'Return on Assets', 'Quarterly Return on Assets', 'Pretax Return on Assets',
+        'Return on Equity', 'Quarterly Return on Equity',
+        'Net Operating Income to Assets', 'Interest Income to Average Assets',
+        'Interest Expense to Average Assets', 'Pre-Provision Net Revenue to Average Assets',
+        'Provision for Credit Losses to Average Assets',
+    ]),
+    ("Efficiency & Margin", [
+        'Yield on Earning Assets', 'Net Interest Margin',
+        'Cost of Funding Earning Assets (YTD)', 'Cost of Funding Earning Assets (Quarterly)',
+        'Earning Assets / Total Assets', 'Efficiency Ratio',
+        'Noninterest Expense to Average Assets', 'Salaries and Benefits to Average Assets',
+        'Noninterest Income to Average Assets',
+    ]),
+    ("Capitalization", [
+        'Common Equity Tier 1 (CET1) Ratio', 'Tier 1 Risk-Based Capital Ratio',
+        'Leverage (Core Capital) Ratio', 'Total Risk-Based Capital Ratio',
+    ]),
+    ("Asset Quality", [
+        'Net Charge-Offs / Total Loans & Leases', 'ACL / Total Loans & Leases',
+        'ACL / Nonaccrual Loans', 'ACL / 90+ DPD & Nonaccrual',
+        'Loan Loss Reserve / Noncurrent Loans', 'Nonaccrual & OREO / Total Loans & OREO',
+        '30-89 DPD / Total Loans', '90+ DPD / Total Loans',
+        'Nonaccrual / Total Loans', '90+ DPD & Nonaccrual / Total Loans',
+    ]),
+    ("Loan & Lease", [
+        'Net Loan Growth Rate', 'Earnings Coverage of Net Loan Charge-Offs',
+        'Loan and Lease Loss Provision to Net Charge-Offs', 'Net Charge-Offs / ACL',
+        'Net Loans and Leases to Assets',
+    ]),
+    ("Funding & Liquidity", [
+        'Net Loans and Leases to Deposits', 'Core Deposits to Total Deposits',
+        'Noninterest-Bearing Deposits to Total Deposits', 'Brokered Deposits to Total Deposits',
+        'Volatile Liabilities to Total Assets',
+    ]),
+    ("Credit Concentration", [
+        'Real Estate Loans to Tier 1 + ACL',
+        'RE Construction and Land Development to Tier 1 + ACL',
+        '1-4 Family Construction to Tier 1 + ACL',
+        'Other Construction & Land Dev to Tier 1 + ACL',
+        'Secured by Farmland to Tier 1 + ACL', '1-4 Family Residential to Tier 1 + ACL',
+        'Revolving Home Equity to Tier 1 + ACL', 'Closed-End 1st Lien to Tier 1 + ACL',
+        'Closed-End Jr Lien to Tier 1 + ACL', 'Multifamily RE to Tier 1 + ACL',
+        'Non-Farm Non-Residential RE to Tier 1 + ACL', 'NFNR: Owner Occupied to Tier 1 + ACL',
+        'NFNR: Non-Owner Occupied to Tier 1 + ACL', 'Commercial RE to Tier 1 + ACL',
+        'Non-Owner Occupied CRE to Tier 1 + ACL',
+        'Non-Owner Occupied CRE 3-Year Growth Rate', 'C&I Loans to Tier 1 + ACL',
+        'Loans to Individuals to Tier 1 + ACL', 'Credit Cards to Tier 1 + ACL',
+        'Auto Loans to Tier 1 + ACL', 'Agriculture Loans to Tier 1 + ACL',
+        'Loans to NDFIs and Other to Tier 1 + ACL',
+    ]),
+    ("Growth", [
+        'Total Asset Growth Rate', 'Tier 1 Capital Growth Rate',
+    ]),
+    # ---- NEW: segment-level asset-quality detail (generated above) ----------
+    ("Net Charge-Offs by Segment", NCO_SEG_METRICS),
+    ("Nonaccrual by Segment", NA_SEG_METRICS),
+    ("90+ Day Past Due by Segment", P9_SEG_METRICS),
+    ("30-89 Day Past Due by Segment", P3_SEG_METRICS),
+    ("Key Financials", [
+        'Total Assets', 'Total Deposits', 'Gross Loans & Leases', 'Net Loans & Leases',
+        'Total Securities', 'Total Earning Assets', 'Total Equity Capital', 'Tier 1 Capital',
+        'Risk-Weighted Assets', 'Net Income (YTD)', 'Net Income (Quarter)',
+        'Allowance for Credit Losses', 'Gross Charge-Offs (YTD)',
+        'Gross Charge-Offs (Quarter)', 'Gross Recoveries (YTD)',
+        'Gross Recoveries (Quarter)', 'Noncurrent Loans', 'Brokered Deposits',
+    ]),
 ]
+
+# Canonical ordering derived from the categories (flatten, order preserved).
+METRIC_ORDER = [m for _cat, _ms in METRIC_CATEGORIES for m in _ms]
 
 METRIC_TO_CATEGORY = {}
 for cat_name, cat_metrics in METRIC_CATEGORIES:
@@ -306,7 +418,9 @@ for cat_name, cat_metrics in METRIC_CATEGORIES:
         METRIC_TO_CATEGORY[m] = cat_name
 
 # Concentration metrics share the (CECL-adjusted) Tier 1 + ACL denominator.
-CONCENTRATION_METRICS = list(METRIC_CATEGORIES[6][1])
+# Referenced BY NAME so it is robust to category reordering.
+CONCENTRATION_METRICS = list(next(ms for name, ms in METRIC_CATEGORIES
+                                  if name == "Credit Concentration"))
 
 CATEGORY_ACCENTS = {
     "Key Financials": "#0f172a",
@@ -314,6 +428,12 @@ CATEGORY_ACCENTS = {
     "Capitalization": "#d97706", "Asset Quality": "#dc2626",
     "Loan & Lease": "#7c3aed", "Funding & Liquidity": "#0891b2",
     "Credit Concentration": "#64748b", "Growth": "#4f46e5",
+    # Segment asset-quality categories, shaded as a delinquency "heat" ramp:
+    # 30-89 (earliest) -> 90+ -> nonaccrual -> charge-off (loss realized).
+    "30-89 Day Past Due by Segment": "#d97706",
+    "90+ Day Past Due by Segment": "#ea580c",
+    "Nonaccrual by Segment": "#dc2626",
+    "Net Charge-Offs by Segment": "#991b1b",
 }
 CATEGORY_BG = {
     "Key Financials": "#f1f5f9",
@@ -321,6 +441,10 @@ CATEGORY_BG = {
     "Capitalization": "#fffbeb", "Asset Quality": "#fef2f2",
     "Loan & Lease": "#f5f3ff", "Funding & Liquidity": "#ecfeff",
     "Credit Concentration": "#f8fafc", "Growth": "#eef2ff",
+    "30-89 Day Past Due by Segment": "#fffbeb",
+    "90+ Day Past Due by Segment": "#fff7ed",
+    "Nonaccrual by Segment": "#fff1f2",
+    "Net Charge-Offs by Segment": "#fef2f2",
 }
 
 CATEGORY_SHORT_LABELS = {
@@ -333,6 +457,10 @@ CATEGORY_SHORT_LABELS = {
     "Credit Concentration": "Credit Concentration",
     "Growth": "Growth",
     "Key Financials": "Key Financials",
+    "Net Charge-Offs by Segment": "NCO by Segment",
+    "Nonaccrual by Segment": "Nonaccrual by Segment",
+    "90+ Day Past Due by Segment": "90+ DPD by Segment",
+    "30-89 Day Past Due by Segment": "30-89 DPD by Segment",
 }
 
 INVERSE_METRICS = {
@@ -348,7 +476,11 @@ INVERSE_METRICS = {
     'Net Charge-Offs / ACL',
     'Brokered Deposits to Total Deposits', 'Volatile Liabilities to Total Assets',
     'Gross Charge-Offs (YTD)', 'Gross Charge-Offs (Quarter)', 'Noncurrent Loans',
-}
+# Every segment delinquency/nonaccrual/charge-off rate AND dollar balance is a
+# "higher = worse" measure (consistent with how the total-level problem-loan
+# dollar metrics above are already treated). The recovery RATE is deliberately
+# excluded -- a higher recovery rate is favorable.
+} | set(ALL_SEG_RATE_METRICS) | set(ALL_SEG_USD_METRICS)
 
 NON_PERCENT_RATIO_METRICS = {
     'Earnings Coverage of Net Loan Charge-Offs',
@@ -443,6 +575,83 @@ METRIC_DEFINITIONS = {
     'Total Asset Growth Rate': "Growth \xb7 YoY growth of total assets. \u226530% YoY invites regulatory questions. UBPR Pg1 #37 (UBPR7316).",
     'Tier 1 Capital Growth Rate': "Growth \xb7 YoY growth of Tier 1 capital. UBPR Pg1 #38 (UBPR7408).",
 }
+
+
+def _build_segment_definitions():
+    """Generate METRIC_DEFINITIONS entries for every segment metric directly
+    from ASSET_QUALITY_SEGMENTS, so each one documents its exact FDIC source
+    field(s) and methodology -- and stays in lockstep with the calculator."""
+    d = {}
+    hist = ("Limited history for some splits: the NFNR owner-occ / non-owner-occ "
+            "breakout begins 2007Q1 and the auto-loan breakout begins 2011Q1; "
+            "before those dates the source field is null and the metric reads N/A.")
+    for (label, bal, na, p9, p3, nt, cavg5) in ASSET_QUALITY_SEGMENTS:
+        d[_nm_na_rate(label)] = (
+            f"Nonaccrual by Segment \xb7 Nonaccrual {label} loans as % of {label} loans (end-of-period). "
+            f"Computed: {na} / {bal} \u00d7 100. Point-in-time stock ratio (RC-N col C); higher = weaker. {hist}")
+        d[_nm_p9_rate(label)] = (
+            f"90+ Day Past Due by Segment \xb7 {label} loans 90+ days past due and still accruing, as % of "
+            f"{label} loans (EOP). Computed: {p9} / {bal} \u00d7 100. Point-in-time (RC-N col B). {hist}")
+        d[_nm_p3_rate(label)] = (
+            f"30-89 Day Past Due by Segment \xb7 {label} loans 30-89 days past due, as % of {label} loans "
+            f"(EOP). Computed: {p3} / {bal} \u00d7 100. Early-stage delinquency (RC-N col A); typically "
+            f"migrates to nonaccrual within 1-2 quarters. {hist}")
+        d[_nm_na_usd(label)] = (
+            f"Nonaccrual by Segment \xb7 Nonaccrual {label} loans. FDIC field: {na}. Values in $000s.")
+        d[_nm_p9_usd(label)] = (
+            f"90+ Day Past Due by Segment \xb7 {label} loans 90+ DPD and still accruing. FDIC field: {p9}. Values in $000s.")
+        d[_nm_p3_usd(label)] = (
+            f"30-89 Day Past Due by Segment \xb7 {label} loans 30-89 DPD. FDIC field: {p3}. Values in $000s.")
+        d[_nm_nco_usd(label)] = (
+            f"Net Charge-Offs by Segment \xb7 Year-to-date net charge-offs on {label} loans. FDIC field: {nt}. "
+            f"Values in $000s (YTD basis; resets each Q1).")
+        if cavg5 is not None:
+            d[_nm_nco_rate(label)] = (
+                f"Net Charge-Offs by Segment \xb7 YTD net charge-offs on {label} loans, ANNUALIZED, as % of "
+                f"average {label} loans. Computed: {nt} \u00d7 (4/quarter) / {cavg5} (CAVG5 5-quarter average) "
+                f"\u00d7 100. UBPR PCTOFANN methodology, consistent with the published total (NTLNLSR). Higher = worse.")
+    d[GROSS_RECOVERY_RATE_METRIC] = (
+        "Net Charge-Offs by Segment \xb7 YTD gross recoveries as % of YTD gross charge-offs. "
+        "Computed: CRLNLS / DRLNLS \u00d7 100. Higher = more charged-off principal recovered (favorable).")
+    return d
+
+
+METRIC_DEFINITIONS.update(_build_segment_definitions())
+
+# -----------------------------------------------------------------------------
+# FDIC financials field projection (FF).
+# Built at MODULE level: the original base projection PLUS every distinct field
+# the segment table needs (nonaccrual / 90+ / 30-89 / net charge-off detail and
+# the CAVG5 average-balance denominators), de-duplicated against the base. The
+# class attribute BankDataRepository.FF is set to FULL_FF below. Still ONE FDIC
+# call per bank -- the field list simply grows; no extra requests.
+# -----------------------------------------------------------------------------
+_BASE_FF = (
+    "CERT,REPDTE,ASSET,DEP,BRO,LNLSGR,LNLSNET,SC,ERNAST,RWAJ,"
+    "LNRE,LNRECONS,LNRECNFM,LNRECNOT,LNREAG,LNRERES,LNRELOC,LNRERSFM,LNRERSF2,"
+    "LNREMULT,LNRENRES,LNRENROW,LNRENROT,LNCOMRE,"
+    "LNCI,LNAG,LNCON,LNCRCD,LNAUTO,LNCONOTH,LNOTHER,"
+    "LNATRES,NALNLS,OREOTH,P3LNLS,P9LNLS,RBCT1J,CT1BADJ,EQ,EQPP,DRLNLS,DRLNLSQ,"
+    "CRLNLS,CRLNLSQ,NTLNLSQ,NETINC,NETINCQ,ERNASTR,NIMY,NTLNLSR,LNATRESR,ROA,ROAQ,"
+    "ROE,ROEQ,RBC1AAJ,RBCRWAJ,LNLSDEPR,LNLSNTV,"
+    "EEFFR,ELNANTR,IDERNCVR,IDT1CER,IDT1RWAJR,INTEXPY,INTEXPYQ,NONIIR,COREDEP,ROAPTX,"
+    "NONIXR,DEPNIDOM,LNRESNCR,VOLIABR,NOIJY,ESALR,INTINCR,EINTEXPR,ELNATRR,INTINCY,"
+    "RBCEQUP,EQUPGR"  # CECL concentration add-back (RC-R ln2 - RC 26.a)
+)
+
+# Every distinct field referenced by the segment table (loan-balance denominators,
+# nonaccrual/90+/30-89 detail, segment net charge-offs, CAVG5 averages), plus the
+# total-level recovery numerator used by Gross Recovery Rate.
+_AQ_SEG_FIELDS = set()
+for _seg in ASSET_QUALITY_SEGMENTS:
+    _AQ_SEG_FIELDS.update(f for f in (_seg[1], _seg[2], _seg[3], _seg[4], _seg[5]) if f)
+    if _seg[6]:
+        _AQ_SEG_FIELDS.add(_seg[6])
+_AQ_SEG_FIELDS.update({"DRLNLS", "CRLNLS"})
+
+_BASE_FF_SET = set(_BASE_FF.split(","))
+_SEG_FF_EXTRA = sorted(f for f in _AQ_SEG_FIELDS if f not in _BASE_FF_SET)
+FULL_FF = _BASE_FF + ("," + ",".join(_SEG_FF_EXTRA) if _SEG_FF_EXTRA else "")
 
 
 def normalize_bank_name(n):
@@ -785,16 +994,10 @@ class FDICAPIClient:
 
 
 class BankDataRepository:
-    FF = ("CERT,REPDTE,ASSET,DEP,BRO,LNLSGR,LNLSNET,SC,ERNAST,RWAJ,"
-        "LNRE,LNRECONS,LNRECNFM,LNRECNOT,LNREAG,LNRERES,LNRELOC,LNRERSFM,LNRERSF2,"
-        "LNREMULT,LNRENRES,LNRENROW,LNRENROT,LNCOMRE,"
-        "LNCI,LNAG,LNCON,LNCRCD,LNAUTO,LNCONOTH,LNOTHER,"
-        "LNATRES,NALNLS,OREOTH,P3LNLS,P9LNLS,RBCT1J,CT1BADJ,EQ,EQPP,DRLNLS,DRLNLSQ,"
-        "CRLNLS,CRLNLSQ,NTLNLSQ,NETINC,NETINCQ,ERNASTR,NIMY,NTLNLSR,LNATRESR,ROA,ROAQ,"
-        "ROE,ROEQ,RBC1AAJ,RBCRWAJ,LNLSDEPR,LNLSNTV,"
-        "EEFFR,ELNANTR,IDERNCVR,IDT1CER,IDT1RWAJR,INTEXPY,INTEXPYQ,NONIIR,COREDEP,ROAPTX,"
-        "NONIXR,DEPNIDOM,LNRESNCR,VOLIABR,NOIJY,ESALR,INTINCR,EINTEXPR,ELNATRR,INTINCY,"
-        "RBCEQUP,EQUPGR")  # RBCEQUP/EQUPGR: CECL concentration add-back (RC-R ln2 - RC 26.a)
+    # Single financials projection. FULL_FF = original base fields + the
+    # segment-level asset-quality fields + CAVG5 denominators (built at module
+    # level above, de-duplicated). Still one FDIC call per bank.
+    FF = FULL_FF
 
     INTER_BANK_DELAY = 0.4
     MIN_PEERS_REQUIRED = 5
@@ -1069,6 +1272,7 @@ class BankMetricsCalculator:
                 self._cc(row, cb)
                 self._cg(row, sf, i, fin)
                 self._aq(row, sf, i)
+                self._aq_segments(row, fin)   # NEW: segment-level NCO/NA/90+/30-89
                 self._gr(row, display_name, fin, pyd)
                 self._bk(row)
                 self._dp(row)
@@ -1315,6 +1519,51 @@ class BankMetricsCalculator:
                 r4 = sum(window_vals)
                 r['Net Charge-Offs / ACL'] = safe_div(r4, acl)
 
+    def _aq_segments(self, r, fin):
+        """Segment-level asset quality, generated entirely from
+        ASSET_QUALITY_SEGMENTS so names/definitions/categories cannot drift.
+
+        For each loan segment, emits:
+          * point-in-time STOCK rates -- Nonaccrual / 90+ DPD / 30-89 DPD as a %
+            of that segment's end-of-period loan balance (RC-N cols C / B / A);
+          * dollar balances for all four problem buckets ($000s);
+          * a FLOW NCO rate = YTD net charge-offs annualized over the segment's
+            CAVG5 average balance (UBPR PCTOFANN) -- ONLY where a CAVG5 field
+            exists for that segment (no EOP substitution for a flow measure).
+        Plus a total-level Gross Recovery Rate (recoveries / charge-offs)."""
+        s = self._sf
+        try:
+            q = pd.to_datetime(fin.get('REPDTE'), format='%Y%m%d').quarter
+        except (ValueError, TypeError):
+            q = 4
+        ann = (4.0 / q) if q else 1.0   # UBPR PCTOFANN annualization factor
+        for (label, bal_f, na_f, p9_f, p3_f, nt_f, cavg_f) in ASSET_QUALITY_SEGMENTS:
+            bal = s(fin.get(bal_f))
+            na = s(fin.get(na_f))
+            p9 = s(fin.get(p9_f))
+            p3 = s(fin.get(p3_f))
+            nt = s(fin.get(nt_f))
+            # Point-in-time stock rates (segment EOP denominator).
+            r[_nm_na_rate(label)] = safe_div(na, bal)
+            r[_nm_p9_rate(label)] = safe_div(p9, bal)
+            r[_nm_p3_rate(label)] = safe_div(p3, bal)
+            # Dollar balances.
+            r[_nm_na_usd(label)] = na
+            r[_nm_p9_usd(label)] = p9
+            r[_nm_p3_usd(label)] = p3
+            r[_nm_nco_usd(label)] = nt
+            # Flow NCO rate (CAVG5 denominator), only where CAVG5 exists.
+            if cavg_f is not None:
+                avg = s(fin.get(cavg_f))
+                if nt is not None and avg is not None and avg > 0:
+                    r[_nm_nco_rate(label)] = (nt * ann / avg) * 100.0
+                else:
+                    r[_nm_nco_rate(label)] = None
+        dr = s(fin.get('DRLNLS'))
+        cr = s(fin.get('CRLNLS'))
+        r[GROSS_RECOVERY_RATE_METRIC] = (
+            (cr / dr) * 100.0 if (dr is not None and cr is not None and dr > 0) else None)
+
     def _gr(self, r, bn, fin, pyd):
         try:
             dt = pd.to_datetime(fin.get('REPDTE'), format='%Y%m%d')
@@ -1395,7 +1644,12 @@ def build_primary_bank_export(df):
         "Loan & Lease": PatternFill('solid', fgColor='F3E5F5'),
         "Funding & Liquidity": PatternFill('solid', fgColor='E0F2F1'),
         "Credit Concentration": PatternFill('solid', fgColor='F5F5F5'),
-        "Growth": PatternFill('solid', fgColor='E8EAF6')}
+        "Growth": PatternFill('solid', fgColor='E8EAF6'),
+        # Segment asset-quality categories (delinquency "heat" ramp tints).
+        "30-89 Day Past Due by Segment": PatternFill('solid', fgColor='FEF3CD'),
+        "90+ Day Past Due by Segment": PatternFill('solid', fgColor='FDEBD0'),
+        "Nonaccrual by Segment": PatternFill('solid', fgColor='F8D7DA'),
+        "Net Charge-Offs by Segment": PatternFill('solid', fgColor='FCE4D6')}
     white_fill = PatternFill('solid', fgColor='FFFFFF')
     alt_fill = PatternFill('solid', fgColor='F8FAFB')
     thin_border = Border(bottom=Side(style='hair', color='D0D0D0'),
@@ -1737,6 +1991,15 @@ class DashboardBuilder:
                 ("Latest-period lag", "JPMorgan's latest available report period is "
                  f"{pd.Timestamp(self.analysis_end_date).strftime('%m/%d/%Y')}; "
                  f"the raw FDIC peer set includes a newer period of {pd.Timestamp(self.raw_latest_date).strftime('%m/%d/%Y')}."))
+
+        # Segment-level asset-quality detail (NCO / nonaccrual / 90+ / 30-89 by loan type).
+        scope_lines.append(
+            ("Segment asset quality",
+             f"Net charge-offs, nonaccrual, 90+ DPD and 30-89 DPD are broken out across {len(SEG_LABELS)} "
+             "loan segments. Stock rates use point-in-time end-of-period segment denominators (RC-N cols "
+             "C/B/A); segment NCO rates use YTD net charge-offs annualized over the CAVG5 5-quarter average "
+             "(UBPR PCTOFANN), consistent with the published total (NTLNLSR). NFNR owner/non-owner splits "
+             "start 2007Q1 and the auto breakout starts 2011Q1; earlier periods read N/A, never fabricated."))
 
         # CECL transition adjustment status (concentration denominator).
         cecl = self.cecl_status or {}
@@ -2768,6 +3031,26 @@ color:var(--text3);margin-bottom:4px;}
 .metric-opt-name{font-size:12px;color:var(--text);}
 .emp{color:var(--text3);font-size:12px;text-align:center;padding:20px;}
 .spark-img{display:block;}
+/* --- supplementary layout rules (containers/modifiers used by the layout) --- */
+.peer-performance-card,.jpm-corr-card,.ref-card{position:relative;}
+.peer-perf-top,.peer-perf-controls-only,.exec-banner-inner{display:block;}
+.peer-control{display:flex;flex-direction:column;}
+.peer-section-snapshot,.peer-section-trend{margin-top:4px;}
+.peer-subrow,.corr-subrow{margin-top:2px;}
+.peer-panel,.corr-panel{height:100%;}
+.pair-card-chart,.pair-card-side{min-height:432px;}
+.viz-graph{width:100%;}
+.insight-shell,.analysis-shell,.overview-shell{display:flex;flex-direction:column;gap:14px;
+overflow-y:auto;max-height:340px;padding-right:2px;}
+.det-cat-label{font-weight:700;font-size:12.5px;}
+.df-txt{color:var(--text3);}
+.dspark{display:flex;align-items:center;}
+.legend-txt{font-size:11px;color:inherit;margin-right:4px;}
+.corr-header-grid{margin-bottom:6px;}
+.corr-title-block{margin-bottom:4px;}
+.corr-control-metric,.corr-control-timeline{display:flex;flex-direction:column;}
+.peer-def-wrap{margin-top:10px;}
+.scope-title{font-weight:700;}
 @media (max-width:768px){.pair-col{flex:0 0 100%;max-width:100%;}.hdr-meta{text-align:left;}
 .peer-control-metric,.peer-control-date{flex:1 1 100%!important;max-width:100%!important;min-width:0!important;}}
 </style>
