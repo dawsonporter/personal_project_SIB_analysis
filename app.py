@@ -1,4 +1,19 @@
-import warnings
+"""JPMorgan Chase — Systemically Important Banks Dashboard.
+
+Heroku-ready Dash app. Key architecture notes:
+  * NON-BLOCKING BOOT: the FDIC fetch (19 banks, full history) runs in a
+    background thread started on the first page request. The web dyno binds
+    to $PORT instantly, so Heroku's 60s R10 boot timeout and gunicorn's
+    worker timeout can never kill the app while data loads. Visitors see a
+    branded loading screen that live-updates fetch progress and auto-reloads
+    into the dashboard when ready.
+  * REAL DATA ONLY: no synthetic/sample fallback. If the FDIC API cannot
+    supply a usable dataset, an error screen is served with a retry link.
+  * Run with:  gunicorn app:server --workers 1 --threads 8 --timeout 120
+    (one worker: the in-process loader thread + file cache should not be
+    duplicated across workers; threads serve concurrent users.)
+"""
+
 import base64
 import requests
 import pandas as pd
@@ -7,7 +22,7 @@ from typing import List, Dict, Union, Optional, Tuple, Any
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import dash
-from dash import dcc, html, Output, Input, State
+from dash import dcc, html, Output, Input, State, no_update
 import dash_bootstrap_components as dbc
 from datetime import datetime
 from scipy import stats
@@ -19,8 +34,10 @@ import ssl
 import glob
 import random
 import hashlib
+import threading
 import time
 from dash.exceptions import PreventUpdate
+from flask import request as flask_request
 
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -394,7 +411,7 @@ METRIC_CATEGORIES = [
     ("Growth", [
         'Total Asset Growth Rate', 'Tier 1 Capital Growth Rate',
     ]),
-    # ---- NEW: segment-level asset-quality detail (generated above) ----------
+    # ---- Segment-level asset-quality detail (generated above) ---------------
     ("Net Charge-Offs by Segment", NCO_SEG_METRICS),
     ("Nonaccrual by Segment", NA_SEG_METRICS),
     ("90+ Day Past Due by Segment", P9_SEG_METRICS),
@@ -799,12 +816,18 @@ def trend_direction_label(slope, eps=1e-9):
     return "\u2191 Up" if sl > 0 else "\u2193 Down"
 
 
+# =============================================================================
+# SVG MICRO-VISUALS (sparklines, percentile arcs) + period/rank helpers
+# =============================================================================
 def make_sparkline_svg(values, width=90, height=24, color=None, fill_color=None):
-    if color is None: color = CS['spark']
-    if fill_color is None: fill_color = CS['spark_area']
+    color = color or CS['spark']
+    fill_color = fill_color or CS['spark_area']
     clean = [float(v) for v in values if v is not None and not pd.isna(v)]
     if len(clean) < 2:
-        return f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg"><line x1="2" y1="{height/2:.1f}" x2="{width-2:.1f}" y2="{height/2:.1f}" stroke="{CS["lighter"]}" stroke-width="1" stroke-dasharray="2,2"/></svg>'
+        return (f'<svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
+                f'xmlns="http://www.w3.org/2000/svg"><line x1="2" y1="{height/2:.1f}" '
+                f'x2="{width-2:.1f}" y2="{height/2:.1f}" stroke="{CS["lighter"]}" '
+                f'stroke-width="1" stroke-dasharray="2,2"/></svg>')
     vmin, vmax = min(clean), max(clean)
     rng = vmax - vmin if vmax != vmin else max(abs(vmax), 1) * 0.1
     pad = 3
@@ -835,42 +858,73 @@ def make_sparkline_img(values, width=90, height=24, color=None, fill_color=None,
     return html.Img(src=svg_to_data_url(svg), className=cls, style={'display': 'block'})
 
 
-def make_percentile_arc_svg(pct, size=72):
-    has_pct = pct is not None and not pd.isna(pct)
-    if has_pct:
-        pct = max(0, min(100, float(pct)))
-    else:
-        pct = 0.0
-    if pct >= 75: color = CS['peer_band_top']
-    elif pct >= 25: color = CS['peer_band_mid']
-    else: color = CS['peer_band_low']
-    cx = cy = size / 2; r = size / 2 - 5
+# Sparklines are pure functions of (values, width, height). The same bank/metric
+# sparkline is otherwise re-rendered (SVG-built + base64-encoded) on every single
+# visit to a date/bank, and the All-Metrics detail builds 198 of them at once.
+# Memoize the expensive bit -- the data-URL string -- keyed by a hashable tuple
+# of the rounded values. lru_cache is process-wide and the inputs are static
+# between data refreshes, so the cache stays warm for the dyno's life.
+from functools import lru_cache as _lru_cache
+
+
+@_lru_cache(maxsize=8192)
+def _sparkline_data_url_cached(values_key, width, height):
+    svg = make_sparkline_svg(list(values_key), width, height)
+    return svg_to_data_url(svg)
+
+
+def make_sparkline_img_cached(values, width=90, height=24, cls="spark-img"):
+    """Memoized sparkline <img>. Values are rounded into a hashable key so tiny
+    float noise does not bust the cache; identical sparklines are encoded once."""
+    key = tuple(round(float(v), 6) if (v is not None and not pd.isna(v)) else None
+                for v in values)
+    src = _sparkline_data_url_cached(key, width, height)
+    return html.Img(src=src, className=cls, style={'display': 'block'})
+
+
+def make_percentile_arc_svg(pct, size=OVERVIEW_GAUGE_SIZE):
+    """270-degree arc gauge for a 0-100 percentile."""
     import math
-    start_angle = 135; end_angle_full = 45 + 360
-    def polar(angle_deg):
-        rad = math.radians(angle_deg)
-        return (cx + r * math.cos(rad), cy + r * math.sin(rad))
-    sx, sy = polar(start_angle)
-    ex, ey = polar(end_angle_full)
-    large_arc_bg = 1
-    bg_path = f"M {sx:.2f} {sy:.2f} A {r} {r} 0 {large_arc_bg} 1 {ex:.2f} {ey:.2f}"
-    sweep = (pct / 100) * 270
-    val_end_angle = start_angle + sweep
-    vex, vey = polar(val_end_angle)
-    large_arc_val = 1 if sweep > 180 else 0
-    val_path = f"M {sx:.2f} {sy:.2f} A {r} {r} 0 {large_arc_val} 1 {vex:.2f} {vey:.2f}"
-    label = f"{pct:.0f}" if has_pct else "\u2014"
-    return (f'<svg width="{size}" height="{size}" viewBox="0 0 {size} {size}" xmlns="http://www.w3.org/2000/svg">'
-            f'<path d="{bg_path}" fill="none" stroke="{CS["neutral_light"]}" stroke-width="5" stroke-linecap="round"/>'
-            f'<path d="{val_path}" fill="none" stroke="{color}" stroke-width="5" stroke-linecap="round"/>'
-            f'<text x="{cx}" y="{cy}" text-anchor="middle" dominant-baseline="central" '
+    if pct is None or pd.isna(pct):
+        pct = None
+    cx = cy = size / 2.0
+    radius = size / 2.0 - size * 0.085
+    stroke_w = size * 0.10
+    start_deg, sweep_deg = 135.0, 270.0
+
+    def _pt(deg):
+        rad = math.radians(deg)
+        return cx + radius * math.cos(rad), cy + radius * math.sin(rad)
+
+    sx, sy = _pt(start_deg)
+    ex_full, ey_full = _pt(start_deg + sweep_deg)
+    track = (f'<path d="M {sx:.2f} {sy:.2f} A {radius:.2f} {radius:.2f} 0 1 1 '
+             f'{ex_full:.2f} {ey_full:.2f}" fill="none" stroke="{CS["neutral_light"]}" '
+             f'stroke-width="{stroke_w:.2f}" stroke-linecap="round"/>')
+    if pct is None:
+        arc = ''
+        label = "\u2014"
+        col = CS['neutral']
+    else:
+        p = max(0.0, min(100.0, float(pct)))
+        col = CS['good'] if p >= 67 else (CS['warn'] if p >= 33 else CS['bad'])
+        deg = sweep_deg * (p / 100.0)
+        large = 1 if deg > 180 else 0
+        px, py = _pt(start_deg + deg)
+        arc = (f'<path d="M {sx:.2f} {sy:.2f} A {radius:.2f} {radius:.2f} 0 {large} 1 '
+               f'{px:.2f} {py:.2f}" fill="none" stroke="{col}" '
+               f'stroke-width="{stroke_w:.2f}" stroke-linecap="round"/>')
+        label = f"{p:.0f}"
+    return (f'<svg width="{size}" height="{size}" viewBox="0 0 {size} {size}" '
+            f'xmlns="http://www.w3.org/2000/svg">{track}{arc}'
+            f'<text x="{cx}" y="{cy - size * 0.02:.1f}" text-anchor="middle" dominant-baseline="central" '
             f'font-family="Inter, sans-serif" font-size="{size * 0.32:.1f}" font-weight="700" fill="{CS["text"]}">{label}</text>'
             f'<text x="{cx}" y="{cy + size * 0.22:.1f}" text-anchor="middle" dominant-baseline="central" '
             f'font-family="Inter, sans-serif" font-size="{size * 0.13:.1f}" font-weight="500" fill="{CS["text3"]}">pctl</text>'
             f'</svg>')
 
 
-def make_percentile_arc_img(pct, size=72, cls="pct-arc"):
+def make_percentile_arc_img(pct, size=OVERVIEW_GAUGE_SIZE, cls="pct-arc"):
     svg = make_percentile_arc_svg(pct, size)
     return html.Img(src=svg_to_data_url(svg), className=cls, style={'display': 'block'})
 
@@ -902,35 +956,39 @@ def compute_period_deltas(df, bank, metric, current_date):
     return (qoq_val, yoy_val)
 
 
-def compute_peer_rank(df, date, metric, bank):
-    slice_ = df[df['Date'] == pd.Timestamp(date)].copy()
-    vals = slice_[[metric, 'Bank']].dropna()
-    if vals.empty or bank not in vals['Bank'].values:
-        return (None, 0, None)
-    total = len(vals)
-    bank_val = vals.loc[vals['Bank'] == bank, metric].iloc[0]
-    other_vals = vals.loc[vals['Bank'] != bank, metric].values
+def compute_peer_rank(df, bank, metric, date, cohort=None):
+    """Direction-aware rank of `bank` among `cohort` for one metric on one
+    date. Returns (rank, total, percentile) -- rank 1 = best, percentile 100 =
+    best -- or (None, None, None) when unrankable. INVERSE_METRICS flip the
+    ordering so lower-is-better metrics rank correctly."""
+    snap = df[df['Date'] == pd.Timestamp(date)]
+    if cohort is not None:
+        snap = snap[snap['Bank'].isin(cohort)]
+    if snap.empty or metric not in snap.columns:
+        return (None, None, None)
+    snap = snap.drop_duplicates(subset=['Bank'], keep='last')
+    row = snap[snap['Bank'] == bank]
+    if row.empty:
+        return (None, None, None)
+    v = row.iloc[0][metric]
+    if v is None or pd.isna(v):
+        return (None, None, None)
+    others = [x for x in snap.loc[snap['Bank'] != bank, metric].tolist()
+              if x is not None and not pd.isna(x)]
+    if not others:
+        return (None, None, None)
     inverse = is_inverse_metric(metric)
-    if len(other_vals) == 0:
-        return (1, total, None)
-    if inverse:
-        favorable = sum(1 for v in other_vals if v < bank_val)
-        unfavorable = sum(1 for v in other_vals if v > bank_val)
-    else:
-        favorable = sum(1 for v in other_vals if v > bank_val)
-        unfavorable = sum(1 for v in other_vals if v < bank_val)
-    ties = len(other_vals) - favorable - unfavorable
-    rank = favorable + 1
-    pct = ((unfavorable + 0.5 * ties) / len(other_vals)) * 100
-    return (rank, total, pct)
+    better = sum(1 for x in others if ((x < v) if inverse else (x > v)))
+    total = len(others) + 1
+    rank = better + 1
+    percentile = 100.0 * (total - rank) / (total - 1) if total > 1 else None
+    return (rank, total, percentile)
 
 
-def get_sparkline_series(df, bank, metric, lookback_quarters=12, end_date=None):
+def get_sparkline_series(df, bank, metric, lookback_quarters=8):
     bd = df[df['Bank'] == bank].sort_values('Date')
-    if bd.empty:
+    if bd.empty or metric not in bd.columns:
         return []
-    if end_date is not None:
-        bd = bd[bd['Date'] <= pd.Timestamp(end_date)]
     return bd[metric].tail(lookback_quarters).tolist()
 
 
@@ -938,11 +996,14 @@ class FDICDataUnavailableError(RuntimeError):
     pass
 
 
+# =============================================================================
+# FDIC API CLIENT
+# =============================================================================
 class FDICAPIClient:
     def __init__(self):
         self.base_url = BASE_URL
 
-    def _get(self, ep, params, attempts=2):
+    def _get(self, ep, params, attempts=4):
         last_error = None
         for attempt in range(1, attempts + 1):
             retry_after = None
@@ -952,7 +1013,7 @@ class FDICAPIClient:
                     params=params,
                     headers={"Accept": "application/json"},
                     verify=False,
-                    timeout=15,
+                    timeout=45,
                 )
                 if r.status_code == 429 or 500 <= r.status_code < 600:
                     ra = r.headers.get('Retry-After')
@@ -984,210 +1045,140 @@ class FDICAPIClient:
         return {"data": [], "_error": last_error}
 
     def get_institutions(self, f, fields):
-        payload = self._get("institutions", {"filters": f, "fields": fields, "limit": 10000})
-        return payload.get('data', []), payload.get('_error')
+        payload = self._get("institutions", {"filters": f, "fields": fields, "limit": 10})
+        return payload.get('data', [])
 
     def get_financials(self, cert, f, fields):
         flt = f"CERT:{cert}" + (f" AND {f}" if f else "")
-        payload = self._get("financials", {"filters": flt, "fields": fields, "limit": 10000})
-        return payload.get('data', []), payload.get('_error')
+        payload = self._get("financials", {"filters": flt, "fields": fields,
+                                           "limit": 10000, "sort_by": "REPDTE",
+                                           "sort_order": "ASC"})
+        return payload.get('data', [])
 
 
+# =============================================================================
+# RAW DATA REPOSITORY (cache discipline: only COMPLETE fetches are persisted;
+# on read, a cache missing any cohort bank is rejected so a stale/partial file
+# can never silently shrink the peer set.)
+# =============================================================================
 class BankDataRepository:
-    # Single financials projection. FULL_FF = original base fields + the
-    # segment-level asset-quality fields + CAVG5 denominators (built at module
-    # level above, de-duplicated). Still one FDIC call per bank.
     FF = FULL_FF
-
-    INTER_BANK_DELAY = 0.4
-    MIN_PEERS_REQUIRED = 5
+    INTER_BANK_DELAY = 0.4  # seconds between per-bank FDIC calls (be polite)
 
     def __init__(self):
         self.api = FDICAPIClient()
 
     @staticmethod
-    def _bank_set_hash(bi):
-        certs = sorted(b['cert'] for b in bi)
-        payload = (CACHE_SCHEMA_VERSION + '|' + ','.join(certs) + '|'
-                   + BankDataRepository.FF + '|' + CECL_AUX_FF)
-        return hashlib.md5(payload.encode()).hexdigest()[:10]
+    def _bank_set_hash():
+        """Stable hash of (cohort certs + cache schema version) so cache files
+        auto-invalidate when banks are added/removed OR the projected field set
+        changes. Sorting the certs makes the hash insensitive to BANK_INFO
+        ordering changes."""
+        certs = ",".join(sorted(b["cert"] for b in BANK_INFO))
+        return hashlib.md5(f"{certs}|{CACHE_SCHEMA_VERSION}".encode("utf-8")).hexdigest()[:10]
 
     def _cp(self, s, e):
-        h = self._bank_set_hash(BANK_INFO)
-        return os.path.join(CACHE_DIR, f"bank_data_{s}_{e}_{h}.json")
+        return os.path.join(CACHE_DIR, f"bank_data_{s}_{e}_{self._bank_set_hash()}.json")
+
+    def _expected_names(self):
+        return {b["display"] for b in BANK_INFO}
+
+    def _is_complete(self, payload):
+        try:
+            fins = payload.get('financials_data', {})
+            names = {normalize_bank_name(n) for n in fins.keys()}
+            return self._expected_names().issubset(names) and all(fins.values())
+        except (AttributeError, TypeError):
+            return False
 
     def _lc(self, s, e):
+        """Load cache for the exact window; if absent, fall back to the most
+        recent COMPLETE cache for this cohort hash (covers redeploys earlier in
+        the same quarter). Incomplete caches are rejected outright."""
         p = self._cp(s, e)
-        if os.path.exists(p):
+        candidates = [p] if os.path.exists(p) else []
+        if not candidates:
+            pattern = os.path.join(CACHE_DIR, f"bank_data_*_{self._bank_set_hash()}.json")
+            candidates = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
+        for path in candidates:
             try:
-                with open(p) as f:
-                    return json.load(f)
+                with open(path) as f:
+                    data = json.load(f)
             except (json.JSONDecodeError, OSError) as exc:
-                logger.warning(f"Cache load failed for {p}: {exc}")
+                logger.warning(f"Cache load failed for {path}: {exc}")
+                continue
+            if self._is_complete(data):
+                logger.info(f"Serving COMPLETE cached FDIC dataset: {path}")
+                return data
+            logger.info(f"Rejecting incomplete cache {path}; will refetch.")
         return None
 
     def _sc(self, d, s, e):
-        path = self._cp(s, e)
-        tmp = f"{path}.tmp.{os.getpid()}"
         try:
-            with open(tmp, 'w') as f:
+            with open(self._cp(s, e), 'w') as f:
                 json.dump(d, f)
-            os.replace(tmp, path)
         except OSError as exc:
             logger.warning(f"Cache save failed: {exc}")
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except OSError:
-                pass
 
-    @staticmethod
-    def _financials_complete(cache_obj, expected_certs):
-        if not isinstance(cache_obj, dict):
-            return False, set()
-        fin_certs = set()
-        for rows in cache_obj.get('financials_data', {}).values():
-            if isinstance(rows, list):
-                for row in rows:
-                    if isinstance(row, dict) and row.get('CERT'):
-                        fin_certs.add(str(row['CERT']).strip())
-        return fin_certs >= expected_certs, fin_certs
-
-    def _latest_complete_cache(self, bi):
-        expected = {str(b['cert']).strip() for b in bi}
-        h = self._bank_set_hash(bi)
-        pattern = os.path.join(CACHE_DIR, f"bank_data_*_{h}.json")
-        best = None
-        best_mtime = None
-        for path in glob.glob(pattern):
-            try:
-                with open(path) as f:
-                    obj = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                continue
-            complete, _ = self._financials_complete(obj, expected)
-            if not complete:
-                continue
-            try:
-                mtime = os.path.getmtime(path)
-            except OSError:
-                continue
-            if best_mtime is None or mtime > best_mtime:
-                best_mtime = mtime
-                best = (obj, path)
-        return best
-
-    def _enrich_cecl(self, cert, fin_data):
-        """Best-effort, ISOLATED enrichment of each financial row with the
-        retained-earnings field(s) used by the CECL concentration-denominator
-        adjustment. Fetched only over the transition window to keep it small.
-
-        Lives entirely inside its own try/except and never propagates a failure:
-        if the candidate fields don't resolve (the FDIC financials endpoint may
-        not expose them under these SDI names), rows are left untouched and the
-        adjustment safely no-ops downstream. CANNOT break the main fetch."""
-        if not (APPLY_CECL_TRANSITION_ADJUSTMENT and CECL_AUX_FF):
-            return
-        try:
-            aux_rows, aux_err = self.api.get_financials(
-                cert, f"REPDTE:[{CECL_TRANSITION_START} TO {CECL_TRANSITION_END}]", CECL_AUX_FF)
-        except Exception as exc:  # noqa: BLE001 - enrichment must never break fetch
-            logger.warning(f"CECL aux fetch raised for cert {cert}: {exc}; using as-reported Tier 1 + ACL.")
-            return
-        if not aux_rows:
-            if aux_err:
-                logger.info(f"CECL aux fields unavailable for cert {cert} ({aux_err}); "
-                            f"concentration ratios will use as-reported Tier 1 + ACL.")
-            return
-        by_dt = {}
-        for a in aux_rows:
-            ad = a.get('data') if isinstance(a, dict) else None
-            if isinstance(ad, dict) and ad.get('REPDTE') is not None:
-                by_dt[str(ad['REPDTE'])] = ad
-        if not by_dt:
-            return
-        merged = 0
-        for row in fin_data:
-            extra = by_dt.get(str(row.get('REPDTE')))
-            if extra:
-                for k, v in extra.items():
-                    if k not in ('CERT', 'REPDTE') and k not in row:
-                        row[k] = v
-                        merged += 1
-        if merged:
-            logger.info(f"CECL aux merged {merged} field-values for cert {cert}.")
-
-    def fetch_data(self, bi, sd, ed):
-        expected_certs = {str(b["cert"]).strip() for b in bi}
-        expected_count = len(expected_certs)
+    def fetch_data(self, bi, sd, ed, progress=None):
+        def _p(msg):
+            if progress:
+                try:
+                    progress(msg)
+                except Exception:
+                    pass
 
         c = self._lc(sd, ed)
         if c:
-            complete, cached_fin_certs = self._financials_complete(c, expected_certs)
-            if complete:
-                logger.info(f"Cache hit (pid={os.getpid()}): complete data for all {expected_count} banks.")
-                return c
-            missing = expected_certs - cached_fin_certs
-            logger.warning(
-                f"Cache present but INCOMPLETE: financials {len(cached_fin_certs)}/{expected_count} "
-                f"(missing certs: {sorted(missing)}). Discarding and re-fetching. (pid={os.getpid()})")
+            _p("Loaded FDIC dataset from cache.")
+            return c
 
-        inst, fins, failed = {}, {}, []
-        for b in bi:
-            cert = str(b["cert"]).strip()
-            display = b.get("display", f"CERT {cert}")
+        inst, fins = {}, {}
+        fails = 0
+        expected_count = len(bi)
+        for i, b in enumerate(bi, 1):
+            disp = b.get('display', b.get('cert'))
+            _p(f"Fetching {disp} ({i}/{expected_count})\u2026")
             try:
-                fn, fin_err = self.api.get_financials(cert, f"REPDTE:[{sd} TO {ed}]", self.FF)
-                fin_data = [f['data'] for f in fn if isinstance(f, dict) and 'data' in f]
-                if not fin_data:
-                    failed.append((cert, display,
-                                   "no financial records"
-                                   + (f" (last error: {fin_err})" if fin_err
-                                      else " - FDIC returned an empty set for this cert/date range")))
+                ii = self.api.get_institutions(f'CERT:{b["cert"]}', "NAME,CERT")
+                if not ii:
+                    logger.warning(f"No institution record for cert {b['cert']} ({disp}).")
+                    fails += 1
                     continue
-                # Best-effort, isolated CECL enrichment (cannot break the fetch).
-                self._enrich_cecl(cert, fin_data)
-                inst[display] = {'CERT': cert, 'NAME': display}
-                fins[display] = fin_data
+                bk = ii[0]
+                if not (isinstance(bk, dict) and 'data' in bk):
+                    fails += 1
+                    continue
+                bd = bk['data']
+                if 'NAME' not in bd:
+                    fails += 1
+                    continue
+                inst[bd['NAME']] = bd
+                fn = self.api.get_financials(bd['CERT'], f"REPDTE:[{sd} TO {ed}]", self.FF)
+                fins[bd['NAME']] = [f['data'] for f in fn if isinstance(f, dict) and 'data' in f]
+                if not fins[bd['NAME']]:
+                    logger.warning(f"Zero financial rows for cert {b['cert']} ({disp}).")
             except (KeyError, TypeError, ValueError) as exc:
-                failed.append((cert, display, f"{type(exc).__name__}: {exc}"))
-            finally:
+                logger.warning(f"Fetch error for cert {b.get('cert')} ({disp}): {exc}")
+                fails += 1
+            if i < expected_count:
                 time.sleep(self.INTER_BANK_DELAY)
 
-        loaded_certs = {str(row.get('CERT', '')).strip()
-                        for rows in fins.values() for row in rows if isinstance(row, dict)}
-        peer_count = len(loaded_certs - {PRIMARY_BANK_CERT})
-        fail_summary = '; '.join(f"{d} (cert {c}): {r}" for c, d, r in failed) or "none"
-
-        def _fallback_or_raise(reason):
-            fb = self._latest_complete_cache(bi)
-            if fb is not None:
-                obj, path = fb
-                logger.warning(f"{reason} Falling back to last complete cache: {path} (pid={os.getpid()})")
-                return obj
+        if not inst:
             raise FDICDataUnavailableError(
-                f"{reason} No complete cache available to fall back to. Failures: {fail_summary}")
-
-        if not fins:
-            return _fallback_or_raise(
-                f"FDIC BankFind returned no usable financial data for any of the {len(bi)} requested banks.")
-        if PRIMARY_BANK_CERT not in loaded_certs:
-            return _fallback_or_raise(
-                f"Primary bank {PRIMARY_BANK_DISPLAY_NAME} (cert {PRIMARY_BANK_CERT}) could not be loaded "
-                f"from FDIC; the dashboard cannot render live data without it.")
-        if peer_count < self.MIN_PEERS_REQUIRED:
-            return _fallback_or_raise(
-                f"Only {peer_count} peer bank(s) loaded from FDIC (need at least "
-                f"{self.MIN_PEERS_REQUIRED}) for meaningful benchmarking.")
+                f"FDIC BankFind API returned no usable data for any of the "
+                f"{len(bi)} requested banks. Verify network connectivity and "
+                f"FDIC API status, then retry. (Synthetic fallback has been "
+                f"removed by design -- this dashboard displays real data only.)"
+            )
 
         result = {'institutions_data': inst, 'financials_data': fins}
 
-        if failed:
-            for cert, display, reason in failed:
-                logger.warning(f"FDIC fetch (partial): {display} (cert {cert}) absent - {reason}")
+        if fails > 0 or len(fins) < expected_count:
             logger.warning(
-                f"FDIC fetch PARTIAL: {len(loaded_certs)}/{expected_count} banks loaded. "
-                f"Rendering available real data; intentionally not caching. (pid={os.getpid()})")
+                f"FDIC fetch incomplete: {expected_count - len(fins)} of {expected_count} "
+                f"banks missing. Rendering available real data; intentionally not "
+                f"caching. (pid={os.getpid()})")
             return result
 
         logger.info(f"FDIC fetch COMPLETE: all {expected_count} banks. Writing cache. (pid={os.getpid()})")
@@ -1195,6 +1186,11 @@ class BankDataRepository:
         return result
 
 
+# =============================================================================
+# METRICS CALCULATOR -- one row per bank-quarter, every METRIC_ORDER column.
+# Direct FDIC ratios pass through untouched; computed metrics follow the exact
+# formulas documented in METRIC_DEFINITIONS (the definitions are the spec).
+# =============================================================================
 class BankMetricsCalculator:
     def __init__(self):
         # CECL adjustment coverage diagnostics (populated during calculate_metrics).
@@ -1219,6 +1215,15 @@ class BankMetricsCalculator:
     @staticmethod
     def _z(v):
         return 0.0 if v is None else v
+
+    @staticmethod
+    def _sum_if_any(*vals):
+        """Sum treating None as zero, but only when at least one component is
+        present; all-None propagates None (never fabricate a zero)."""
+        present = [v for v in vals if v is not None]
+        if not present:
+            return None
+        return float(sum(present))
 
     def _cecl_addback(self, fin):
         """Dollar amount ($000s) of the CECL transitional add-back currently
@@ -1253,117 +1258,80 @@ class BankMetricsCalculator:
             book = self._sf(fin.get(f))
             if book is not None:
                 break
-        if reg is not None and book is not None:
-            return max(0.0, reg - book)
-        return None
+        if reg is None or book is None:
+            return None
+        return max(0.0, reg - book)
 
-    def calculate_metrics(self, fd):
-        rows = []
-        pyd = {}
-        for bn, fins in fd.items():
-            sf = sorted(fins, key=lambda x: x['REPDTE'])
-            for i, fin in enumerate(sf):
-                cert = str(fin.get('CERT', '')).strip()
-                display_name = CERT_TO_DISPLAY.get(cert)
-                if display_name is None:
-                    display_name = normalize_bank_name(bn)
-                row = self._br(display_name, fin)
-                cb = self._cb(row, fin)
-                self._cc(row, cb)
-                self._cg(row, sf, i, fin)
-                self._aq(row, sf, i)
-                self._aq_segments(row, fin)   # NEW: segment-level NCO/NA/90+/30-89
-                self._gr(row, display_name, fin, pyd)
-                self._bk(row)
-                self._dp(row)
-                self._pp(row)
-                self._kf(row, fin)
-                # CECL coverage diagnostics (read before '_'-keys are stripped).
-                repdte = str(fin.get('REPDTE', ''))
-                if repdte and CECL_TRANSITION_START <= repdte <= CECL_TRANSITION_END:
-                    self.cecl_window_rows += 1
-                if row.get('_cecl_applied'):
-                    self.cecl_applied_rows += 1
-                    if display_name == PRIMARY_BANK_DISPLAY_NAME:
-                        self.cecl_primary_samples.append((repdte, row.get('_cecl_addback')))
-                rows.append({k: v for k, v in row.items() if not k.startswith('_')})
-        df = pd.DataFrame(rows)
-        if df.empty:
-            return df
-        df['Date'] = pd.to_datetime(df['Date'], format='%Y%m%d')
-        # Collapse restated/amended quarters (duplicate cert+REPDTE) to one row,
-        # keeping the latest, so f.pivot(index='Date', columns='Bank') in
-        # _trend / _ta cannot raise "Index contains duplicate entries".
-        df = df.drop_duplicates(subset=['Bank', 'Date'], keep='last')
-        return df.sort_values('Date')
-
-    def cecl_status(self):
+    # ------------------------------------------------------------------ rows
+    def _br(self, bank_name, fin):
+        """Base row: identity, internal balance fields (underscore-prefixed,
+        dropped before display), and every metric the FDIC publishes directly."""
+        sf = self._sf
         return {
-            'enabled': APPLY_CECL_TRANSITION_ADJUSTMENT,
-            'window_rows': self.cecl_window_rows,
-            'applied_rows': self.cecl_applied_rows,
-            'active': self.cecl_applied_rows > 0,
-            'primary_samples': sorted(self.cecl_primary_samples),
+            'Bank': bank_name,
+            'Date': fin.get('REPDTE'),
+            # Internal balances ($000s) for computed metrics
+            '_ta': sf(fin.get('ASSET')), '_td': sf(fin.get('DEP')),
+            '_bd': sf(fin.get('BRO')), '_tl': sf(fin.get('LNLSGR')),
+            '_nl': sf(fin.get('LNLSNET')), '_sc': sf(fin.get('SC')),
+            '_ea': sf(fin.get('ERNAST')), '_rwa': sf(fin.get('RWAJ')),
+            '_eq': sf(fin.get('EQ')), '_t1': sf(fin.get('RBCT1J')),
+            '_acl': sf(fin.get('LNATRES')), '_na': sf(fin.get('NALNLS')),
+            '_oreo': sf(fin.get('OREOTH')), '_p30': sf(fin.get('P3LNLS')),
+            '_p90': sf(fin.get('P9LNLS')), '_ni': sf(fin.get('NETINC')),
+            '_niq': sf(fin.get('NETINCQ')), '_gco_ytd': sf(fin.get('DRLNLS')),
+            '_gcoq': sf(fin.get('DRLNLSQ')), '_rec_ytd': sf(fin.get('CRLNLS')),
+            '_recq': sf(fin.get('CRLNLSQ')), '_ncoq': sf(fin.get('NTLNLSQ')),
+            # Concentration exposures ($000s)
+            '_re': sf(fin.get('LNRE')), '_cons': sf(fin.get('LNRECONS')),
+            '_c14': sf(fin.get('LNRECNFM')), '_cot': sf(fin.get('LNRECNOT')),
+            '_farm': sf(fin.get('LNREAG')), '_res14': sf(fin.get('LNRERES')),
+            '_heloc': sf(fin.get('LNRELOC')), '_cl1': sf(fin.get('LNRERSFM')),
+            '_cljr': sf(fin.get('LNRERSF2')), '_mf': sf(fin.get('LNREMULT')),
+            '_nfnr': sf(fin.get('LNRENRES')), '_nfnrow': sf(fin.get('LNRENROW')),
+            '_nfnrnoo': sf(fin.get('LNRENROT')), '_comre': sf(fin.get('LNCOMRE')),
+            '_ci': sf(fin.get('LNCI')), '_agl': sf(fin.get('LNAG')),
+            '_con': sf(fin.get('LNCON')), '_cards': sf(fin.get('LNCRCD')),
+            '_auto': sf(fin.get('LNAUTO')), '_oth': sf(fin.get('LNOTHER')),
+            # FDIC-provided ratios (displayed as-is)
+            'Net Charge-Offs / Total Loans & Leases': sf(fin.get('NTLNLSR')),
+            'ACL / Total Loans & Leases': sf(fin.get('LNATRESR')),
+            'Earnings Coverage of Net Loan Charge-Offs': sf(fin.get('IDERNCVR')),
+            'Loan and Lease Loss Provision to Net Charge-Offs': sf(fin.get('ELNANTR')),
+            'Net Loans and Leases to Deposits': sf(fin.get('LNLSDEPR')),
+            'Net Loans and Leases to Assets': sf(fin.get('LNLSNTV')),
+            'Return on Assets': sf(fin.get('ROA')),
+            'Quarterly Return on Assets': sf(fin.get('ROAQ')),
+            'Return on Equity': sf(fin.get('ROE')),
+            'Quarterly Return on Equity': sf(fin.get('ROEQ')),
+            'Leverage (Core Capital) Ratio': sf(fin.get('RBC1AAJ')),
+            'Total Risk-Based Capital Ratio': sf(fin.get('RBCRWAJ')),
+            'Efficiency Ratio': sf(fin.get('EEFFR')),
+            'Earning Assets / Total Assets': sf(fin.get('ERNASTR')),
+            'Net Interest Margin': sf(fin.get('NIMY')),
+            'Common Equity Tier 1 (CET1) Ratio': sf(fin.get('IDT1CER')),
+            'Tier 1 Risk-Based Capital Ratio': sf(fin.get('IDT1RWAJR')),
+            'Cost of Funding Earning Assets (YTD)': sf(fin.get('INTEXPY')),
+            'Cost of Funding Earning Assets (Quarterly)': sf(fin.get('INTEXPYQ')),
+            'Noninterest Income to Average Assets': sf(fin.get('NONIIR')),
+            'Pretax Return on Assets': sf(fin.get('ROAPTX')),
+            'Noninterest Expense to Average Assets': sf(fin.get('NONIXR')),
+            'Loan Loss Reserve / Noncurrent Loans': sf(fin.get('LNRESNCR')),
+            'Volatile Liabilities to Total Assets': sf(fin.get('VOLIABR')),
+            'Net Operating Income to Assets': sf(fin.get('NOIJY')),
+            'Salaries and Benefits to Average Assets': sf(fin.get('ESALR')),
+            'Interest Income to Average Assets': sf(fin.get('INTINCR')),
+            'Interest Expense to Average Assets': sf(fin.get('EINTEXPR')),
+            'Provision for Credit Losses to Average Assets': sf(fin.get('ELNATRR')),
+            'Yield on Earning Assets': sf(fin.get('INTINCY')),
         }
-
-    def _br(self, bn, fin):
-        s = self._sf
-        return {'Bank': bn, 'Date': fin.get('REPDTE'),
-            '_ta': s(fin.get('ASSET')), '_td': s(fin.get('DEP')), '_bd': s(fin.get('BRO')),
-            '_tl': s(fin.get('LNLSGR')), '_nl': s(fin.get('LNLSNET')),
-            '_sc': s(fin.get('SC')), '_ea': s(fin.get('ERNAST')), '_rwa': s(fin.get('RWAJ')),
-            '_re': s(fin.get('LNRE')), '_con': s(fin.get('LNRECONS')),
-            '_c14': s(fin.get('LNRECNFM')), '_cot': s(fin.get('LNRECNOT')),
-            '_fm': s(fin.get('LNREAG')), '_r14': s(fin.get('LNRERES')),
-            '_hel': s(fin.get('LNRELOC')), '_f1': s(fin.get('LNRERSFM')), '_jr': s(fin.get('LNRERSF2')),
-            '_mul': s(fin.get('LNREMULT')),
-            '_nfnr': s(fin.get('LNRENRES')), '_ooc': s(fin.get('LNRENROW')),
-            '_noo': s(fin.get('LNRENROT')), '_cre': s(fin.get('LNCOMRE')),
-            '_ci': s(fin.get('LNCI')), '_ag': s(fin.get('LNAG')),
-            '_csm': s(fin.get('LNCON')), '_crd': s(fin.get('LNCRCD')), '_aut': s(fin.get('LNAUTO')),
-            '_ndf': s(fin.get('LNOTHER')),
-            '_acl': s(fin.get('LNATRES')), '_na': s(fin.get('NALNLS')), '_oreo': s(fin.get('OREOTH')),
-            '_p30': s(fin.get('P3LNLS')), '_p90': s(fin.get('P9LNLS')),
-            '_t1': s(fin.get('RBCT1J')), '_ncoq': s(fin.get('NTLNLSQ')),
-            '_ct1b': s(fin.get('CT1BADJ')), '_eq': s(fin.get('EQ')), '_eqpp': s(fin.get('EQPP')),
-            '_cd': s(fin.get('COREDEP')), '_nib': s(fin.get('DEPNIDOM')),
-            '_ni': s(fin.get('NETINC')), '_niq': s(fin.get('NETINCQ')),
-            '_gco_ytd': s(fin.get('DRLNLS')), '_gcoq': s(fin.get('DRLNLSQ')),
-            '_rec_ytd': s(fin.get('CRLNLS')), '_recq': s(fin.get('CRLNLSQ')),
-            'Net Charge-Offs / Total Loans & Leases': s(fin.get('NTLNLSR')),
-            'ACL / Total Loans & Leases': s(fin.get('LNATRESR')),
-            'Earnings Coverage of Net Loan Charge-Offs': s(fin.get('IDERNCVR')),
-            'Loan and Lease Loss Provision to Net Charge-Offs': s(fin.get('ELNANTR')),
-            'Net Loans and Leases to Deposits': s(fin.get('LNLSDEPR')),
-            'Net Loans and Leases to Assets': s(fin.get('LNLSNTV')),
-            'Return on Assets': s(fin.get('ROA')),
-            'Quarterly Return on Assets': s(fin.get('ROAQ')),
-            'Return on Equity': s(fin.get('ROE')),
-            'Quarterly Return on Equity': s(fin.get('ROEQ')),
-            'Leverage (Core Capital) Ratio': s(fin.get('RBC1AAJ')),
-            'Total Risk-Based Capital Ratio': s(fin.get('RBCRWAJ')),
-            'Efficiency Ratio': s(fin.get('EEFFR')), 'Earning Assets / Total Assets': s(fin.get('ERNASTR')),
-            'Net Interest Margin': s(fin.get('NIMY')),
-            'Common Equity Tier 1 (CET1) Ratio': s(fin.get('IDT1CER')),
-            'Tier 1 Risk-Based Capital Ratio': s(fin.get('IDT1RWAJR')),
-            'Cost of Funding Earning Assets (YTD)': s(fin.get('INTEXPY')),
-            'Cost of Funding Earning Assets (Quarterly)': s(fin.get('INTEXPYQ')),
-            'Noninterest Income to Average Assets': s(fin.get('NONIIR')),
-            'Pretax Return on Assets': s(fin.get('ROAPTX')),
-            'Noninterest Expense to Average Assets': s(fin.get('NONIXR')),
-            'Loan Loss Reserve / Noncurrent Loans': s(fin.get('LNRESNCR')),
-            'Volatile Liabilities to Total Assets': s(fin.get('VOLIABR')),
-            'Net Operating Income to Assets': s(fin.get('NOIJY')),
-            'Salaries and Benefits to Average Assets': s(fin.get('ESALR')),
-            'Interest Income to Average Assets': s(fin.get('INTINCR')),
-            'Interest Expense to Average Assets': s(fin.get('EINTEXPR')),
-            'Provision for Credit Losses to Average Assets': s(fin.get('ELNATRR')),
-            'Yield on Earning Assets': s(fin.get('INTINCY'))}
 
     def _kf(self, r, fin):
         r['Total Assets'] = r['_ta']
         r['Total Deposits'] = r['_td']
         r['Gross Loans & Leases'] = r['_tl']
+        # Net Loans & Leases -- LNLSNET, the numerator FDIC uses for the
+        # LNLSDEPR (Net Loans / Deposits) ratio. Already pulled into _nl in _br().
         r['Net Loans & Leases'] = r['_nl']
         r['Total Securities'] = r['_sc']
         r['Total Earning Assets'] = r['_ea']
@@ -1377,6 +1345,8 @@ class BankMetricsCalculator:
         r['Gross Charge-Offs (Quarter)'] = r['_gcoq']
         r['Gross Recoveries (YTD)'] = r['_rec_ytd']
         r['Gross Recoveries (Quarter)'] = r['_recq']
+        # Noncurrent loans is a sum, so missing components are treated as zero
+        # only when at least one component is present.
         if r['_na'] is not None or r['_p90'] is not None:
             r['Noncurrent Loans'] = self._z(r['_na']) + self._z(r['_p90'])
         else:
@@ -1384,1740 +1354,1544 @@ class BankMetricsCalculator:
         r['Brokered Deposits'] = r['_bd']
 
     def _cb(self, r, fin):
-        """Concentration denominator. Base = Tier 1 + ACL. During the CECL
-        transition (2020-2024), subtract the transitional add-back already
-        embedded in Tier 1 so the '+ ACL' term does not double-count the
-        reserve -- matching UBPR Page 7B / OCC Bull. 2020-90. Applies ONLY to
-        the concentration ('... to Tier 1 + ACL') metrics; regulatory capital
-        ratios elsewhere intentionally keep the transition relief."""
-        t1 = r.get('_t1')
-        acl = r.get('_acl')
+        """Concentration denominator: Tier 1 + ACL, with Tier 1 reduced by the
+        CECL transitional add-back during the 2020-2024 window (OCC Bulletin
+        2020-90; Fed SR 20-8) so the reserve is not double-counted -- matching
+        the UBPR Page 7B methodology. Fields absent -> safe no-op (raw T1+ACL).
+        Returns the denominator ($000s) or None when it cannot be formed."""
+        t1, acl = r['_t1'], r['_acl']
         if t1 is None or acl is None:
             return None
-        base = t1 + acl
+        repdte = str(fin.get('REPDTE', ''))
+        in_window = bool(repdte) and (CECL_TRANSITION_START <= repdte <= CECL_TRANSITION_END)
+        if in_window:
+            self.cecl_window_rows += 1
         addback = self._cecl_addback(fin)
-        r['_cecl_addback'] = addback
-        if addback and addback > 0:
-            adj = (t1 - addback) + acl
-            if adj > 0:
-                r['_cecl_applied'] = True
-                return adj
+        adj_t1 = t1
+        if addback is not None and addback > 0:
+            candidate = t1 - addback
+            if candidate > 0:
+                adj_t1 = candidate
+                self.cecl_applied_rows += 1
+                if r.get('Bank') == PRIMARY_BANK_DISPLAY_NAME and len(self.cecl_primary_samples) < 8:
+                    self.cecl_primary_samples.append((repdte, addback))
+            # else: add-back exceeds Tier 1 (implausible) -> fall back unadjusted.
+        base = adj_t1 + acl
         return base if base > 0 else None
 
-    def _cc(self, r, cb):
-        conc_metrics = [
-            'Real Estate Loans to Tier 1 + ACL', 'RE Construction and Land Development to Tier 1 + ACL',
-            '1-4 Family Construction to Tier 1 + ACL', 'Other Construction & Land Dev to Tier 1 + ACL',
-            'Secured by Farmland to Tier 1 + ACL', '1-4 Family Residential to Tier 1 + ACL',
-            'Revolving Home Equity to Tier 1 + ACL', 'Closed-End 1st Lien to Tier 1 + ACL',
-            'Closed-End Jr Lien to Tier 1 + ACL', 'Multifamily RE to Tier 1 + ACL',
-            'Non-Farm Non-Residential RE to Tier 1 + ACL', 'NFNR: Owner Occupied to Tier 1 + ACL',
-            'NFNR: Non-Owner Occupied to Tier 1 + ACL', 'Commercial RE to Tier 1 + ACL',
-            'Non-Owner Occupied CRE to Tier 1 + ACL',
-            'C&I Loans to Tier 1 + ACL', 'Loans to Individuals to Tier 1 + ACL',
-            'Credit Cards to Tier 1 + ACL', 'Auto Loans to Tier 1 + ACL',
-            'Agriculture Loans to Tier 1 + ACL', 'Loans to NDFIs and Other to Tier 1 + ACL']
-        if cb is None or cb <= 0:
-            for m in conc_metrics:
-                r[m] = None
-            return
-        r['Real Estate Loans to Tier 1 + ACL'] = safe_div(r.get('_re'), cb)
-        r['RE Construction and Land Development to Tier 1 + ACL'] = safe_div(r.get('_con'), cb)
-        r['1-4 Family Construction to Tier 1 + ACL'] = safe_div(r.get('_c14'), cb)
-        r['Other Construction & Land Dev to Tier 1 + ACL'] = safe_div(r.get('_cot'), cb)
-        r['Secured by Farmland to Tier 1 + ACL'] = safe_div(r.get('_fm'), cb)
-        r['1-4 Family Residential to Tier 1 + ACL'] = safe_div(r.get('_r14'), cb)
-        r['Revolving Home Equity to Tier 1 + ACL'] = safe_div(r.get('_hel'), cb)
-        r['Closed-End 1st Lien to Tier 1 + ACL'] = safe_div(r.get('_f1'), cb)
-        r['Closed-End Jr Lien to Tier 1 + ACL'] = safe_div(r.get('_jr'), cb)
-        r['Multifamily RE to Tier 1 + ACL'] = safe_div(r.get('_mul'), cb)
-        r['Non-Farm Non-Residential RE to Tier 1 + ACL'] = safe_div(r.get('_nfnr'), cb)
-        r['NFNR: Owner Occupied to Tier 1 + ACL'] = safe_div(r.get('_ooc'), cb)
-        r['NFNR: Non-Owner Occupied to Tier 1 + ACL'] = safe_div(r.get('_noo'), cb)
-        cre_sum = self._z(r.get('_con')) + self._z(r.get('_mul')) + self._z(r.get('_nfnr')) + self._z(r.get('_cre'))
-        r['Commercial RE to Tier 1 + ACL'] = safe_div(cre_sum, cb)
-        noo_cre_sum = self._z(r.get('_con')) + self._z(r.get('_mul')) + self._z(r.get('_noo')) + self._z(r.get('_cre'))
-        r['Non-Owner Occupied CRE to Tier 1 + ACL'] = safe_div(noo_cre_sum, cb)
-        r['C&I Loans to Tier 1 + ACL'] = safe_div(r.get('_ci'), cb)
-        r['Loans to Individuals to Tier 1 + ACL'] = safe_div(r.get('_csm'), cb)
-        r['Credit Cards to Tier 1 + ACL'] = safe_div(r.get('_crd'), cb)
-        r['Auto Loans to Tier 1 + ACL'] = safe_div(r.get('_aut'), cb)
-        r['Agriculture Loans to Tier 1 + ACL'] = safe_div(r.get('_ag'), cb)
-        r['Loans to NDFIs and Other to Tier 1 + ACL'] = safe_div(r.get('_ndf'), cb)
+    def _cc(self, r, fin):
+        cb = self._cb(r, fin)
+        z, sa = self._z, self._sum_if_any
+        r['Real Estate Loans to Tier 1 + ACL'] = safe_div(r['_re'], cb)
+        r['RE Construction and Land Development to Tier 1 + ACL'] = safe_div(r['_cons'], cb)
+        r['1-4 Family Construction to Tier 1 + ACL'] = safe_div(r['_c14'], cb)
+        r['Other Construction & Land Dev to Tier 1 + ACL'] = safe_div(r['_cot'], cb)
+        r['Secured by Farmland to Tier 1 + ACL'] = safe_div(r['_farm'], cb)
+        r['1-4 Family Residential to Tier 1 + ACL'] = safe_div(r['_res14'], cb)
+        r['Revolving Home Equity to Tier 1 + ACL'] = safe_div(r['_heloc'], cb)
+        r['Closed-End 1st Lien to Tier 1 + ACL'] = safe_div(r['_cl1'], cb)
+        r['Closed-End Jr Lien to Tier 1 + ACL'] = safe_div(r['_cljr'], cb)
+        r['Multifamily RE to Tier 1 + ACL'] = safe_div(r['_mf'], cb)
+        r['Non-Farm Non-Residential RE to Tier 1 + ACL'] = safe_div(r['_nfnr'], cb)
+        r['NFNR: Owner Occupied to Tier 1 + ACL'] = safe_div(r['_nfnrow'], cb)
+        r['NFNR: Non-Owner Occupied to Tier 1 + ACL'] = safe_div(r['_nfnrnoo'], cb)
+        # UBPR Total CRE = Construction + Multifamily + NFNR total + LNCOMRE.
+        cre = sa(r['_cons'], r['_mf'], r['_nfnr'], r['_comre'])
+        r['Commercial RE to Tier 1 + ACL'] = safe_div(cre, cb)
+        # Interagency NOO CRE = Construction + Multifamily + NFNR NOO + LNCOMRE.
+        noo = sa(r['_cons'], r['_mf'], r['_nfnrnoo'], r['_comre'])
+        r['_noo_cre'] = noo  # dollar exposure retained for the 3-yr growth pass
+        r['Non-Owner Occupied CRE to Tier 1 + ACL'] = safe_div(noo, cb)
+        r['C&I Loans to Tier 1 + ACL'] = safe_div(r['_ci'], cb)
+        r['Loans to Individuals to Tier 1 + ACL'] = safe_div(r['_con'], cb)
+        r['Credit Cards to Tier 1 + ACL'] = safe_div(r['_cards'], cb)
+        r['Auto Loans to Tier 1 + ACL'] = safe_div(r['_auto'], cb)
+        r['Agriculture Loans to Tier 1 + ACL'] = safe_div(r['_agl'], cb)
+        r['Loans to NDFIs and Other to Tier 1 + ACL'] = safe_div(r['_oth'], cb)
 
-    def _cg(self, r, sf, idx, cur):
-        s = self._sf
-        z = self._z
-        now = z(s(cur.get('LNRECONS'))) + z(s(cur.get('LNREMULT'))) + \
-              z(s(cur.get('LNRENROT'))) + z(s(cur.get('LNCOMRE')))
-        try:
-            cur_dt = pd.to_datetime(cur.get('REPDTE'), format='%Y%m%d')
-        except (ValueError, TypeError):
-            r['Non-Owner Occupied CRE 3-Year Growth Rate'] = None
-            return
-        target = cur_dt - pd.DateOffset(years=3)
-        prior_record = None
-        best_diff = None
-        for j in range(idx):
-            try:
-                d = pd.to_datetime(sf[j].get('REPDTE'), format='%Y%m%d')
-            except (ValueError, TypeError):
-                continue
-            diff = abs((d - target).days)
-            if best_diff is None or diff < best_diff:
-                best_diff = diff
-                prior_record = sf[j]
-        if prior_record is None or best_diff is None or best_diff > PRIOR_PERIOD_TOLERANCE_DAYS:
-            r['Non-Owner Occupied CRE 3-Year Growth Rate'] = None
-            return
-        old = z(s(prior_record.get('LNRECONS'))) + z(s(prior_record.get('LNREMULT'))) + \
-              z(s(prior_record.get('LNRENROT'))) + z(s(prior_record.get('LNCOMRE')))
-        if old > 0:
-            r['Non-Owner Occupied CRE 3-Year Growth Rate'] = ((now / old) - 1) * 100
-        else:
-            r['Non-Owner Occupied CRE 3-Year Growth Rate'] = None
-
-    def _aq(self, r, sf, idx):
-        l = r.get('_tl'); acl = r.get('_acl'); na = r.get('_na')
-        oreo = r.get('_oreo'); p30 = r.get('_p30'); p90 = r.get('_p90')
-        r['ACL / Nonaccrual Loans'] = safe_div(acl, na, scale=1.0)
-        if na is None and p90 is None:
-            r['ACL / 90+ DPD & Nonaccrual'] = None
-        else:
-            r['ACL / 90+ DPD & Nonaccrual'] = safe_div(acl, self._z(na) + self._z(p90), scale=1.0)
-        if na is None and oreo is None and p90 is None:
-            r['Nonaccrual & OREO / Total Loans & OREO'] = None
-        else:
-            num = self._z(na) + self._z(oreo) + self._z(p90)
-            denom = self._z(l) + self._z(oreo)
-            r['Nonaccrual & OREO / Total Loans & OREO'] = safe_div(num, denom)
-        r['30-89 DPD / Total Loans'] = safe_div(p30, l)
-        r['90+ DPD / Total Loans'] = safe_div(p90, l)
-        r['Nonaccrual / Total Loans'] = safe_div(na, l)
-        if na is None and p90 is None:
-            r['90+ DPD & Nonaccrual / Total Loans'] = None
-        else:
-            r['90+ DPD & Nonaccrual / Total Loans'] = safe_div(self._z(na) + self._z(p90), l)
-        r['Net Charge-Offs / ACL'] = None
-        if idx >= 3:
-            window = sf[idx - 3:idx + 1]
-            window_dates = []
-            parse_ok = True
-            for w in window:
-                try:
-                    window_dates.append(pd.to_datetime(w.get('REPDTE'), format='%Y%m%d'))
-                except (ValueError, TypeError):
-                    parse_ok = False
-                    break
-            contiguous = False
-            if parse_ok and len(window_dates) == 4:
-                gaps = [(window_dates[k + 1] - window_dates[k]).days
-                        for k in range(len(window_dates) - 1)]
-                contiguous = all(75 <= g <= 100 for g in gaps)
-            window_vals = [self._sf(w.get('NTLNLSQ')) for w in window]
-            if contiguous and all(v is not None for v in window_vals):
-                r4 = sum(window_vals)
-                r['Net Charge-Offs / ACL'] = safe_div(r4, acl)
+    def _aq(self, r, fin):
+        tl = r['_tl']
+        r['30-89 DPD / Total Loans'] = safe_div(r['_p30'], tl)
+        r['90+ DPD / Total Loans'] = safe_div(r['_p90'], tl)
+        r['Nonaccrual / Total Loans'] = safe_div(r['_na'], tl)
+        nc = self._sum_if_any(r['_na'], r['_p90'])
+        r['90+ DPD & Nonaccrual / Total Loans'] = safe_div(nc, tl)
+        # Broadest NPA measure: (nonaccrual + OREO + 90+ DPD) / (loans + OREO).
+        npa = self._sum_if_any(r['_na'], r['_oreo'], r['_p90'])
+        denom = self._sum_if_any(tl, r['_oreo']) if tl is not None else None
+        r['Nonaccrual & OREO / Total Loans & OREO'] = safe_div(npa, denom)
+        # Coverage MULTIPLES (x, not %).
+        r['ACL / Nonaccrual Loans'] = safe_div(r['_acl'], r['_na'], scale=1.0)
+        r['ACL / 90+ DPD & Nonaccrual'] = safe_div(r['_acl'], nc, scale=1.0)
 
     def _aq_segments(self, r, fin):
-        """Segment-level asset quality, generated entirely from
-        ASSET_QUALITY_SEGMENTS so names/definitions/categories cannot drift.
-
-        For each loan segment, emits:
-          * point-in-time STOCK rates -- Nonaccrual / 90+ DPD / 30-89 DPD as a %
-            of that segment's end-of-period loan balance (RC-N cols C / B / A);
-          * dollar balances for all four problem buckets ($000s);
-          * a FLOW NCO rate = YTD net charge-offs annualized over the segment's
-            CAVG5 average balance (UBPR PCTOFANN) -- ONLY where a CAVG5 field
-            exists for that segment (no EOP substitution for a flow measure).
-        Plus a total-level Gross Recovery Rate (recoveries / charge-offs)."""
-        s = self._sf
+        """Segment-level stock rates, dollars, and annualized NCO flow rates --
+        generated straight from ASSET_QUALITY_SEGMENTS so names, fields, and
+        math can never drift apart (see the table's docstring)."""
+        sf = self._sf
+        repdte = str(fin.get('REPDTE', ''))
         try:
-            q = pd.to_datetime(fin.get('REPDTE'), format='%Y%m%d').quarter
-        except (ValueError, TypeError):
-            q = 4
-        ann = (4.0 / q) if q else 1.0   # UBPR PCTOFANN annualization factor
-        for (label, bal_f, na_f, p9_f, p3_f, nt_f, cavg_f) in ASSET_QUALITY_SEGMENTS:
-            bal = s(fin.get(bal_f))
-            na = s(fin.get(na_f))
-            p9 = s(fin.get(p9_f))
-            p3 = s(fin.get(p3_f))
-            nt = s(fin.get(nt_f))
-            # Point-in-time stock rates (segment EOP denominator).
+            month = int(repdte[4:6])
+            quarter = max(1, min(4, (month + 2) // 3))
+        except (ValueError, IndexError):
+            quarter = 4
+        for (label, bal_f, na_f, p9_f, p3_f, nt_f, cavg5_f) in ASSET_QUALITY_SEGMENTS:
+            bal = sf(fin.get(bal_f))
+            na = sf(fin.get(na_f))
+            p9 = sf(fin.get(p9_f))
+            p3 = sf(fin.get(p3_f))
+            nt = sf(fin.get(nt_f))
             r[_nm_na_rate(label)] = safe_div(na, bal)
             r[_nm_p9_rate(label)] = safe_div(p9, bal)
             r[_nm_p3_rate(label)] = safe_div(p3, bal)
-            # Dollar balances.
             r[_nm_na_usd(label)] = na
             r[_nm_p9_usd(label)] = p9
             r[_nm_p3_usd(label)] = p3
             r[_nm_nco_usd(label)] = nt
-            # Flow NCO rate (CAVG5 denominator), only where CAVG5 exists.
-            if cavg_f is not None:
-                avg = s(fin.get(cavg_f))
-                if nt is not None and avg is not None and avg > 0:
-                    r[_nm_nco_rate(label)] = (nt * ann / avg) * 100.0
-                else:
-                    r[_nm_nco_rate(label)] = None
-        dr = s(fin.get('DRLNLS'))
-        cr = s(fin.get('CRLNLS'))
-        r[GROSS_RECOVERY_RATE_METRIC] = (
-            (cr / dr) * 100.0 if (dr is not None and cr is not None and dr > 0) else None)
+            if cavg5_f is not None:
+                cavg5 = sf(fin.get(cavg5_f))
+                # UBPR PCTOFANN: YTD NCO annualized over the 5-quarter average.
+                ann_nco = nt * (4.0 / quarter) if nt is not None else None
+                r[_nm_nco_rate(label)] = safe_div(ann_nco, cavg5)
 
-    def _gr(self, r, bn, fin, pyd):
-        try:
-            dt = pd.to_datetime(fin.get('REPDTE'), format='%Y%m%d')
-        except (ValueError, TypeError):
-            r['Net Loan Growth Rate'] = None
-            r['Total Asset Growth Rate'] = None
-            r['Tier 1 Capital Growth Rate'] = None
-            return
-        q, yr = dt.quarter, dt.year
-        for sfx, val, m in [('nl', r.get('_nl'), 'Net Loan Growth Rate'),
-                            ('ta', r.get('_ta'), 'Total Asset Growth Rate'),
-                            ('t1', r.get('_t1'), 'Tier 1 Capital Growth Rate')]:
-            k = f"{bn}_{q}_{sfx}"
-            if val is not None:
-                pyd.setdefault(k, {})[yr] = val
-            pv = pyd.get(k, {}).get(yr - 1)
-            if pv is not None and pv > 0 and val is not None:
-                r[m] = ((val / pv) - 1) * 100
-            else:
-                r[m] = None
+    def _gr(self, r, fin):
+        r[GROSS_RECOVERY_RATE_METRIC] = safe_div(r['_rec_ytd'], r['_gco_ytd'])
 
-    def _bk(self, r):
-        r['Brokered Deposits to Total Deposits'] = safe_div(r.get('_bd'), r.get('_td'))
+    def _bk(self, r, fin):
+        sf = self._sf
+        r['Core Deposits to Total Deposits'] = safe_div(sf(fin.get('COREDEP')), r['_td'])
+        r['Noninterest-Bearing Deposits to Total Deposits'] = safe_div(sf(fin.get('DEPNIDOM')), r['_td'])
+        r['Brokered Deposits to Total Deposits'] = safe_div(r['_bd'], r['_td'])
 
-    def _dp(self, r):
-        r['Core Deposits to Total Deposits'] = safe_div(r.get('_cd'), r.get('_td'))
-        r['Noninterest-Bearing Deposits to Total Deposits'] = safe_div(r.get('_nib'), r.get('_td'))
-
-    def _pp(self, r):
-        ii = r.get('Interest Income to Average Assets')
-        ie = r.get('Interest Expense to Average Assets')
-        ni = r.get('Noninterest Income to Average Assets')
-        nx = r.get('Noninterest Expense to Average Assets')
-        if any(v is None or pd.isna(v) for v in (ii, ie, ni, nx)):
+    def _dp(self, r, fin):
+        """PPNR / Avg Assets from the four published avg-asset ratios (UBPR Pg1
+        #6 arithmetic): II - IE + NonII - NonIE. Any missing component -> None."""
+        comps = [r.get('Interest Income to Average Assets'),
+                 r.get('Interest Expense to Average Assets'),
+                 r.get('Noninterest Income to Average Assets'),
+                 r.get('Noninterest Expense to Average Assets')]
+        if any(c is None or pd.isna(c) for c in comps):
             r['Pre-Provision Net Revenue to Average Assets'] = None
         else:
-            r['Pre-Provision Net Revenue to Average Assets'] = ii - ie + ni - nx
+            ii, ie, nii, nie = comps
+            r['Pre-Provision Net Revenue to Average Assets'] = ii - ie + nii - nie
+
+    # ------------------------------------------------- time-series second pass
+    @staticmethod
+    def _nearest_prior(dates, idx, years_back):
+        """Index of the observation closest to (dates[idx] - years_back), or
+        None if nothing lands within the prior-period tolerance."""
+        target = dates[idx] - pd.DateOffset(years=years_back)
+        best_j, best_diff = None, None
+        for j in range(idx):
+            diff = abs((dates[j] - target).days)
+            if best_diff is None or diff < best_diff:
+                best_diff, best_j = diff, j
+        if best_j is not None and best_diff <= PRIOR_PERIOD_TOLERANCE_DAYS:
+            return best_j
+        return None
+
+    def _cg(self, bdf):
+        """YoY growth rates (and the 3-yr NOO CRE growth) for one bank's
+        date-sorted frame. Dollar-balance growth: NOT CECL-affected."""
+        dates = list(bdf['Date'])
+        specs = [('_ta', 'Total Asset Growth Rate', 1),
+                 ('_t1', 'Tier 1 Capital Growth Rate', 1),
+                 ('_nl', 'Net Loan Growth Rate', 1),
+                 ('_noo_cre', 'Non-Owner Occupied CRE 3-Year Growth Rate', 3)]
+        for src, name, yrs in specs:
+            out = [None] * len(bdf)
+            if src in bdf.columns:
+                vals = list(bdf[src])
+                for i in range(len(bdf)):
+                    j = self._nearest_prior(dates, i, yrs)
+                    if j is None:
+                        continue
+                    cur, prior = self._sf(vals[i]), self._sf(vals[j])
+                    if cur is None or prior is None or prior <= 0:
+                        continue
+                    out[i] = ((cur / prior) - 1.0) * 100.0
+            bdf[name] = out
+        return bdf
+
+    def _pp(self, bdf):
+        """Rolling 4-quarter NCOs as % of current ACL. Requires four CONTIGUOUS
+        quarters (75-100 day spacing); otherwise N/A -- never a partial sum."""
+        dates = list(bdf['Date'])
+        ncoq = list(bdf['_ncoq']) if '_ncoq' in bdf.columns else [None] * len(bdf)
+        acl = list(bdf['_acl']) if '_acl' in bdf.columns else [None] * len(bdf)
+        out = [None] * len(bdf)
+        for i in range(len(bdf)):
+            if i < 3:
+                continue
+            window = [self._sf(ncoq[k]) for k in (i - 3, i - 2, i - 1, i)]
+            if any(v is None for v in window):
+                continue
+            contiguous = all(75 <= (dates[k] - dates[k - 1]).days <= 100
+                             for k in range(i - 2, i + 1))
+            if not contiguous:
+                continue
+            a = self._sf(acl[i])
+            out[i] = safe_div(sum(window), a)
+        bdf['Net Charge-Offs / ACL'] = out
+        return bdf
+
+    # ----------------------------------------------------------------- driver
+    def calculate_metrics(self, financials_data):
+        frames = []
+        for raw_name, fins in financials_data.items():
+            bank = normalize_bank_name(raw_name)
+            rows = []
+            for fin in sorted(fins, key=lambda f: str(f.get('REPDTE', ''))):
+                if not isinstance(fin, dict) or not fin.get('REPDTE'):
+                    continue
+                r = self._br(bank, fin)
+                self._kf(r, fin)
+                self._cc(r, fin)
+                self._aq(r, fin)
+                self._aq_segments(r, fin)
+                self._gr(r, fin)
+                self._bk(r, fin)
+                self._dp(r, fin)
+                rows.append(r)
+            if not rows:
+                continue
+            bdf = pd.DataFrame(rows)
+            bdf['Date'] = pd.to_datetime(bdf['Date'], format='%Y%m%d', errors='coerce')
+            bdf = bdf.dropna(subset=['Date']).sort_values('Date')
+            # FDIC normally returns one row per REPDTE; dedupe defensively.
+            bdf = bdf.drop_duplicates(subset=['Bank', 'Date'], keep='last').reset_index(drop=True)
+            bdf = self._cg(bdf)
+            bdf = self._pp(bdf)
+            frames.append(bdf)
+        if not frames:
+            return pd.DataFrame()
+        df = pd.concat(frames, ignore_index=True)
+        return df.sort_values(['Bank', 'Date']).reset_index(drop=True)
+
+    def cecl_status(self):
+        cov = (100.0 * self.cecl_applied_rows / self.cecl_window_rows
+               if self.cecl_window_rows else None)
+        return {'window_rows': self.cecl_window_rows,
+                'applied_rows': self.cecl_applied_rows,
+                'coverage_pct': cov,
+                'primary_samples': list(self.cecl_primary_samples)}
 
 
+# =============================================================================
+# SERVICE LAYER
+# =============================================================================
 class BankDataService:
     def __init__(self):
         self.repo = BankDataRepository()
         self.calc = BankMetricsCalculator()
 
-    def get_metrics_data(self, sd=DEFAULT_START_DATE, ed=DEFAULT_END_DATE):
-        d = self.repo.fetch_data(BANK_INFO, sd, ed)
-        if not d.get('financials_data'):
-            return pd.DataFrame()
-        df = self.calc.calculate_metrics(d['financials_data'])
+    def get_metrics_data(self, sd=DEFAULT_START_DATE, ed=DEFAULT_END_DATE, progress=None):
+        raw = self.repo.fetch_data(BANK_INFO, sd, ed, progress=progress)
+        if progress:
+            try:
+                progress(f"Computing {len(METRIC_ORDER)} UBPR-aligned metrics\u2026")
+            except Exception:
+                pass
+        df = self.calc.calculate_metrics(raw.get('financials_data', {}))
         if df.empty:
             return df
-        df['Bank'] = df['Bank'].apply(normalize_bank_name)
-        return df[['Bank', 'Date'] + [m for m in METRIC_ORDER if m in df.columns]]
+        # Internal underscore columns never leave the service layer.
+        drop = [c for c in df.columns if c.startswith('_')]
+        return df.drop(columns=drop)
 
 
-def build_primary_bank_export(df):
+# =============================================================================
+# EXCEL EXPORT -- every period, every metric, one sheet per category, for any
+# bank in the cohort (defaults to the primary bank).
+# =============================================================================
+def _safe_sheet_title(name, max_len=31):
+    """Excel sheet titles: <=31 chars, no []:*?/\\ characters."""
+    bad = set('[]:*?/\\')
+    clean = ''.join(('-' if ch in bad else ch) for ch in str(name)).strip()
+    return (clean[:max_len]) if clean else "Sheet"
+
+
+def build_bank_export(df, bank_display=PRIMARY_BANK_DISPLAY_NAME):
+    """All-periods Excel workbook for one bank: a sheet per metric category,
+    metrics as rows, reporting dates as columns (oldest -> newest), values
+    formatted exactly as the dashboard shows them. Returns workbook bytes."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    from openpyxl.utils import get_column_letter
 
-    ghb = df[df['Bank'] == PRIMARY_BANK_DISPLAY_NAME].copy()
-    if ghb.empty:
-        return None
-    ghb = ghb.sort_values('Date')
-    metrics = [m for m in METRIC_ORDER if m in ghb.columns]
-    dates = ghb['Date'].sort_values().unique()
+    bdf = df[df['Bank'] == bank_display].sort_values('Date')
+    dates = list(bdf['Date'])
+
     wb = Workbook()
-    ws = wb.active
-    ws.title = "JPM Metrics"
+    wb.remove(wb.active)
 
-    hdr_fill = PatternFill('solid', fgColor='005EB8')
-    cat_fills = {
-        "Key Financials": PatternFill('solid', fgColor='E2E8F0'),
-        "Earnings & Profitability": PatternFill('solid', fgColor='E8F0EB'),
-        "Efficiency & Margin": PatternFill('solid', fgColor='E0ECF4'),
-        "Capitalization": PatternFill('solid', fgColor='FFF8E1'),
-        "Asset Quality": PatternFill('solid', fgColor='FBE9E7'),
-        "Loan & Lease": PatternFill('solid', fgColor='F3E5F5'),
-        "Funding & Liquidity": PatternFill('solid', fgColor='E0F2F1'),
-        "Credit Concentration": PatternFill('solid', fgColor='F5F5F5'),
-        "Growth": PatternFill('solid', fgColor='E8EAF6'),
-        # Segment asset-quality categories (delinquency "heat" ramp tints).
-        "30-89 Day Past Due by Segment": PatternFill('solid', fgColor='FEF3CD'),
-        "90+ Day Past Due by Segment": PatternFill('solid', fgColor='FDEBD0'),
-        "Nonaccrual by Segment": PatternFill('solid', fgColor='F8D7DA'),
-        "Net Charge-Offs by Segment": PatternFill('solid', fgColor='FCE4D6')}
-    white_fill = PatternFill('solid', fgColor='FFFFFF')
-    alt_fill = PatternFill('solid', fgColor='F8FAFB')
-    thin_border = Border(bottom=Side(style='hair', color='D0D0D0'),
-                         right=Side(style='hair', color='D0D0D0'))
-    hdr_font = Font(name='Arial', bold=True, color='FFFFFF', size=9)
-    cat_font = Font(name='Arial', bold=True, color='005EB8', size=8)
-    metric_font = Font(name='Arial', bold=True, color='333333', size=8)
-    date_font = Font(name='Arial', bold=False, color='1A1A2E', size=9)
-    val_font = Font(name='Arial', color='1A1A2E', size=9)
-    center = Alignment(horizontal='center', vertical='center', wrap_text=True)
-    left = Alignment(horizontal='left', vertical='center')
+    hdr_font = Font(name='Calibri', size=10, bold=True, color='FFFFFF')
+    hdr_fill = PatternFill(start_color='005EB8', end_color='005EB8', fill_type='solid')
+    name_font = Font(name='Calibri', size=10, bold=True)
+    val_font = Font(name='Calibri', size=10)
+    thin = Side(style='thin', color='D9E2EC')
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    ws.cell(row=1, column=1, value=f"{PRIMARY_BANK_FDIC_NAME} \u00b7 since {REQUESTED_START_DATE_DISPLAY}").font = hdr_font
-    ws.cell(row=1, column=1).fill = hdr_fill
-    ws.cell(row=1, column=1).alignment = left
-    col = 2
     for cat_name, cat_metrics in METRIC_CATEGORIES:
-        present = [m for m in cat_metrics if m in metrics]
+        present = [m for m in cat_metrics if m in bdf.columns]
         if not present:
             continue
-        start_col = col
-        for m in present:
-            ws.cell(row=1, column=col).fill = cat_fills.get(cat_name, white_fill)
-            col += 1
-        end_col = col - 1
-        ws.merge_cells(start_row=1, start_column=start_col, end_row=1, end_column=end_col)
-        merged = ws.cell(row=1, column=start_col)
-        merged.value = cat_name
-        merged.font = cat_font
-        merged.alignment = center
-        merged.fill = cat_fills.get(cat_name, white_fill)
-
-    ws.cell(row=2, column=1, value="Report Date").font = metric_font
-    ws.cell(row=2, column=1).fill = PatternFill('solid', fgColor='E8F0EB')
-    ws.cell(row=2, column=1).alignment = left
-    col = 2
-    for m in metrics:
-        cell = ws.cell(row=2, column=col, value=m)
-        cell.font = metric_font
-        cell.alignment = Alignment(horizontal='center', vertical='bottom', wrap_text=True)
-        cell.fill = cat_fills.get(METRIC_TO_CATEGORY.get(m, ''), white_fill)
-        col += 1
-
-    for ri, dt in enumerate(dates):
-        row_num = ri + 3
-        row_data = ghb[ghb['Date'] == dt]
-        if row_data.empty:
-            continue
-        row_data = row_data.iloc[0]
-        fill = white_fill if ri % 2 == 0 else alt_fill
-        dc = ws.cell(row=row_num, column=1, value=pd.Timestamp(dt).strftime('%m/%d/%Y'))
-        dc.font = date_font
-        dc.alignment = left
-        dc.fill = fill
-        dc.border = thin_border
-        col = 2
-        for m in metrics:
-            val = row_data.get(m)
-            cell = ws.cell(row=row_num, column=col)
-            if pd.notna(val):
-                cell.value = round(float(val), 4) if not is_dollar_metric(m) else round(float(val), 0)
-                cell.number_format = '#,##0' if is_dollar_metric(m) else '0.00'
-            else:
-                cell.value = None
-            cell.font = val_font
-            cell.alignment = Alignment(horizontal='center', vertical='center')
-            cell.fill = fill
-            cell.border = thin_border
-            col += 1
-
-    ws.column_dimensions['A'].width = 14
-    for ci in range(2, len(metrics) + 2):
-        ws.column_dimensions[get_column_letter(ci)].width = 14
-    ws.row_dimensions[1].height = 22
-    ws.row_dimensions[2].height = 56
-    ws.freeze_panes = 'B3'
-    ws.auto_filter.ref = f"A2:{get_column_letter(len(metrics) + 1)}{len(dates) + 2}"
-
-    ws2 = wb.create_sheet("Metric Definitions")
-    ws2.cell(row=1, column=1, value="Category").font = Font(name='Arial', bold=True, size=9)
-    ws2.cell(row=1, column=2, value="Metric").font = Font(name='Arial', bold=True, size=9)
-    ws2.cell(row=1, column=3, value="Definition").font = Font(name='Arial', bold=True, size=9)
-    for c in range(1, 4):
-        ws2.cell(row=1, column=c).fill = hdr_fill
-        ws2.cell(row=1, column=c).font = hdr_font
-    r = 2
-    for m in metrics:
-        cat = METRIC_TO_CATEGORY.get(m, '')
-        defn = METRIC_DEFINITIONS.get(m, '')
-        parts = defn.split(' \xb7 ', 1)
-        txt = parts[1] if len(parts) == 2 else defn
-        ws2.cell(row=r, column=1, value=cat).font = Font(name='Arial', size=9, color='005EB8', bold=True)
-        ws2.cell(row=r, column=2, value=m).font = Font(name='Arial', size=9, bold=True)
-        ws2.cell(row=r, column=3, value=txt).font = Font(name='Arial', size=9)
-        ws2.cell(row=r, column=3).alignment = Alignment(wrap_text=True)
-        r += 1
-    ws2.column_dimensions['A'].width = 26
-    ws2.column_dimensions['B'].width = 42
-    ws2.column_dimensions['C'].width = 90
-    ws2.freeze_panes = 'A2'
+        ws = wb.create_sheet(_safe_sheet_title(cat_name))
+        ws.cell(row=1, column=1, value='Metric')
+        for j, d in enumerate(dates, start=2):
+            c = ws.cell(row=1, column=j, value=d.strftime('%m/%d/%Y'))
+            c.font = hdr_font
+            c.fill = hdr_fill
+            c.alignment = Alignment(horizontal='center')
+            c.border = border
+        c0 = ws.cell(row=1, column=1)
+        c0.font = hdr_font
+        c0.fill = hdr_fill
+        c0.border = border
+        ws.freeze_panes = 'B2'
+        ws.column_dimensions['A'].width = 46
+        for i, m in enumerate(present, start=2):
+            nc = ws.cell(row=i, column=1, value=m)
+            nc.font = name_font
+            nc.border = border
+            series = list(bdf[m])
+            for j, v in enumerate(series, start=2):
+                vc = ws.cell(row=i, column=j, value=fmt_val(v, m, with_unit=True))
+                vc.font = val_font
+                vc.alignment = Alignment(horizontal='right')
+                vc.border = border
+        for j in range(2, len(dates) + 2):
+            ws.column_dimensions[ws.cell(row=1, column=j).column_letter].width = 12
 
     buf = io.BytesIO()
     wb.save(buf)
-    buf.seek(0)
     return buf.getvalue()
 
 
-class DashboardBuilder:
-    GHB = PRIMARY_BANK_DISPLAY_NAME
-    SPARK_LOOKBACK = 12
-
-    @staticmethod
-    def _metric_option(metric):
-        cat = METRIC_TO_CATEGORY.get(metric, "Other")
-        short_cat = CATEGORY_SHORT_LABELS.get(cat, cat)
-        accent = CATEGORY_ACCENTS.get(cat, CS['primary'])
-        bg = CATEGORY_BG.get(cat, CS['neutral_light'])
-        return {
-            'label': html.Div([
-                html.Span("", className="metric-opt-dot", style={'backgroundColor': accent}),
-                html.Span(short_cat, className="metric-opt-cat", style={'color': accent, 'backgroundColor': bg}),
-                html.Span(metric, className="metric-opt-name"),
-            ], className="metric-opt"),
-            'value': metric,
-            'search': f"{metric} {cat} {short_cat}",
+# =============================================================================
+# PAGE TEMPLATE + DESIGN SYSTEM (single source of CSS; Dash tokens preserved)
+# =============================================================================
+INDEX_STRING = """<!DOCTYPE html>
+<html>
+<head>
+    {%metas%}
+    <title>{%title%}</title>
+    {%favicon%}
+    {%css%}
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        :root{
+            --jpm:#005EB8; --jpm-dark:#003B73; --jpm-light:#2F7FD3;
+            --ink:#0f172a; --ink2:#475569; --ink3:#64748b;
+            --bg:#f4f6f9; --card:#ffffff;
+            --line:rgba(15,23,42,0.06); --line2:rgba(15,23,42,0.12);
+            --good:#16a34a; --bad:#ef4444; --warn:#f59e0b; --neutral:#64748b;
+            --r-lg:14px; --r-md:10px; --r-sm:7px;
+            --sh-1:0 1px 2px rgba(15,23,42,.05),0 1px 1px rgba(15,23,42,.03);
+            --sh-2:0 8px 24px -8px rgba(2,32,71,.16),0 2px 6px rgba(2,32,71,.06);
         }
+        *,*::before,*::after{box-sizing:border-box}
+        html{-webkit-text-size-adjust:100%}
+        body{margin:0;background:var(--bg);color:var(--ink);
+            font-family:'Inter',-apple-system,'Segoe UI',Roboto,sans-serif;
+            font-size:14px;line-height:1.45;
+            -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
+        ::selection{background:rgba(0,94,184,.18)}
+        ::-webkit-scrollbar{width:10px;height:10px}
+        ::-webkit-scrollbar-track{background:transparent}
+        ::-webkit-scrollbar-thumb{background:#c7d2de;border-radius:6px;border:2px solid var(--bg)}
+        ::-webkit-scrollbar-thumb:hover{background:#9fb2c4}
+        :focus-visible{outline:2px solid var(--jpm);outline-offset:2px;border-radius:4px}
 
-    def __init__(self, df, missing_banks=None, cecl_status=None):
+        /* ---------- header ---------- */
+        .hdr{position:sticky;top:0;z-index:60;
+            background:linear-gradient(135deg,#003B73 0%,#005EB8 62%,#0B4F8A 100%);
+            color:#fff;box-shadow:0 6px 22px -8px rgba(2,32,71,.55);
+            backdrop-filter:saturate(140%) blur(6px)}
+        .hdr-inner{max-width:1480px;margin:0 auto;padding:16px 28px 14px}
+        .hdr-title{margin:0;font-size:21px;font-weight:800;letter-spacing:-.015em;line-height:1.2}
+        .hdr-meta{display:flex;align-items:center;flex-wrap:wrap;gap:7px 14px;
+            margin-top:6px;font-size:12px;font-weight:500;color:rgba(255,255,255,.82)}
+        .hdr-live{display:inline-flex;align-items:center;gap:6px;
+            padding:2.5px 10px 2.5px 8px;border-radius:999px;
+            background:rgba(255,255,255,.13);border:1px solid rgba(255,255,255,.22);
+            font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase}
+        .live-dot{width:7px;height:7px;border-radius:50%;background:#4ade80;
+            box-shadow:0 0 0 0 rgba(74,222,128,.65);animation:pulse 2.2s infinite}
+        @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(74,222,128,.65)}
+            70%{box-shadow:0 0 0 7px rgba(74,222,128,0)}100%{box-shadow:0 0 0 0 rgba(74,222,128,0)}}
+        .hdr-disc{margin-top:4px;font-size:11px;color:rgba(255,255,255,.6)}
+
+        /* ---------- shell ---------- */
+        .main-wrap{max-width:1480px;margin:0 auto;padding:22px 28px 56px}
+        .ftr{max-width:1480px;margin:0 auto;padding:18px 28px 30px;
+            font-size:11.5px;color:var(--ink3);border-top:1px solid var(--line)}
+
+        /* ---------- cards ---------- */
+        .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r-lg);
+            box-shadow:var(--sh-1);padding:18px 20px;
+            transition:box-shadow .18s ease,transform .18s ease}
+        .ch{display:flex;align-items:baseline;justify-content:space-between;
+            flex-wrap:wrap;gap:6px 12px;margin-bottom:12px}
+        .ct{margin:0;font-size:14.5px;font-weight:700;letter-spacing:-.01em;color:var(--ink)}
+        .csub,.rng{font-size:11.5px;font-weight:500;color:var(--ink3)}
+
+        .sec{margin-top:26px}
+        .sec-head{margin:0 2px 12px}
+        .sec-title{margin:0;font-size:16.5px;font-weight:800;letter-spacing:-.015em}
+        .sec-sub{margin:3px 0 0;font-size:12px;color:var(--ink3)}
+
+        /* ---------- peer controls ---------- */
+        .peer-card{margin-top:20px}
+        .peer-row{display:flex;align-items:flex-start;gap:14px;flex-wrap:wrap}
+        .peer-dd-wrap{flex:1 1 520px;min-width:300px}
+        .peer-actions{display:flex;gap:8px;padding-top:2px}
+        .btn-mini{appearance:none;border:1px solid var(--line2);background:#fff;
+            color:var(--ink2);font:inherit;font-size:12px;font-weight:600;
+            padding:7px 14px;border-radius:var(--r-sm);cursor:pointer;
+            transition:all .15s ease;white-space:nowrap}
+        .btn-mini:hover{border-color:var(--jpm);color:var(--jpm);background:#f5f9fe}
+        .peer-count{font-size:11.5px;color:var(--ink3);margin-top:8px}
+
+        /* ---------- executive banner ---------- */
+        .exec-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));
+            gap:12px;margin-top:16px}
+        .exec-card{position:relative;background:var(--card);border:1px solid var(--line);
+            border-radius:var(--r-md);box-shadow:var(--sh-1);padding:13px 14px 12px;
+            overflow:hidden;transition:box-shadow .18s ease,transform .18s ease}
+        .exec-card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;
+            background:var(--jpm);opacity:0;transition:opacity .18s ease}
+        .exec-card:hover{transform:translateY(-2px);box-shadow:var(--sh-2)}
+        .exec-card:hover::before{opacity:1}
+        .exec-kpi-cat{font-size:10px;font-weight:700;letter-spacing:.08em;
+            text-transform:uppercase;color:var(--jpm)}
+        .exec-kpi-label{font-size:11.5px;font-weight:600;color:var(--ink2);
+            margin-top:2px;min-height:30px;line-height:1.3}
+        .exec-kpi-val{font-size:21px;font-weight:800;letter-spacing:-.02em;
+            font-variant-numeric:tabular-nums;margin-top:4px}
+        .exec-kpi-row{display:flex;align-items:center;justify-content:space-between;
+            gap:8px;margin-top:7px}
+        .exec-rank{font-size:10.5px;font-weight:600;color:var(--ink3)}
+        .spark-img{width:90px;height:24px;margin-top:8px}
+
+        .delta-chip{display:inline-flex;align-items:center;gap:3px;
+            font-size:10.5px;font-weight:700;font-variant-numeric:tabular-nums;
+            padding:2px 7px;border-radius:999px;white-space:nowrap}
+        .delta-chip.up{color:var(--good);background:color-mix(in srgb,var(--good) 12%,white)}
+        .delta-chip.down{color:var(--bad);background:color-mix(in srgb,var(--bad) 11%,white)}
+        .delta-chip.flat{color:var(--neutral);background:#f1f5f9}
+
+        /* ---------- analysis sections ---------- */
+        .control-row{display:flex;align-items:flex-end;gap:14px;flex-wrap:wrap;margin-bottom:14px}
+        .ctl{display:flex;flex-direction:column;gap:5px}
+        .ctl-label{font-size:10.5px;font-weight:700;letter-spacing:.07em;
+            text-transform:uppercase;color:var(--ink3)}
+        .peer-metric-wrap{flex:0 0 500px;max-width:610px;min-width:360px;
+            transition:flex-basis .2s ease}
+        .peer-def{font-size:11.5px;color:var(--ink3);line-height:1.5;
+            margin:2px 2px 14px;max-width:1100px}
+        .range-label{font-size:11.5px;font-weight:600;color:var(--ink3)}
+
+        .paired-row{display:flex;gap:16px;align-items:stretch}
+        .chart-col{flex:1 1 62%;min-width:0;display:flex}
+        .insight-col{flex:0 0 36%;min-width:300px;display:flex}
+        .chart-col .card,.insight-col .card{flex:1;min-height:432px;display:flex;flex-direction:column}
+        .insight-shell{flex:1;overflow-y:auto;min-height:0}
+
+        /* ---------- overview / analysis panels ---------- */
+        .ov-top{display:flex;align-items:center;justify-content:space-between;gap:14px}
+        .ov-val{font-size:30px;font-weight:800;letter-spacing:-.025em;
+            font-variant-numeric:tabular-nums;line-height:1.05}
+        .ov-unit{font-size:13px;font-weight:600;color:var(--ink3);margin-left:3px}
+        .ov-rank{font-size:12px;font-weight:600;color:var(--ink2);margin-top:5px}
+        .ov-stats{display:grid;grid-template-columns:1fr 1fr;gap:8px 14px;margin-top:14px}
+        .ov-stat{padding:8px 10px;background:#f8fafc;border:1px solid var(--line);
+            border-radius:var(--r-sm)}
+        .ov-stat-label{font-size:10px;font-weight:700;letter-spacing:.06em;
+            text-transform:uppercase;color:var(--ink3)}
+        .ov-stat-val{font-size:13.5px;font-weight:700;font-variant-numeric:tabular-nums;margin-top:2px}
+        .ov-mom-label{font-size:10.5px;font-weight:700;letter-spacing:.07em;
+            text-transform:uppercase;color:var(--ink3);margin:16px 0 6px}
+        .pct-arc{flex:0 0 auto}
+
+        .jpm-corr-card .corr-val{font-size:30px;font-weight:800;
+            font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+        .corr-label{font-size:11px;font-weight:700;letter-spacing:.06em;
+            text-transform:uppercase;color:var(--ink3)}
+        .corr-interp{font-size:12.5px;color:var(--ink2);line-height:1.55;margin-top:10px}
+
+        .emp{color:var(--ink3);font-size:13px;padding:18px 4px}
+        .warn-banner{margin-top:16px;padding:11px 16px;border-radius:var(--r-md);
+            background:#fffbeb;border:1px solid #fde68a;color:#92400e;
+            font-size:12.5px;font-weight:500}
+
+        /* ---------- All-Metrics detail ---------- */
+        .det-controls{display:flex;align-items:flex-end;gap:14px;flex-wrap:wrap}
+        .det-bank-wrap{flex:0 0 300px;min-width:240px;transition:flex-basis .2s ease}
+        .det-date-wrap{flex:0 0 190px}
+        .btn-export{appearance:none;border:none;cursor:pointer;font:inherit;
+            font-size:12.5px;font-weight:700;color:#fff;background:var(--jpm);
+            padding:9px 18px;border-radius:var(--r-sm);
+            box-shadow:0 2px 8px -2px rgba(0,94,184,.55);transition:all .15s ease}
+        .btn-export:hover{background:var(--jpm-dark);transform:translateY(-1px)}
+        .det-legend{font-size:11px;color:var(--ink3);margin-left:auto;align-self:center}
+        .det-cat{margin-top:18px;border:1px solid var(--line);border-radius:var(--r-md);overflow:hidden}
+        .det-cat-head{display:flex;align-items:center;gap:10px;padding:9px 14px;
+            font-size:12px;font-weight:800;letter-spacing:.03em}
+        .det-cat-count{margin-left:auto;font-size:10.5px;font-weight:600;color:var(--ink3)}
+        .det-row{display:grid;grid-template-columns:minmax(230px,2.1fr) minmax(95px,.9fr) 100px minmax(86px,.7fr) minmax(86px,.7fr);
+            gap:12px;align-items:center;padding:7px 14px;border-top:1px solid var(--line);
+            background:#fff;font-size:12.5px}
+        .det-row:nth-child(even){background:#fbfcfe}
+        .det-row:hover{background:#f4f8fd}
+        .det-hdr-row{font-size:10px;font-weight:700;letter-spacing:.07em;
+            text-transform:uppercase;color:var(--ink3);background:#fff}
+        .det-name{font-weight:600;color:var(--ink)}
+        .det-val{font-weight:700;font-variant-numeric:tabular-nums;text-align:right}
+        .det-delta{font-size:11.5px;font-weight:700;font-variant-numeric:tabular-nums;text-align:right}
+
+        /* ---------- reference guide (collapsible) ---------- */
+        .ref-wrap{column-width:300px;column-gap:14px;margin-top:6px}
+        details.ref-cat{break-inside:avoid;background:#fff;border:1px solid var(--line);
+            border-radius:var(--r-md);margin:0 0 14px;overflow:hidden}
+        .ref-summary{display:flex;align-items:center;gap:10px;list-style:none;
+            cursor:pointer;padding:10px 14px;user-select:none}
+        .ref-summary::-webkit-details-marker{display:none}
+        .ref-accent{width:4px;height:18px;border-radius:3px;flex:0 0 auto}
+        .ref-cat-label{font-size:12.5px;font-weight:700}
+        .ref-cat-count{margin-left:auto;font-size:10.5px;font-weight:600;color:var(--ink3)}
+        .ref-chev{flex:0 0 auto;color:var(--ink3);font-size:11px;
+            transition:transform .18s ease}
+        details[open] .ref-chev{transform:rotate(90deg)}
+        .ref-body{padding:2px 14px 12px;border-top:1px solid var(--line)}
+        .ref-row{padding:8px 0;border-bottom:1px dashed var(--line)}
+        .ref-row:last-child{border-bottom:none}
+        .ref-name{font-size:12px;font-weight:700}
+        .ref-desc{font-size:11.5px;color:var(--ink2);line-height:1.5;margin-top:2px}
+
+        /* ---------- dropdown theming (both react-select generations) ---------- */
+        .dd .Select-control,.dd [class*="-control"]{
+            border:1px solid var(--line2)!important;border-radius:var(--r-sm)!important;
+            min-height:38px!important;box-shadow:none!important;
+            font-size:13px;transition:border-color .15s ease}
+        .dd .Select-control:hover,.dd [class*="-control"]:hover{border-color:var(--jpm)!important}
+        .dd .is-focused .Select-control,.dd [class*="-control"][class*="-is-focused"],
+        .dd [class*="-control"]:focus-within{
+            border-color:var(--jpm)!important;box-shadow:0 0 0 3px rgba(0,94,184,.14)!important}
+        .dd .Select-menu-outer,.dd [class*="-menu"]{
+            border:1px solid var(--line2)!important;border-radius:var(--r-sm)!important;
+            box-shadow:var(--sh-2)!important;font-size:13px;z-index:80!important}
+        .dd .VirtualizedSelectFocusedOption,.dd [class*="-option"][class*="-is-focused"]{
+            background:#eef5fd!important;color:var(--ink)!important}
+        .dd [class*="-option"][class*="-is-selected"]{
+            background:var(--jpm)!important;color:#fff!important}
+        /* multi-select peer chips: compact, scrollable when 18 are selected */
+        .dd .Select--multi .Select-multi-value-wrapper,
+        .dd [class*="-control"] [class*="-ValueContainer"]{
+            max-height:88px;overflow-y:auto}
+        .dd .Select--multi .Select-value,.dd [class*="-multiValue"]{
+            background:#e8f2fc!important;border:1px solid rgba(0,94,184,.25)!important;
+            border-radius:5px!important;color:var(--jpm-dark)!important;
+            font-size:11.5px;font-weight:600}
+        .dd .Select--multi .Select-value-icon:hover,
+        .dd [class*="-multiValue"] [role="button"]:hover{
+            background:rgba(0,94,184,.18)!important;color:var(--jpm-dark)!important}
+
+        /* ---------- boot / error screens ---------- */
+        .boot-screen{min-height:100vh;display:flex;align-items:center;justify-content:center;
+            padding:28px;background:
+            radial-gradient(1100px 520px at 18% -10%,rgba(0,94,184,.16),transparent 60%),
+            radial-gradient(900px 480px at 100% 110%,rgba(11,79,138,.13),transparent 55%),
+            var(--bg)}
+        .boot-card{width:min(560px,94vw);background:#fff;border:1px solid var(--line);
+            border-radius:18px;box-shadow:var(--sh-2);padding:38px 40px;text-align:center}
+        .boot-mark{width:54px;height:54px;margin:0 auto;border-radius:14px;
+            display:flex;align-items:center;justify-content:center;
+            background:linear-gradient(135deg,#003B73,#005EB8);color:#fff;
+            font-size:17px;font-weight:800;letter-spacing:.02em;
+            box-shadow:0 10px 24px -8px rgba(0,94,184,.6)}
+        .boot-title{margin:18px 0 4px;font-size:17px;font-weight:800;letter-spacing:-.01em}
+        .boot-dots{display:flex;gap:7px;justify-content:center;margin:18px 0 14px}
+        .boot-dot{width:9px;height:9px;border-radius:50%;background:var(--jpm);
+            animation:bdot 1.25s ease-in-out infinite}
+        .boot-dot:nth-child(2){animation-delay:.18s}
+        .boot-dot:nth-child(3){animation-delay:.36s}
+        @keyframes bdot{0%,80%,100%{transform:scale(.66);opacity:.45}40%{transform:scale(1);opacity:1}}
+        .boot-msg{min-height:20px;font-size:13.5px;font-weight:600;color:var(--ink2)}
+        .boot-sub{margin-top:12px;font-size:11.5px;color:var(--ink3);line-height:1.55}
+        .boot-card--err .boot-mark{background:linear-gradient(135deg,#7f1d1d,#ef4444);
+            box-shadow:0 10px 24px -8px rgba(239,68,68,.55)}
+        .boot-err-msg{font-size:13px;color:var(--ink2);line-height:1.6;margin-top:8px}
+        .boot-note{font-style:italic;font-size:11.5px;color:var(--ink3);margin-top:14px}
+        .boot-retry{display:inline-block;margin-top:18px;padding:10px 22px;
+            border-radius:var(--r-sm);background:var(--jpm);color:#fff!important;
+            font-size:13px;font-weight:700;text-decoration:none;
+            box-shadow:0 2px 10px -2px rgba(0,94,184,.6);transition:all .15s ease}
+        .boot-retry:hover{background:var(--jpm-dark);transform:translateY(-1px)}
+
+        /* ---------- responsive ---------- */
+        @media (max-width:1180px){
+            .exec-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+            .paired-row{flex-direction:column}
+            .insight-col{flex:1 1 auto;min-width:0}
+            .chart-col .card,.insight-col .card{min-height:0}
+            .peer-metric-wrap{flex:1 1 100%;max-width:none;min-width:0}
+        }
+        @media (max-width:680px){
+            .hdr-inner,.main-wrap,.ftr{padding-left:16px;padding-right:16px}
+            .exec-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+            .det-row{grid-template-columns:minmax(150px,1.6fr) minmax(80px,1fr) minmax(76px,.8fr);}
+            .det-spark,.det-col-yoy{display:none}
+            .boot-card{padding:30px 22px}
+        }
+        @media (prefers-reduced-motion:reduce){
+            *,*::before,*::after{animation-duration:.001s!important;
+                transition-duration:.001s!important}
+        }
+    </style>
+</head>
+<body>
+    {%app_entry%}
+    <footer>
+        {%config%}
+        {%scripts%}
+        {%renderer%}
+    </footer>
+</body>
+</html>"""
+
+
+# =============================================================================
+# DASHBOARD BUILDER -- layout + figure/insight factories. Callbacks live at
+# module level (register_callbacks) so they can be registered before data
+# exists; every method here is pure given self.df.
+# =============================================================================
+class DashboardBuilder:
+    def __init__(self, df, cecl=None, missing_banks=None):
         self.df = df
-        self.missing_banks = sorted(missing_banks or [])
-        self.cecl_status = cecl_status or {}
-        self.raw_dates = sorted(df['Date'].unique())
-        self.loaded_banks = sorted(set(df['Bank'].unique()))
-        primary_df = df[df['Bank'] == self.GHB].sort_values('Date').reset_index(drop=True)
-        self._ghb_df = primary_df
-        self.primary_dates = sorted(primary_df['Date'].unique())
-        date_sets = [set(df.loc[df['Bank'] == bank, 'Date']) for bank in self.loaded_banks]
-        self.common_dates = sorted(set.intersection(*date_sets)) if date_sets else []
-        self.dates = self.primary_dates if self.primary_dates else self.raw_dates
-        self.analysis_start_date = self.dates[0] if self.dates else None
-        self.analysis_end_date = self.dates[-1] if self.dates else None
-        self.raw_latest_date = self.raw_dates[-1] if self.raw_dates else None
-        self.common_start_date = self.common_dates[0] if self.common_dates else None
-        self.common_latest_date = self.common_dates[-1] if self.common_dates else None
-
+        self.GHB = PRIMARY_BANK_DISPLAY_NAME
+        self.cecl = cecl or {}
+        self.missing_banks = missing_banks or []
         self.metrics = [m for m in METRIC_ORDER if m in df.columns]
-        self.peers = sorted(set(df['Bank'].unique()) - {self.GHB})
-        self._mo = [self._metric_option(m) for m in self.metrics]
-        self._do = [{'label': d.strftime('%m/%d/%Y'), 'value': d.strftime('%Y-%m-%d')}
-                    for d in reversed(self.dates)]
-        self._to = (
-            [{'label': f'{y} Yr', 'value': y} for y in [1, 2, 3, 4, 5, 7, 10, 15, 20]]
-            + [{'label': 'Full History', 'value': 'FULL'}]
-        )
-        self._def_metric = 'Return on Assets' if 'Return on Assets' in self.metrics else self.metrics[0]
-        self._def_r3_primary = 'Net Interest Margin' if 'Net Interest Margin' in self.metrics else self.metrics[0]
-        self._def_r3_secondary = 'Cost of Funding Earning Assets (YTD)' if 'Cost of Funding Earning Assets (YTD)' in self.metrics else (self.metrics[1] if len(self.metrics) > 1 else self.metrics[0])
-        if not self._ghb_df.empty:
-            self._ghb_date_index = {pd.Timestamp(d): i for i, d in enumerate(self._ghb_df['Date'])}
-        else:
-            self._ghb_date_index = {}
+        present = set(df['Bank'].unique())
+        self.banks = [b['display'] for b in BANK_INFO if b['display'] in present]
+        self.peers = [b for b in self.banks if b != self.GHB]
+        prim = df[df['Bank'] == self.GHB]
+        self.dates = sorted(prim['Date'].unique(), reverse=True) if not prim.empty \
+            else sorted(df['Date'].unique(), reverse=True)
+        self.latest = pd.Timestamp(self.dates[0]) if len(self.dates) else None
+        self.default_metric = ('Return on Assets' if 'Return on Assets' in self.metrics
+                               else (self.metrics[0] if self.metrics else None))
+        # Per-bank render caches (cleared only on process restart -- data is static).
+        self._bframes = {}
+        self._bd_cache = {}
 
-    def _ghb_idx(self, date):
-        return self._ghb_date_index.get(pd.Timestamp(date))
+    # ------------------------------------------------------------ small utils
+    def _metric_option(self, m):
+        return {'label': m, 'value': m}
 
-    def _ghb_value(self, metric, date):
-        idx = self._ghb_idx(date)
-        if idx is None or self._ghb_df.empty or metric not in self._ghb_df.columns:
-            return None
-        v = self._ghb_df.iloc[idx][metric]
-        return None if pd.isna(v) else v
+    def _mdd(self, did, value, options, multi=False, clearable=False, placeholder=None):
+        return dcc.Dropdown(id=did, options=options, value=value, multi=multi,
+                            clearable=clearable, placeholder=placeholder,
+                            className='dd')
 
-    def _ghb_qoq_yoy(self, metric, date):
-        idx = self._ghb_idx(date)
-        if idx is None or self._ghb_df.empty or metric not in self._ghb_df.columns:
-            return (None, None)
-        # QoQ only when the immediately-preceding row is truly ~1 quarter back
-        # (75-100 days); a missing quarter must not be mislabeled as "QoQ".
-        prev_dt = self._ghb_df.iloc[idx - 1]['Date'] if idx >= 1 else None
-        qoq_val = (self._ghb_df.iloc[idx - 1][metric]
-                   if idx >= 1 and 75 <= (pd.Timestamp(date) - prev_dt).days <= 100
-                   else None)
-        target_yoy = pd.Timestamp(date) - pd.DateOffset(years=1)
-        yoy_val = None
-        best_j = None
-        best_diff = None
-        for j in range(idx):
-            d = self._ghb_df.iloc[j]['Date']
-            diff = abs((d - target_yoy).days)
-            if best_diff is None or diff < best_diff:
-                best_diff = diff
-                best_j = j
-        if best_j is not None and best_diff <= PRIOR_PERIOD_TOLERANCE_DAYS:
-            yoy_val = self._ghb_df.iloc[best_j][metric]
-        if qoq_val is not None and pd.isna(qoq_val):
-            qoq_val = None
-        if yoy_val is not None and pd.isna(yoy_val):
-            yoy_val = None
-        return (qoq_val, yoy_val)
+    def _date_options(self):
+        return [{'label': pd.Timestamp(d).strftime('%m/%d/%Y'), 'value': str(pd.Timestamp(d))}
+                for d in self.dates]
 
-    def _ghb_spark(self, metric, end_date, lookback=None):
-        if lookback is None:
-            lookback = self.SPARK_LOOKBACK
-        idx = self._ghb_idx(end_date)
-        if idx is None or self._ghb_df.empty or metric not in self._ghb_df.columns:
-            return []
-        start = max(0, idx - lookback + 1)
-        return self._ghb_df.iloc[start:idx + 1][metric].tolist()
+    def _fmt(self, v, m):
+        return fmt_val(v, m, with_unit=True)
 
-    def create_dashboard(self):
-        app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP],
-                        meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}])
-        app.title = DASHBOARD_TITLE
-        app.config.suppress_callback_exceptions = True
-        app.index_string = self._css()
-        app.layout = self._layout()
-        self._cbs(app)
-        return app
+    def _bank_frame(self, bank):
+        if bank not in self._bframes:
+            self._bframes[bank] = self.df[self.df['Bank'] == bank].sort_values('Date')
+        return self._bframes[bank]
 
-    def _mdd(self, id_, v=None, c="idd-m"):
-        return dcc.Dropdown(id=id_, options=self._mo, value=v or self._def_metric,
-                            clearable=False, optionHeight=66, className=c,
-                            placeholder="Search metrics...")
+    def _bank_qoq_yoy(self, bank, metric, date):
+        return compute_period_deltas(self.df, bank, metric, date)
 
-    def _window_bounds(self, y, end=None, bank_filter=None):
-        if end is None:
-            end = self.analysis_end_date if self.analysis_end_date is not None else self.df['Date'].max()
-        end_ts = pd.Timestamp(end)
-        if str(y).upper() == 'FULL':
-            if bank_filter:
-                subset = self.df[self.df['Bank'].isin(bank_filter)]
-                if not subset.empty:
-                    return pd.Timestamp(subset['Date'].min()), end_ts
-            if self.analysis_start_date is not None:
-                return pd.Timestamp(self.analysis_start_date), end_ts
-            return pd.Timestamp(self.df['Date'].min()), end_ts
-        try:
-            years = int(y)
-        except (TypeError, ValueError):
-            years = 4
-        start_ts = end_ts - pd.DateOffset(years=years)
-        if self.analysis_start_date is not None:
-            start_ts = max(pd.Timestamp(self.analysis_start_date), start_ts)
-        return start_ts, end_ts
+    def _bank_spark(self, bank, metric, lookback=8):
+        return get_sparkline_series(self.df, bank, metric, lookback)
 
-    @staticmethod
-    def _window_label(y, start, end):
-        return f"{pd.Timestamp(start).strftime('%m/%Y')}\u2013{pd.Timestamp(end).strftime('%m/%Y')}"
+    def _window_bounds(self, banks, years):
+        sub = self.df[self.df['Bank'].isin(banks)]
+        if sub.empty:
+            return None, None
+        end = sub['Date'].max()
+        start = end - pd.DateOffset(years=years)
+        return start, end
 
-    @staticmethod
-    def _axis_for_window(start, end):
-        span_years = max((pd.Timestamp(end) - pd.Timestamp(start)).days / 365.25, 0)
-        if span_years <= 2:
-            return 'M3', '%b %Y'
-        if span_years <= 4:
-            return 'M6', '%b %Y'
-        if span_years <= 10:
-            return 'M12', '%Y'
-        if span_years <= 18:
-            return 'M24', '%Y'
-        return 'M36', '%Y'
+    def _window_label(self, start, end):
+        if start is None or end is None:
+            return ""
+        return f"{start.strftime('%m/%Y')}\u2013{end.strftime('%m/%Y')}"
 
-    def _tdd(self, id_):
-        return dcc.Dropdown(id=id_, options=self._to, value=10, clearable=False,
-                            searchable=False, className="idd-t")
-
-    def _dfoot(self, id_):
-        return html.Div(id=id_, className="dfoot")
-
-    def _exec_banner(self, selected_peers=None):
-        latest_date = self.analysis_end_date
-        if latest_date is None:
-            return html.Div("No JPMorgan reporting date available", className="exec-banner")
-        peer_selection = self.peers if selected_peers is None else selected_peers
-        cohort = [self.GHB] + list(peer_selection)
-        cohort_df = self.df[self.df['Bank'].isin(cohort)]
-        cards = []
-        for metric, label in EXECUTIVE_KPIS:
-            if metric not in self.metrics:
-                continue
-            curr = self._ghb_value(metric, latest_date)
-            qoq_prev, yoy_prev = self._ghb_qoq_yoy(metric, latest_date)
-            qoq_text, qoq_color = fmt_delta(curr, qoq_prev, metric)
-            spark_vals = self._ghb_spark(metric, latest_date, self.SPARK_LOOKBACK)
-            rank, total, pctl = compute_peer_rank(cohort_df, latest_date, metric, self.GHB)
-            has_peer_context = total > 1
-            rank_color = CS['text3'] if has_peer_context and rank else CS['light']
-            rank_text = f"#{rank}/{total}" if has_peer_context and rank else "\u2014"
-            val_display = fmt_val(curr, metric, with_unit=True)
-            card = html.Div([
-                html.Div([
-                    html.Span(label, className="exec-label"),
-                    html.Span(rank_text, className="exec-rank",
-                              style={'color': rank_color, 'borderColor': rank_color}),
-                ], className="exec-hdr"),
-                html.Div(val_display, className="exec-val"),
-                html.Div(metric, className="exec-metric-name"),
-                html.Div([make_sparkline_img(spark_vals, width=110, height=26)], className="exec-spark"),
-                html.Div([
-                    html.Span("QoQ", className="exec-delta-label"),
-                    html.Span(qoq_text, className="exec-delta-val", style={'color': qoq_color}),
-                ], className="exec-delta"),
-            ], className="exec-card")
-            cards.append(card)
-        latest_peer_rows = cohort_df[(cohort_df['Date'] == pd.Timestamp(latest_date)) & (cohort_df['Bank'] != self.GHB)]
-        available_peers = latest_peer_rows['Bank'].nunique()
-        peer_note = f"JPM benchmark vs available selected SIB peers: {available_peers}/{len(peer_selection)}"
-        return html.Div([
-            html.Div([
-                html.Div([
-                    html.Span("JPMorgan Executive Snapshot", className="exec-banner-title"),
-                    html.Span(f"Latest reported period \u00b7 {pd.Timestamp(latest_date).strftime('%b %d, %Y')} \u00b7 {peer_note}",
-                              className="exec-banner-date"),
-                ], className="exec-banner-hdr"),
-                html.Div(cards, className="exec-grid"),
-            ], className="exec-banner-inner"),
-        ], className="exec-banner")
-
-    def _missing_data_banner(self):
-        scope_lines = [
-            ("Source", "FDIC BankFind API financials endpoint."),
-            ("History", f"FDIC financial history begins with the {REQUESTED_START_DATE_DISPLAY} report period."),
-            ("Peer coverage", f"Full common peer coverage starts {COMMON_FULL_PEER_START_DATE_DISPLAY}; before that, coverage varies by charter/history."),
-            ("Peer math", "Stats use only banks with real data for the selected date/window."),
-        ]
-        if self.common_start_date is not None and self.analysis_start_date is not None:
-            computed_common = pd.Timestamp(self.common_start_date).strftime('%m/%d/%Y')
-            if (pd.Timestamp(self.common_start_date) > pd.Timestamp(self.analysis_start_date)
-                    and computed_common != COMMON_FULL_PEER_START_DATE_DISPLAY):
-                scope_lines.append(
-                    ("Loaded-data check", f"All currently loaded banks share data beginning {computed_common}."))
-        if self.missing_banks:
-            missing = ', '.join(self.missing_banks)
-            scope_lines.append(
-                ("Missing banks", f"{missing}. Stats exclude these banks until a complete FDIC fetch succeeds."))
-        if (self.raw_latest_date is not None and self.analysis_end_date is not None
-                and pd.Timestamp(self.raw_latest_date) > pd.Timestamp(self.analysis_end_date)):
-            scope_lines.append(
-                ("Latest-period lag", "JPMorgan's latest available report period is "
-                 f"{pd.Timestamp(self.analysis_end_date).strftime('%m/%d/%Y')}; "
-                 f"the raw FDIC peer set includes a newer period of {pd.Timestamp(self.raw_latest_date).strftime('%m/%d/%Y')}."))
-
-        # Segment-level asset-quality detail (NCO / nonaccrual / 90+ / 30-89 by loan type).
-        scope_lines.append(
-            ("Segment asset quality",
-             f"Net charge-offs, nonaccrual, 90+ DPD and 30-89 DPD are broken out across {len(SEG_LABELS)} "
-             "loan segments. Stock rates use point-in-time end-of-period segment denominators (RC-N cols "
-             "C/B/A); segment NCO rates use YTD net charge-offs annualized over the CAVG5 5-quarter average "
-             "(UBPR PCTOFANN), consistent with the published total (NTLNLSR). NFNR owner/non-owner splits "
-             "start 2007Q1 and the auto breakout starts 2011Q1; earlier periods read N/A, never fabricated."))
-
-        # CECL transition adjustment status (concentration denominator).
-        cecl = self.cecl_status or {}
-        if cecl.get('enabled'):
-            if cecl.get('active'):
-                scope_lines.append(
-                    ("CECL transition",
-                     "Concentration ratios (\u2026 to Tier 1 + ACL) net the CECL transitional add-back "
-                     "out of Tier 1 during 2020\u20132024, per OCC Bulletin 2020-90 and Fed SR 20-8, "
-                     f"matching UBPR Page 7B. Applied to {cecl.get('applied_rows', 0)} bank-quarter(s); "
-                     "pre-2020 and 2025+ are unaffected."))
-            else:
-                scope_lines.append(
-                    ("CECL transition",
-                     "Adjustment enabled, but the source retained-earnings fields did not resolve from "
-                     "the FDIC API, so concentration ratios use as-reported Tier 1 + ACL "
-                     "(\u2248 1.9% high in 2020, \u2248 0.4% high in 2023, exact 2025+). Configure the "
-                     "CECL_*_FIELDS names to activate."))
-        else:
-            scope_lines.append(
-                ("CECL transition",
-                 "Adjustment disabled; concentration ratios use as-reported Tier 1 + ACL."))
-
-        return html.Div([
-            html.Div([
-                html.Div([
-                    html.Span("FDIC Data Scope", className="scope-title scope-title-pill"),
-                    html.Span(f"{PEER_UNIVERSE_LABEL} \u00b7 {len(BANK_INFO)} banks \u00b7 {len(METRIC_ORDER)} metrics",
-                              className="scope-meta"),
-                ], className="scope-title-wrap"),
-            ], className="scope-hdr"),
-            html.Div([
-                html.Div([
-                    html.Span(k, className="scope-k"),
-                    html.Span(v, className="scope-v"),
-                ], className="scope-line") for k, v in scope_lines
-            ], className="scope-lines")
-        ], className="data-scope-banner")
-
-    def _layout(self):
-        dv = self._do[0]['value'] if self._do else None
-        chart_style = {'height': f'{PAIRED_GRAPH_HEIGHT}px'}
-        return html.Div([
-            html.Div([
-                html.Div([
-                    html.Div(PRIMARY_BANK_ABBR, className="hdr-mark"),
-                    html.Div([
-                        html.Span(PRIMARY_BANK_DISPLAY_NAME, className="hdr-title"),
-                        html.Span(DASHBOARD_SHORT_TITLE + " \u00b7 " + PEER_UNIVERSE_LABEL, className="hdr-sub")
-                    ])
-                ], className="hdr-brand"),
-                html.Div([
-                    html.Div([
-                        html.Span(f"FDIC API \u00b7 SIB peer set \u00b7 since {REQUESTED_START_DATE_DISPLAY}", className="hdr-src"),
-                        html.Span(f"\u00b7 {len(METRIC_ORDER)} metrics", className="hdr-cnt"),
-                        html.Span(f"\u00b7 {len(BANK_INFO)} banks", className="hdr-cnt")
-                    ], className="hdr-meta-line"),
-                    html.Span(HEADER_DISCLOSURE_SHORT, className="hdr-disclaimer")
-                ], className="hdr-meta")
-            ], className="hdr"),
-            html.Div([
-                html.Div(self._exec_banner(self.peers), id='exec-banner-wrap'),
-                html.Div([
-                    html.Div([
-                        html.Div([
-                            html.Div([
-                                html.Span("Metric", className="peer-control-label"),
-                                self._mdd('peer-metric', c="idd-m peer-metric-dd"),
-                            ], className="peer-control peer-control-metric", id="peer-metric-control-wrap"),
-                            html.Div([
-                                html.Span("As-of Date", className="peer-control-label"),
-                                dcc.Dropdown(id='r1d', options=self._do, value=dv, clearable=False,
-                                             searchable=False, className="idd-d peer-date-dd")
-                            ], className="peer-control peer-control-date", id="peer-date-control-wrap"),
-                            html.Div([
-                                html.Span("Selected Peers", className="peer-control-label"),
-                                html.Div([
-                                    dcc.Dropdown(id='peer-sel',
-                                                 options=[{'label': p, 'value': p} for p in self.peers],
-                                                 value=self.peers, multi=True, className="tb-dd peer-sel-dd",
-                                                 placeholder="Select SIB peers..."),
-                                    html.Div([
-                                        html.Button("All", id="sel-all", className="tb-btn peer-btn"),
-                                        html.Button("Clear", id="sel-clear", className="tb-btn tb-btn-secondary peer-btn")
-                                    ], className="peer-actions")
-                                ], className="peer-select-row")
-                            ], className="peer-control peer-control-peers"),
-                        ], className="peer-control-grid")
-                    ], className="peer-perf-top peer-perf-controls-only"),
-                    html.Div([
-                        dbc.Row([
-                            dbc.Col(html.Div([
-                                html.Div([
-                                    html.H6("Peer Snapshot", className="ct"),
-                                    html.Span("Point-in-time peer ranking and distribution", className="section-title-note")
-                                ], className="ch ch-wrap"),
-                                html.Div([
-                                    dcc.Loading(dcc.Graph(id='r1c', config=GRAPH_CONFIG,
-                                                          style=chart_style, className="viz-graph"),
-                                                type="dot", color=CS['primary'])
-                                ], className="viz-shell"),
-                            ], className="peer-panel pair-card pair-card-chart"), md=7, className="mb-3 pair-col"),
-                            dbc.Col(html.Div([
-                                html.Div([html.H6("Snapshot Stats", className="ct")], className="ch"),
-                                html.Div([
-                                    dcc.Loading(html.Div(id='r1o', className="insight-shell overview-shell"),
-                                                type="dot", color=CS['primary'])
-                                ], className="insight-load-shell")
-                            ], className="peer-panel pair-card pair-card-side"), md=5, className="mb-3 pair-col")
-                        ], className="paired-row peer-subrow"),
-                    ], className="peer-section peer-section-snapshot"),
-                    html.Div([
-                        dbc.Row([
-                            dbc.Col(html.Div([
-                                html.Div([
-                                    html.H6("Peer Trend", className="ct"),
-                                    html.Span("Same metric through selected as-of date", className="section-title-note"),
-                                    html.Div(style={"flex": "1"}),
-                                    self._tdd('r2t'),
-                                    html.Span(id='r2r', className="rng")
-                                ], className="ch ch-wrap"),
-                                html.Div([
-                                    dcc.Loading(dcc.Graph(id='r2c', config=GRAPH_CONFIG,
-                                                          style=chart_style, className="viz-graph"),
-                                                type="dot", color=CS['primary'])
-                                ], className="viz-shell"),
-                            ], className="peer-panel pair-card pair-card-chart"), md=7, className="mb-3 pair-col"),
-                            dbc.Col(html.Div([
-                                html.Div([html.H6("Trend Stats", className="ct")], className="ch"),
-                                html.Div([
-                                    dcc.Loading(html.Div(id='r2a', className="insight-shell analysis-shell"),
-                                                type="dot", color=CS['primary'])
-                                ], className="insight-load-shell")
-                            ], className="peer-panel pair-card pair-card-side"), md=5, className="mb-3 pair-col")
-                        ], className="paired-row peer-subrow"),
-                    ], className="peer-section peer-section-trend"),
-                    html.Div(id='peer-def', className="dfoot peer-def-wrap"),
-                ], className="card peer-performance-card mb-3"),
-                html.Div([
-                    html.Div([
-                        html.Div([
-                            html.Div("JPMorgan Correlation Analysis", className="corr-title-main"),
-                        ], className="corr-title-block"),
-                        html.Div([
-                            html.Div([
-                                html.Span("Primary Metric", className="peer-control-label"),
-                                self._mdd('r3p', self._def_r3_primary, "idd-m idd-m2 corr-metric-dd"),
-                            ], className="peer-control corr-control-metric"),
-                            html.Div([
-                                html.Span("Secondary Metric", className="peer-control-label"),
-                                self._mdd('r3s', self._def_r3_secondary, "idd-m idd-m2 corr-metric-dd"),
-                            ], className="peer-control corr-control-metric"),
-                            html.Div([
-                                html.Span("Timeline", className="peer-control-label"),
-                                self._tdd('r3t')
-                            ], className="peer-control corr-control-timeline"),
-                        ], className="corr-control-grid"),
-                    ], className="corr-header-grid"),
-                    dbc.Row([
-                        dbc.Col(html.Div([
-                            html.Div([
-                                html.H6("Metric Correlation", className="ct"),
-                                html.Span("Compares the selected metrics over the chosen timeline", className="section-title-note")
-                            ], className="ch ch-wrap"),
-                            html.Div([
-                                dcc.Loading(dcc.Graph(id='r3c', config=GRAPH_CONFIG,
-                                                      style=chart_style, className="viz-graph"),
-                                            type="dot", color=CS['primary'])
-                            ], className="viz-shell"),
-                            self._dfoot('r3f')
-                        ], className="corr-panel pair-card pair-card-chart"), md=7, className="mb-3 pair-col"),
-                        dbc.Col(html.Div([
-                            html.Div([html.H6("Metric Correlation Stats", className="ct")], className="ch"),
-                            html.Div([
-                                dcc.Loading(html.Div(id='r3x', className="insight-shell analysis-shell"),
-                                            type="dot", color=CS['primary'])
-                            ], className="insight-load-shell")
-                        ], className="corr-panel pair-card pair-card-side"), md=5, className="mb-3 pair-col")
-                    ], className="paired-row corr-subrow"),
-                ], className="card jpm-corr-card mb-3"),
-                html.Div([
-                    html.Div([
-                        html.Div([
-                            html.H6("JPMorgan Chase \u2014 All Metrics", className="ct", style={"color": "#fff"}),
-                            dcc.Dropdown(id='det-date', options=self._do, value=dv,
-                                         clearable=False, searchable=False, className="idd-d-light"),
-                            html.Div([
-                                html.Span("\u25b8", className="legend-dot", style={'color': CS['good']}),
-                                html.Span("Favorable", className="legend-txt"),
-                                html.Span("\u25b8", className="legend-dot", style={'color': CS['bad']}),
-                                html.Span("Unfavorable", className="legend-txt"),
-                            ], className="det-legend"),
-                            html.Div(style={"flex": "1"}),
-                            html.Button([
-                                html.Span("\u21e9", style={"marginRight": "5px", "fontSize": "13px"}),
-                                "Export All Periods"
-                            ], id="export-btn", className="export-btn"),
-                            dcc.Download(id="export-download")
-                        ], className="ch det-hdr"),
-                        dcc.Loading(html.Div(id='det'), type="dot", color=CS['primary'])
-                    ], className="card det-card")
-                ], className="mb-4"),
-                self._reference_section(),
-                html.Div([
-                    self._missing_data_banner(),
-                    html.Div([
-                        html.Div("Dashboard notes", className="dashboard-footer-label"),
-                        html.Div([
-                            html.Span("Metrics follow UBPR-style definitions across "),
-                            html.Span(f"{len(METRIC_CATEGORIES)} categories", className="dashboard-footer-emph"),
-                            html.Span(". Peer ranks, percentiles, volatility, and correlation stats are dashboard-computed comparisons. "),
-                            html.Span(FOOTER_DISCLOSURE_NOTE, className="dashboard-footer-muted"),
-                        ], className="dashboard-footer-text")
-                    ], className="dashboard-footer-note"),
-                ], className="dashboard-footer"),
-            ], className="main")
-        ])
-
-    def _reference_section(self):
-        sections = []
-        for ci, (cat_name, cat_metrics) in enumerate(METRIC_CATEGORIES):
-            rows = []
-            for m in cat_metrics:
-                d = METRIC_DEFINITIONS.get(m, '')
-                parts = d.split(' \xb7 ', 1)
-                txt = parts[1] if len(parts) == 2 else d
-                rows.append(html.Div([
-                    html.Div(m, className="ref-name"),
-                    html.Div(txt, className="ref-desc")
-                ], className="ref-row"))
-            accent = CATEGORY_ACCENTS.get(cat_name, CS['primary'])
-            sections.append(html.Div([
-                html.Div([
-                    html.Div(style={"width": "3px", "background": accent,
-                                    "borderRadius": "2px", "flexShrink": "0"}),
-                    html.Span(cat_name, className="ref-cat-label"),
-                    html.Span(f"{len(cat_metrics)} metrics", className="ref-cat-count")
-                ], className="ref-cat"),
-                html.Div(rows, className="ref-body")
-            ], className="ref-section"))
-        return html.Div([
-            html.Div([
-                html.H6("Metric Reference Guide", className="ct"),
-                html.Span(f"{len(METRIC_ORDER)} metrics across {len(METRIC_CATEGORIES)} categories "
-                          f"\xb7 Verify UBPR concept codes at ffiec.gov/data/ubpr/report-user-guide",
-                          className="rng")
-            ], className="ch"),
-            html.Div(sections, className="ref-wrap")
-        ], className="card ref-card")
-
-    def _cbs(self, app):
-        @app.callback(Output('peer-sel', 'value'),
-                      [Input('sel-all', 'n_clicks'), Input('sel-clear', 'n_clicks')],
-                      State('peer-sel', 'options'))
-        def sel_action(n_all, n_clear, options):
-            ctx = dash.callback_context
-            if not ctx.triggered:
-                raise PreventUpdate
-            trig = ctx.triggered[0]['prop_id'].split('.')[0]
-            if trig == 'sel-all' and n_all:
-                return [x['value'] for x in options]
-            if trig == 'sel-clear' and n_clear:
-                return []
-            raise PreventUpdate
-
-        @app.callback(Output('exec-banner-wrap', 'children'), Input('peer-sel', 'value'))
-        def ue(p):
-            return self._exec_banner(p or [])
-
-        @app.callback(Output('peer-def', 'children'), Input('peer-metric', 'value'))
-        def d_peer(m):
-            return self._peer_metric_definition(m)
-
-        @app.callback(Output('peer-metric-control-wrap', 'style'), Input('peer-metric', 'value'))
-        def resize_peer_metric_control(metric):
-            """Keep the peer metric selector compact, but let it breathe.
-
-            Dash/React Select does not expose the rendered label width directly, so
-            this uses a conservative character-based width estimate and clamps it
-            to a narrow range. The surrounding flex row then naturally slides the
-            As-of Date box right/left without stretching the metric selector across
-            the full peer section.
-            """
-            label = str(metric or self._def_metric or "")
-            estimated_width = 330 + (len(label) * 5.8)
-            width = int(max(460, min(610, estimated_width)))
-            return {
-                'flex': f'0 0 {width}px',
-                'maxWidth': f'{width}px',
-                'minWidth': '360px',
-                'transition': 'flex-basis 180ms ease, max-width 180ms ease',
-            }
-
-        @app.callback(Output('r3f', 'children'), [Input('r3p', 'value'), Input('r3s', 'value')])
-        def d3(a, b):
-            return html.Div([self._rdef(a, "Primary"), self._rdef(b, "Secondary")])
-
-        @app.callback([Output('r1c', 'figure'), Output('r1o', 'children')],
-                      [Input('peer-metric', 'value'), Input('r1d', 'value'), Input('peer-sel', 'value')])
-        def u1(m, ds, p):
-            if not m or not ds:
-                return self._ef(""), html.Div()
-            dt = pd.to_datetime(ds)
-            bk = [self.GHB] + (p or [])
-            f = self.df[(self.df['Date'] == dt) & self.df['Bank'].isin(bk)]
-            if f.empty:
-                return self._ef("No data"), html.Div()
-            return self._bar(f.sort_values(m, ascending=is_inverse_metric(m)), m, dt), self._ov(f, m, dt)
-
-        @app.callback([Output('r2c', 'figure'), Output('r2a', 'children'), Output('r2r', 'children')],
-                      [Input('peer-metric', 'value'), Input('peer-sel', 'value'),
-                       Input('r2t', 'value'), Input('r1d', 'value')])
-        def u2(m, p, y, ds):
-            if not m:
-                return self._ef(""), html.Div(), ""
-            bk = [self.GHB] + (p or [])
-            end = pd.to_datetime(ds) if ds else (self.analysis_end_date if self.analysis_end_date is not None else self.df['Date'].max())
-            start_ts, end_ts = self._window_bounds(y, end=end, bank_filter=bk)
-            return self._trend(bk, m, y, end_date=end), self._ta(bk, m, y, end_date=end), self._window_label(y, start_ts, end_ts)
-
-        @app.callback([Output('r3c', 'figure'), Output('r3x', 'children')],
-                      [Input('r3p', 'value'), Input('r3s', 'value'), Input('r3t', 'value')])
-        def u3(a, b, y):
-            if not a or not b:
-                return self._ef(""), html.Div()
-            return self._dual(a, b, y), self._corr(a, b, y)
-
-        @app.callback(Output('det', 'children'), Input('det-date', 'value'))
-        def ud(ds):
-            if not ds:
-                return html.P("Select a date", className="emp")
-            dt = pd.to_datetime(ds)
-            bf = self.df[(self.df['Bank'] == self.GHB) & (self.df['Date'] == dt)]
-            if bf.empty:
-                return html.P("No data for this date", className="emp")
-            return self._bd(bf.iloc[0], dt)
-
-        @app.callback(Output('export-download', 'data'), Input('export-btn', 'n_clicks'),
-                      prevent_initial_call=True)
-        def export_all_periods(n_clicks):
-            if not n_clicks:
-                raise PreventUpdate
-            xlsx_bytes = build_primary_bank_export(self.df)
-            if xlsx_bytes is None:
-                raise PreventUpdate
-            return dcc.send_bytes(xlsx_bytes,
-                                  f"JPMorgan_SIB_Metrics_All_Periods_{datetime.now().strftime('%Y%m%d')}.xlsx")
-
-    def _rdef(self, m, label=None):
-        d = METRIC_DEFINITIONS.get(m, '')
-        if not d:
-            return None
-        parts = d.split(' \xb7 ', 1)
-        cat = parts[0] if len(parts) == 2 else ""
-        txt = parts[1] if len(parts) == 2 else d
-        pre = f"{label}: " if label else ""
-        return html.Div([
-            html.Span(f"{pre}{cat}", className="df-cat") if cat else None,
-            html.Span(f" {txt}", className="df-txt")
-        ], className="df-line")
+    def _rdef(self, m, prefix=None):
+        if not m:
+            return html.Div()
+        txt = METRIC_DEFINITIONS.get(m, "No definition available.")
+        label = f"{prefix}: {m}" if prefix else m
+        return html.Div([html.Span(label + " \u2014 ", style={'fontWeight': 700}),
+                         html.Span(txt)], className='peer-def')
 
     def _peer_metric_definition(self, m):
-        d = METRIC_DEFINITIONS.get(m, '')
-        if not d:
-            return None
-        parts = d.split(' \xb7 ', 1)
-        txt = parts[1] if len(parts) == 2 else d
-        return html.Div([
-            html.Span("Metric Definition", className="df-cat"),
-            html.Span(f" {txt}", className="df-txt")
-        ], className="df-line")
+        return self._rdef(m)
 
-    @staticmethod
-    def _fmt(v, m=None):
-        return fmt_val(v, m)
-
-    def _ef(self, msg):
+    def _ef(self, msg=""):
         fig = go.Figure()
-        fig.update_layout(annotations=[dict(text=msg, xref="paper", yref="paper",
-                                             showarrow=False,
-                                             font=dict(size=13, color=CS['text2']))],
-                          xaxis=dict(visible=False), yaxis=dict(visible=False),
-                          plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
-                          margin=dict(l=20, r=20, t=20, b=20), dragmode=False)
-        return self._lock_chart_view(fig)
+        fig.update_layout(template='plotly_white', height=PAIRED_GRAPH_HEIGHT,
+                          margin=dict(l=10, r=10, t=10, b=10),
+                          xaxis={'visible': False}, yaxis={'visible': False},
+                          annotations=[dict(text=msg or "", showarrow=False,
+                                            font=dict(size=13, color=CS['text3']))])
+        return self._bl(fig)
 
-    def _bl(self, **kw):
-        return dict(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
-                    font=dict(family="'Inter',sans-serif", color=CS['text'], size=11),
-                    hoverlabel=dict(bgcolor="white", font_size=11, font_color=CS['text'],
-                                    font_family="'Inter',sans-serif", bordercolor=CS['border']),
-                    dragmode=False,
-                    **kw)
-
-    def _lock_chart_view(self, fig):
+    def _bl(self, fig):
+        """Lock the chart view: hover-only interaction, no zoom/pan artifacts."""
+        fig.update_layout(dragmode=False, hoverlabel=dict(
+            bgcolor='white', bordercolor=CS['border_strong'],
+            font=dict(family='Inter, sans-serif', size=12, color=CS['text'])))
         fig.update_xaxes(fixedrange=True)
         fig.update_yaxes(fixedrange=True)
         return fig
 
-    def _bar(self, df, m, dt):
-        isdol = is_dollar_metric(m)
-        ispct = is_percent_metric(m)
-        inverse = is_inverse_metric(m)
-        with_vals = df[['Bank', m]].dropna()
-        if not with_vals.empty:
-            rank_series = with_vals[m].rank(method='min', ascending=inverse).astype(int)
-            rank_map = dict(zip(with_vals['Bank'], rank_series))
-        else:
-            rank_map = {}
-        def bar_color(bank):
-            return CS['ghb'] if bank == self.GHB else CS['peer']
-        c = [bar_color(b) for b in df['Bank']]
-        o = [1.0 if b == self.GHB else 0.72 for b in df['Bank']]
-        hover_vals = [fmt_val(v, m, with_unit=True) for v in df[m]]
-        ht = '<b>%{x}</b><br>%{customdata}<extra></extra>'
-        rank_texts = [(f"#{rank_map[b]}" if b in rank_map else "") for b in df['Bank']]
-        fig = go.Figure(go.Bar(x=df['Bank'], y=df[m], customdata=hover_vals,
-                               marker_color=c, marker_opacity=o,
-                               marker_line_width=0, hovertemplate=ht,
-                               text=rank_texts, textposition='outside',
-                               textfont=dict(size=10, color=CS['text2'], family="'Inter',sans-serif"),
-                               cliponaxis=False))
-        v = df[m].dropna()
-        mn, mx = (v.min(), v.max()) if len(v) else (0, 1)
-        pad = max((mx - mn) * 0.22, 0.01)
-        peer_vals = df[df['Bank'] != self.GHB][m].dropna()
-        if len(peer_vals) > 0:
-            pavg = peer_vals.mean()
-            ann_txt = f"Peer Avg: {fmt_val(pavg, m, with_unit=True)}"
-            fig.add_hline(y=pavg, line_dash="dot", line_color=CS['text3'], line_width=1,
-                          annotation_text=ann_txt, annotation_position="top right",
-                          annotation_font_size=9, annotation_font_color=CS['text2'])
-        if len(v):
-            if mn >= 0:
-                y_min = 0
-            elif mx <= 0:
-                y_min = mn - pad
-            else:
-                y_min = mn - pad
-            y_max = mx + pad if mx != 0 else pad
-        else:
-            y_min, y_max = 0, 1
-        tfmt = ',.0f' if isdol else '.2f'
-        y_title = '$000s' if isdol else ('%' if ispct else None)
-        fig.update_layout(**self._bl(
-            margin=dict(l=48, r=12, t=24, b=68),
-            xaxis=dict(tickangle=-35, tickfont=dict(size=9.5), showgrid=False, showline=False),
-            yaxis=dict(title_text=y_title, title_font=dict(size=9, color=CS['text3']),
-                       tickformat=tfmt, range=[y_min, y_max], showgrid=True,
-                       gridcolor=CS['grid'], showline=False, tickfont=dict(size=9.5),
-                       zeroline=True, zerolinecolor=CS['border_strong']),
-            bargap=0.35))
-        return self._lock_chart_view(fig)
+    def _base_fig_layout(self, fig, height=PAIRED_GRAPH_HEIGHT):
+        fig.update_layout(
+            template='plotly_white', height=height,
+            margin=dict(l=14, r=14, t=12, b=12),
+            font=dict(family='Inter, sans-serif', size=11.5, color=CS['text2']),
+            paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+            legend=dict(orientation='h', yanchor='bottom', y=1.01, x=0,
+                        font=dict(size=10.5)),
+        )
+        fig.update_xaxes(gridcolor=CS['grid'], zeroline=False)
+        fig.update_yaxes(gridcolor=CS['grid'], zeroline=False)
+        return fig
 
-    def _ov(self, df, m, dt):
-        isdol = is_dollar_metric(m)
-        inverse = is_inverse_metric(m)
-        gh = df[df['Bank'] == self.GHB]
-        gv = gh[m].values[0] if not gh.empty else None
-        if gv is not None and pd.isna(gv):
-            gv = None
-        peer_df = df[df['Bank'] != self.GHB].copy()
-        peer_vals = peer_df[m].dropna()
-        peer_count = len(peer_vals)
-        f = lambda val: fmt_val(val, m, with_unit=True)
-        rank, total, pctl = compute_peer_rank(df, dt, m, self.GHB)
-
-        qoq_prev, yoy_prev = self._ghb_qoq_yoy(m, dt) if self._ghb_idx(dt) is not None else (None, None)
-        if qoq_prev is None and yoy_prev is None:
-            qoq_prev, yoy_prev = compute_period_deltas(self.df, self.GHB, m, dt)
-        qoq_text, qoq_color = fmt_delta(gv, qoq_prev, m)
-        yoy_text, yoy_color = fmt_delta(gv, yoy_prev, m)
-
-        if peer_count == 0:
-            pf, pc, pi = "No peer comparison", CS['text3'], "\u2022"
-        elif gv is None:
-            pf, pc, pi = "N/A", CS['text2'], ""
-        elif peer_count < 4:
-            pmed = float(peer_vals.median())
-            if np.isclose(gv, pmed, equal_nan=False):
-                pf, pc, pi = "At Peer Median", CS['peer_band_mid'], "\u2022"
-            elif (gv < pmed and inverse) or (gv > pmed and not inverse):
-                pf, pc, pi = "Above Peer Median", CS['peer_band_top'], "\u25b4"
-            else:
-                pf, pc, pi = "Below Peer Median", CS['peer_band_low'], "\u25be"
-        else:
-            q1, q3 = np.percentile(peer_vals, [25, 75])
-            if inverse:
-                if gv <= q1:
-                    pf, pc, pi = "Top Quartile", CS['peer_band_top'], "\u25b4"
-                elif gv >= q3:
-                    pf, pc, pi = "Bottom Quartile", CS['peer_band_low'], "\u25be"
-                else:
-                    pf, pc, pi = "Middle 50%", CS['peer_band_mid'], "\u2022"
-            else:
-                if gv >= q3:
-                    pf, pc, pi = "Top Quartile", CS['peer_band_top'], "\u25b4"
-                elif gv <= q1:
-                    pf, pc, pi = "Bottom Quartile", CS['peer_band_low'], "\u25be"
-                else:
-                    pf, pc, pi = "Middle 50%", CS['peer_band_mid'], "\u2022"
-
-        def sr(l, val, h=False):
-            return html.Div([html.Span(l, className="ol"), html.Span(str(val), className="ov")],
-                            className="or" + (" oh" if h else ""))
-
-        def sr_colored(l, val, color):
-            return html.Div([html.Span(l, className="ol"),
-                             html.Span(str(val), className="ov", style={'color': color, 'fontWeight': '600'})],
-                            className="or")
-
-        unit_note = " ($000s)" if isdol else ""
-        rank_text = f"#{rank} of {total}" if rank and total > 1 else "\u2014"
-        peer_avg = f(peer_vals.mean()) if peer_count else "N/A"
-        peer_median = f(peer_vals.median()) if peer_count else "N/A"
-        if peer_count:
-            high_idx = peer_df[m].idxmax()
-            low_idx = peer_df[m].idxmin()
-            peer_high = f"{f(peer_df.loc[high_idx, m])} \u2014 {peer_df.loc[high_idx, 'Bank']}"
-            peer_low = f"{f(peer_df.loc[low_idx, m])} \u2014 {peer_df.loc[low_idx, 'Bank']}"
-        else:
-            peer_high = "N/A"
-            peer_low = "N/A"
-
-        gauge_section = html.Div([
-            html.Div([
-                make_percentile_arc_img(pctl, size=OVERVIEW_GAUGE_SIZE),
-                html.Div([
-                    html.Div("Peer Position", className="pct-label"),
-                    html.Div(rank_text, className="pct-rank"),
-                    html.Div([
-                        html.Span(pi, style={'color': pc, 'marginRight': '4px'}),
-                        html.Span(pf, style={'color': pc, 'fontWeight': '600'})
-                    ], className="pct-band"),
-                ], className="pct-info"),
-            ], className="pct-gauge-wrap"),
-        ], className="pct-gauge-section")
-
-        return html.Div([
-            gauge_section,
-            html.Div([
-                html.Div(f"Peer Snapshot{unit_note}", className="ost"),
-                sr("Peer Average", peer_avg),
-                sr("Peer Median", peer_median),
-                sr(self.GHB, f(gv) if gv is not None else "N/A", h=True),
-                sr("Peer High", peer_high),
-                sr("Peer Low", peer_low)
-            ], className="os"),
-            html.Div([
-                html.Div("JPM Momentum", className="ost"),
-                sr_colored("QoQ Change", qoq_text, qoq_color),
-                sr_colored("YoY Change", yoy_text, yoy_color),
-            ], className="os"),
-        ], className="ow")
-
-    def _trend(self, bk, m, y, end_date=None):
-        isdol = is_dollar_metric(m)
-        f = self.df[self.df['Bank'].isin(bk)]
-        if f.empty:
-            return self._ef("No data")
-        start, end = self._window_bounds(y, end=end_date, bank_filter=bk)
-        f = f[(f['Date'] <= end) & (f['Date'] >= start)]
-        if f.empty:
-            return self._ef("No data for selected historical window")
-        pv = f.pivot(index='Date', columns='Bank', values=m)
-        fig = go.Figure()
-        peer_cols = [c for c in pv.columns if c != self.GHB]
-        if len(peer_cols) >= 2:
-            fig.add_trace(go.Scatter(x=pv.index, y=pv[peer_cols].max(axis=1), mode='lines',
-                                     line=dict(width=0), showlegend=False, hoverinfo='skip'))
-            fig.add_trace(go.Scatter(x=pv.index, y=pv[peer_cols].min(axis=1), mode='lines',
-                                     line=dict(width=0), fill='tonexty',
-                                     fillcolor='rgba(148,163,184,0.10)',
-                                     showlegend=False, hoverinfo='skip'))
-        ispct = is_percent_metric(m)
-        metric_label = m if len(m) <= 54 else m[:51] + "..."
-        for b in pv.columns:
-            ig = b == self.GHB
-            hover_vals = [fmt_val(v, m, with_unit=True) for v in pv[b]]
-            hover_role = "JPM Benchmark" if ig else "Selected Peer"
-            ht = (f'<b>{b}</b><br>'
-                  f'<span style="color:{CS["text3"]}">{hover_role}</span><br>'
-                  f'%{{x|%m/%d/%Y}}<br>'
-                  f'{metric_label}: <b>%{{customdata}}</b><extra></extra>')
-            fig.add_trace(go.Scatter(x=pv.index, y=pv[b], customdata=hover_vals, mode='lines', name=b,
-                                     line=dict(color=CS['ghb'] if ig else CS['peer'],
-                                               width=2.8 if ig else 1.15, shape='spline'),
-                                     opacity=1 if ig else CS['peer_op'], hovertemplate=ht))
-        dt, tick_fmt = self._axis_for_window(start, end)
-        tfmt = ',.0f' if isdol else '.2f'
-        y_title = '$000s' if isdol else ('%' if ispct else None)
-        fig.update_layout(**self._bl(
-            showlegend=False,
-            hovermode='closest', hoverdistance=18, spikedistance=1000,
-            margin=dict(l=48, r=12, t=6, b=40),
-            xaxis=dict(showgrid=False, tickformat=tick_fmt,
-                       dtick=dt, tickangle=-35, tickfont=dict(size=9),
-                       showspikes=True, spikemode='across', spikesnap='cursor',
-                       spikecolor=CS['border_strong'], spikethickness=1),
-            yaxis=dict(title_text=y_title, title_font=dict(size=9, color=CS['text3']),
-                       showgrid=True, gridcolor=CS['grid'], tickformat=tfmt,
-                       tickfont=dict(size=9), zeroline=True, zerolinecolor=CS['border_strong'])))
-        return self._lock_chart_view(fig)
-
-    def _ta(self, bk, m, y, end_date=None):
-        isdol = is_dollar_metric(m)
-        inverse = is_inverse_metric(m)
-        f = self.df[self.df['Bank'].isin(bk)]
-        if f.empty:
-            return html.Div("No data", className="emp")
-        start, end = self._window_bounds(y, end=end_date, bank_filter=bk)
-        f = f[(f['Date'] <= end) & (f['Date'] >= start)]
-        if f.empty:
-            return html.Div("No data for selected historical window", className="emp")
-        pv = f.pivot(index='Date', columns='Bank', values=m)
-        if self.GHB not in pv.columns or pv[self.GHB].count() < 2:
-            return html.Div("Insufficient data", className="emp")
-        ghd = pv[self.GHB].dropna()
-        stats_by_bank = {}
-        for b in pv.columns:
-            bd = pv[b].dropna()
-            if len(bd) < 2:
+    # -------------------------------------------------------- header sections
+    def _exec_banner(self, selected_peers):
+        cohort = [self.GHB] + [p for p in (selected_peers or []) if p in self.peers]
+        cards = []
+        for metric, cat in EXECUTIVE_KPIS:
+            if metric not in self.metrics or self.latest is None:
                 continue
-            sv, ev = bd.iloc[0], bd.iloc[-1]
-            chg = calc_trend_change(sv, ev, m)
-            vol = bd.std()
-            mean_val = bd.mean()
-            cv = (vol / abs(mean_val)) * 100 if mean_val != 0 and not pd.isna(mean_val) else np.nan
-            sl = np.polyfit(np.arange(len(bd)), bd.values, 1)[0]
-            cr = np.nan
-            if b != self.GHB:
-                ov = pd.concat([ghd, bd], axis=1).dropna()
-                if len(ov) >= 2 and ov.iloc[:, 0].nunique() >= 2 and ov.iloc[:, 1].nunique() >= 2:
-                    cr = ov.iloc[:, 0].corr(ov.iloc[:, 1])
-            stats_by_bank[b] = {'g': chg, 'v': vol, 'cv': cv, 'c': cr, 't': trend_direction_label(sl)}
-        ghb_stats = stats_by_bank.get(self.GHB, {})
-        peer_stats = {b: s for b, s in stats_by_bank.items() if b != self.GHB}
-        peer_growth = {b: s for b, s in peer_stats.items() if not pd.isna(s['g'])}
-        peer_vols = [s['v'] for s in peer_stats.values() if not pd.isna(s.get('v'))]
-        peer_cvs = [s['cv'] for s in peer_stats.values() if not pd.isna(s.get('cv'))]
-        peer_corr = {b: s['c'] for b, s in peer_stats.items() if not pd.isna(s['c'])}
-        most_similar = max(peer_corr.items(), key=lambda x: x[1]) if peer_corr else (None, np.nan)
-        least_similar = min(peer_corr.items(), key=lambda x: x[1]) if peer_corr else (None, np.nan)
-        fcorr = lambda item: f"{item[0]} ({item[1]:.2f})" if item and item[0] else "N/A"
-        fg = lambda v: fmt_trend_change(v, m)
-        fvol = lambda v: ("N/A" if v is None or pd.isna(v) else
-                          (fmt_val(v, m, with_unit=True) if isdol else f"{v:.4f} pp"))
-        fcv = lambda v: "N/A" if v is None or pd.isna(v) else f"{v:.1f}%"
-        avg_peer_vol = fvol(np.nanmean(peer_vols)) if peer_vols else "N/A"
-        avg_peer_cv = fcv(np.nanmean(peer_cvs)) if peer_cvs else "N/A"
-
-        def sr(l, v, h=False):
-            return html.Div([html.Span(l, className="ol"), html.Span(str(v), className="ov")],
-                            className="or" + (" oh" if h else ""))
-
-        if peer_growth:
-            change_key = (lambda x: x[1]['g'])
-            highest_peer_name, highest_peer_stats = max(peer_growth.items(), key=change_key)
-            lowest_peer_name, lowest_peer_stats = min(peer_growth.items(), key=change_key)
-            avg_peer_growth = fg(np.nanmean([s['g'] for s in peer_growth.values()]))
-            highest_peer_text = f"{highest_peer_name} ({fg(highest_peer_stats['g'])})"
-            lowest_peer_text = f"{lowest_peer_name} ({fg(lowest_peer_stats['g'])})"
-        else:
-            avg_peer_growth = "N/A"
-            highest_peer_text = "N/A"
-            lowest_peer_text = "N/A"
-        change_label = "Growth" if isdol else "Change"
-        trend_window_label = "Full-History Trend" if str(y).upper() == "FULL" else f"{y}Y Trend"
-        return html.Div([
-            html.Div([
-                html.Div(trend_window_label, className="ost"),
-                sr(f"JPM {change_label}", fg(ghb_stats.get('g')), h=True),
-                sr("Direction", ghb_stats.get('t', 'N/A')),
-                sr("Volatility (std)", fvol(ghb_stats.get('v'))),
-                sr("Volatility (CV)", fcv(ghb_stats.get('cv')))
-            ], className="os"),
-            html.Div([
-                html.Div("Peers", className="ost"),
-                sr(f"Avg Peer {change_label}", avg_peer_growth),
-                sr("Avg Peer Volatility (std)", avg_peer_vol),
-                sr("Avg Peer Volatility (CV)", avg_peer_cv),
-                sr("Most Similar (Correlation)", fcorr(most_similar)),
-                sr("Least Similar (Correlation)", fcorr(least_similar)),
-                sr("Highest Peer Change", highest_peer_text),
-                sr("Lowest Peer Change", lowest_peer_text)
-            ], className="os")
-        ], className="ow")
-
-    def _dual(self, m1, m2, y):
-        g = self.df[self.df['Bank'] == self.GHB].copy()
-        if g.empty:
-            return self._ef("No JPMorgan data")
-        start, end = self._window_bounds(y, bank_filter=[self.GHB])
-        g = g[(g['Date'] <= end) & (g['Date'] >= start)]
-        if g.empty:
-            return self._ef("No JPMorgan data for selected historical window")
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
-        isdol1 = is_dollar_metric(m1)
-        isdol2 = is_dollar_metric(m2)
-        cd1 = [fmt_val(v, m1, with_unit=True) for v in g[m1]]
-        cd2 = [fmt_val(v, m2, with_unit=True) for v in g[m2]]
-        ht1 = '%{x|%m/%d/%Y}<br>' + m1[:40] + ': %{customdata}<extra></extra>'
-        ht2 = '%{x|%m/%d/%Y}<br>' + m2[:40] + ': %{customdata}<extra></extra>'
-        fig.add_trace(go.Scatter(x=g['Date'], y=g[m1], customdata=cd1, mode='lines', name=m1[:40],
-                                 line=dict(color=CS['ghb'], width=2.5, shape='spline'),
-                                 hovertemplate=ht1), secondary_y=False)
-        fig.add_trace(go.Scatter(x=g['Date'], y=g[m2], customdata=cd2, mode='lines', name=m2[:40],
-                                 line=dict(color=CS['ghb2'], width=2.5, dash='dot', shape='spline'),
-                                 hovertemplate=ht2), secondary_y=True)
-        dt, tick_fmt = self._axis_for_window(start, end)
-        fig.update_layout(**self._bl(
-            showlegend=True, hovermode='x unified',
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left",
-                        x=0, font=dict(size=9)),
-            margin=dict(l=48, r=48, t=26, b=40),
-            xaxis=dict(showgrid=False, tickformat=tick_fmt,
-                       dtick=dt, tickangle=-35, tickfont=dict(size=9))))
-        tfmt1 = ',.0f' if isdol1 else '.2f'
-        tfmt2 = ',.0f' if isdol2 else '.2f'
-        ytitle1 = '$000s' if isdol1 else ('%' if is_percent_metric(m1) else None)
-        ytitle2 = '$000s' if isdol2 else ('%' if is_percent_metric(m2) else None)
-        fig.update_yaxes(title_text=ytitle1, title_font=dict(size=9, color=CS['ghb']),
-                         tickformat=tfmt1, showgrid=True, gridcolor=CS['grid'],
-                         tickfont=dict(size=9, color=CS['ghb']),
-                         zeroline=True, zerolinecolor=CS['border_strong'], secondary_y=False)
-        fig.update_yaxes(title_text=ytitle2, title_font=dict(size=9, color=CS['ghb2']),
-                         tickformat=tfmt2, showgrid=False,
-                         tickfont=dict(size=9, color=CS['ghb2']), zeroline=True,
-                         zerolinecolor=CS['border_strong'], secondary_y=True)
-        return self._lock_chart_view(fig)
-
-    def _corr(self, m1, m2, y):
-        g = self.df[self.df['Bank'] == self.GHB].copy()
-        if g.empty:
-            return html.Div("No data", className="emp")
-        start, end = self._window_bounds(y, bank_filter=[self.GHB])
-        g = g[(g['Date'] <= end) & (g['Date'] >= start)]
-        if g.empty:
-            return html.Div("No JPMorgan data for selected historical window", className="emp")
-        cm = g[[m1, m2]].dropna()
-        n = len(cm)
-
-        def sr(l, v, h=False):
-            return html.Div([html.Span(l, className="ol"), html.Span(str(v), className="ov")],
-                            className="or" + (" oh" if h else ""))
-
-        if n < 3:
-            return html.Div([html.Div([
-                html.Div("Insufficient Data", className="ost"),
-                sr("Periods", str(n)), sr("Required", "3+")
-            ], className="os")], className="ow")
-        if cm[m1].nunique() < 2 or cm[m2].nunique() < 2:
-            return html.Div([html.Div([
-                html.Div("Correlation Unavailable", className="ost"),
-                sr("Reason", "One metric is constant"),
-                sr("Periods", str(n))
-            ], className="os")], className="ow")
-        r, pv = stats.pearsonr(cm[m1], cm[m2])
-        if pd.isna(r) or pd.isna(pv):
-            return html.Div([html.Div([
-                html.Div("Correlation Unavailable", className="ost"),
-                sr("Reason", "Correlation returned N/A"),
-                sr("Periods", str(n))
-            ], className="os")], className="ow")
-        r2 = r ** 2
-        st = "Strong" if abs(r) >= 0.7 else ("Moderate" if abs(r) >= 0.4 else "Weak")
-        dr = "positive" if r > 0 else ("negative" if r < 0 else "flat")
-        if abs(r) >= 0.7:
-            rc = CS['primary']
-        elif abs(r) >= 0.4:
-            rc = CS['text2']
-        else:
-            rc = CS['text3']
-
-        def ms(s, met):
-            if len(s) < 2:
-                return [sr("Data", "N/A")]
-            sv, ev = s.iloc[0], s.iloc[-1]
-            ch = calc_trend_change(sv, ev, met)
-            sl = np.polyfit(np.arange(len(s)), s.values, 1)[0]
-            mean_val = s.mean()
-            std_val = s.std()
-            cv_val = (std_val / abs(mean_val)) * 100 if mean_val != 0 else np.nan
-            fcv = "N/A" if pd.isna(cv_val) else f"{cv_val:.1f}%"
-            return [
-                sr("Direction", trend_direction_label(sl)),
-                sr("Change", fmt_trend_change(ch, met)),
-                sr("Volatility (CV)", fcv)
-            ]
-
-        s1 = g[m1].dropna()
-        s2 = g[m2].dropna()
-        return html.Div([
-            html.Div([
-                html.Div("Relationship", className="ost"),
-                sr("Correlation (r)", f"{r:.4f}", h=True),
-                sr("R\u00b2", f"{r2:.4f}"),
+            row = self.df[(self.df['Bank'] == self.GHB) & (self.df['Date'] == self.latest)]
+            val = row.iloc[0][metric] if not row.empty else None
+            qoq, _yoy = self._bank_qoq_yoy(self.GHB, metric, self.latest)
+            d_txt, d_col = fmt_delta(val, qoq, metric)
+            chip_cls = 'flat'
+            if d_col == CS['good']:
+                chip_cls = 'up'
+            elif d_col == CS['bad']:
+                chip_cls = 'down'
+            rank, total, _pct = compute_peer_rank(self.df, self.GHB, metric, self.latest, cohort)
+            rank_txt = f"#{rank} of {total}" if rank else "\u2014"
+            spark = self._bank_spark(self.GHB, metric)
+            cards.append(html.Div([
+                html.Div(cat, className='exec-kpi-cat'),
+                html.Div(metric, className='exec-kpi-label'),
+                html.Div(self._fmt(val, metric), className='exec-kpi-val'),
                 html.Div([
-                    html.Span("Strength", className="ol"),
-                    html.Span(f"{st} {dr}", style={"color": rc, "fontWeight": "600"}, className="ov")
-                ], className="or"),
-                sr("p-value", f"{pv:.4f}" if pv >= 0.0001 else "< 0.0001"),
-                sr("Periods", str(n))
-            ], className="os"),
-            html.Div([html.Div("Primary", className="ost")] + ms(s1, m1), className="os"),
-            html.Div([html.Div("Secondary", className="ost")] + ms(s2, m2), className="os")
-        ], className="ow")
+                    html.Span(d_txt + " QoQ", className=f'delta-chip {chip_cls}'),
+                    html.Span(rank_txt, className='exec-rank'),
+                ], className='exec-kpi-row'),
+                make_sparkline_img_cached(spark),
+            ], className='exec-card'))
+        snap = self.latest.strftime('%m/%d/%Y') if self.latest is not None else "\u2014"
+        return html.Div([
+            html.Div([
+                html.H3("Executive Snapshot \u2014 " + self.GHB, className='sec-title'),
+                html.P(f"Latest quarter {snap} \u00b7 QoQ deltas \u00b7 rank vs "
+                       f"{len(cohort) - 1} selected peers", className='sec-sub'),
+            ], className='sec-head'),
+            html.Div(cards, className='exec-grid'),
+        ])
 
-    def _bd(self, data, date):
+    def _missing_data_banner(self):
+        notes = []
+        if self.missing_banks:
+            notes.append(f"FDIC returned no data for: {', '.join(self.missing_banks)}. "
+                         f"They are excluded from peer statistics this session.")
+        cov = self.cecl.get('coverage_pct') if self.cecl else None
+        if cov is not None:
+            notes.append(f"CECL concentration adjustment active: add-back applied to "
+                         f"{self.cecl['applied_rows']} of {self.cecl['window_rows']} "
+                         f"bank-quarters in the 2020\u20132024 window ({cov:.0f}% coverage).")
+        if not notes:
+            return html.Div()
+        return html.Div(" ".join(notes), className='warn-banner')
+
+    # ---------------------------------------------------------- reference card
+    def _reference_section(self):
         sections = []
         for cat_name, cat_metrics in METRIC_CATEGORIES:
-            present = [m for m in cat_metrics if m in data.index]
+            present = [m for m in cat_metrics if m in self.metrics]
+            if not present:
+                continue
+            rows = []
+            for m in present:
+                txt = METRIC_DEFINITIONS.get(m, "")
+                rows.append(html.Div([
+                    html.Div(m, className="ref-name"),
+                    html.Div(txt, className="ref-desc"),
+                ], className="ref-row"))
+            accent = CATEGORY_ACCENTS.get(cat_name, CS['primary'])
+            sections.append(html.Details([
+                html.Summary([
+                    html.Span(className='ref-accent', style={'background': accent}),
+                    html.Span(CATEGORY_SHORT_LABELS.get(cat_name, cat_name),
+                              className='ref-cat-label'),
+                    html.Span(f"{len(present)}", className='ref-cat-count'),
+                    html.Span("\u25B6", className='ref-chev'),
+                ], className='ref-summary'),
+                html.Div(rows, className="ref-body"),
+            ], className="ref-cat"))
+        return html.Div([
+            html.Div([
+                html.H6("Metric Reference Guide", className="ct"),
+                html.Span(f"{len(self.metrics)} metrics across "
+                          f"{len(METRIC_CATEGORIES)} categories \u00b7 click a category to expand",
+                          className="rng"),
+            ], className="ch"),
+            html.Div(sections, className="ref-wrap"),
+        ], className="card ref-card sec")
+
+    # ----------------------------------------------------------------- layout
+    def _layout(self):
+        metric_opts = [self._metric_option(m) for m in self.metrics]
+        date_opts = self._date_options()
+        latest_val = date_opts[0]['value'] if date_opts else None
+        peer_opts = [{'label': p, 'value': p} for p in self.peers]
+        bank_opts = [{'label': b, 'value': b} for b in self.banks]
+        year_opts = [{'label': f"{y} yr" if y > 1 else "1 yr", 'value': y}
+                     for y in (1, 2, 3, 5, 10, 23)]
+
+        header = html.Div(html.Div([
+            html.H1(DASHBOARD_TITLE, className='hdr-title'),
+            html.Div([
+                html.Span([html.Span(className='live-dot'), "FDIC live"],
+                          className='hdr-live'),
+                html.Span(f"{len(self.banks)} institutions \u00b7 "
+                          f"{len(self.metrics)} UBPR-aligned metrics \u00b7 "
+                          f"quarterly since {REQUESTED_START_DATE_DISPLAY}"),
+                html.Span(f"Latest data: "
+                          f"{self.latest.strftime('%m/%d/%Y') if self.latest is not None else '\u2014'}"),
+            ], className='hdr-meta'),
+            html.Div(HEADER_DISCLOSURE_SHORT, className='hdr-disc'),
+        ], className='hdr-inner'), className='hdr')
+
+        peer_card = html.Div([
+            html.Div([
+                html.H6("Peer Set", className='ct'),
+                html.Span(PEER_UNIVERSE_LABEL, className='csub'),
+            ], className='ch'),
+            html.Div([
+                html.Div(self._mdd('peer-sel', self.peers, peer_opts, multi=True,
+                                   placeholder="Select peer banks\u2026"),
+                         className='peer-dd-wrap'),
+                html.Div([
+                    html.Button("Select all", id='sel-all', n_clicks=None, className='btn-mini'),
+                    html.Button("Clear", id='sel-clear', n_clicks=None, className='btn-mini'),
+                ], className='peer-actions'),
+            ], className='peer-row'),
+            html.Div(f"{self.GHB} is always included; statistics use the selected peers.",
+                     className='peer-count'),
+        ], className='card peer-card')
+
+        snapshot_sec = html.Div([
+            html.Div([
+                html.H3("Peer Comparison", className='sec-title'),
+                html.P("Point-in-time snapshot and trailing trend vs the selected peer set.",
+                       className='sec-sub'),
+            ], className='sec-head'),
+            html.Div([
+                html.Div([
+                    html.Span("Metric", className='ctl-label'),
+                    self._mdd('peer-metric', self.default_metric, metric_opts),
+                ], id='peer-metric-wrap', className='ctl peer-metric-wrap'),
+                html.Div([
+                    html.Span("Snapshot date", className='ctl-label'),
+                    self._mdd('r1d', latest_val, date_opts),
+                ], className='ctl', style={'flex': '0 0 190px'}),
+                html.Div([
+                    html.Span("Trend window", className='ctl-label'),
+                    self._mdd('r2t', 5, year_opts),
+                ], className='ctl', style={'flex': '0 0 130px'}),
+                html.Span(id='r2r', className='range-label',
+                          style={'marginLeft': 'auto', 'alignSelf': 'flex-end'}),
+            ], className='control-row'),
+            html.Div(id='peer-def'),
+            html.Div([
+                html.Div(html.Div([
+                    html.Div([html.H6("Peer Snapshot", className='ct'),
+                              html.Span("ranked bar \u00b7 JPM highlighted", className='csub')],
+                             className='ch'),
+                    dcc.Loading(dcc.Graph(id='r1c', config=GRAPH_CONFIG), type='dot',
+                                color=CS['primary']),
+                ], className='card'), className='chart-col'),
+                html.Div(html.Div([
+                    html.Div([html.H6("Metric Overview", className='ct')], className='ch'),
+                    html.Div(id='r1o', className='insight-shell'),
+                ], className='card'), className='insight-col'),
+            ], className='paired-row'),
+            html.Div([
+                html.Div(html.Div([
+                    html.Div([html.H6("Peer Trend", className='ct'),
+                              html.Span("peer band = min\u2013max \u00b7 dashed = peer median",
+                                        className='csub')], className='ch'),
+                    dcc.Loading(dcc.Graph(id='r2c', config=GRAPH_CONFIG), type='dot',
+                                color=CS['primary']),
+                ], className='card'), className='chart-col'),
+                html.Div(html.Div([
+                    html.Div([html.H6("Trend Analysis", className='ct')], className='ch'),
+                    html.Div(id='r2a', className='insight-shell'),
+                ], className='card'), className='insight-col'),
+            ], className='paired-row', style={'marginTop': '16px'}),
+        ], className='sec')
+
+        dual_sec = html.Div([
+            html.Div([
+                html.H3("Metric Relationship", className='sec-title'),
+                html.P("Two metrics for JPMorgan on independent axes, with Pearson correlation.",
+                       className='sec-sub'),
+            ], className='sec-head'),
+            html.Div([
+                html.Div([html.Span("Primary metric", className='ctl-label'),
+                          self._mdd('r3p', self.default_metric, metric_opts)],
+                         className='ctl', style={'flex': '1 1 320px', 'maxWidth': '480px'}),
+                html.Div([html.Span("Secondary metric", className='ctl-label'),
+                          self._mdd('r3s', 'Net Interest Margin'
+                                    if 'Net Interest Margin' in self.metrics
+                                    else self.default_metric, metric_opts)],
+                         className='ctl', style={'flex': '1 1 320px', 'maxWidth': '480px'}),
+                html.Div([html.Span("Window", className='ctl-label'),
+                          self._mdd('r3t', 10, year_opts)],
+                         className='ctl', style={'flex': '0 0 130px'}),
+            ], className='control-row'),
+            html.Div(id='r3f'),
+            html.Div([
+                html.Div(html.Div([
+                    html.Div([html.H6("Dual-Axis Trend \u2014 JPMorgan", className='ct')],
+                             className='ch'),
+                    dcc.Loading(dcc.Graph(id='r3c', config=GRAPH_CONFIG), type='dot',
+                                color=CS['primary']),
+                ], className='card'), className='chart-col'),
+                html.Div(html.Div([
+                    html.Div([html.H6("JPMorgan Correlation Analysis", className='ct')],
+                             className='ch'),
+                    html.Div(id='r3x', className='insight-shell'),
+                ], className='card jpm-corr-card'), className='insight-col'),
+            ], className='paired-row'),
+        ], className='sec')
+
+        detail_sec = html.Div([
+            html.Div([
+                html.H6("All Metrics", id='det-title', className='ct'),
+                html.Span("every metric \u00b7 8-quarter sparkline \u00b7 QoQ / YoY deltas",
+                          className='csub'),
+            ], className='ch'),
+            html.Div([
+                html.Div([html.Span("Bank", className='ctl-label'),
+                          self._mdd('det-bank', self.GHB, bank_opts)],
+                         id='det-bank-wrap', className='ctl det-bank-wrap'),
+                html.Div([html.Span("As of", className='ctl-label'),
+                          self._mdd('det-date', latest_val, date_opts)],
+                         className='ctl det-date-wrap'),
+                html.Button("Export all periods (Excel)", id='exp', n_clicks=None,
+                            className='btn-export'),
+                dcc.Download(id='dl'),
+                html.Span("Deltas: QoQ vs prior quarter \u00b7 YoY vs same quarter last year",
+                          className='det-legend'),
+            ], className='det-controls'),
+            dcc.Loading(html.Div(id='det'), type='dot', color=CS['primary']),
+        ], className='card sec det-card')
+
+        footer = html.Div([
+            html.Div(FOOTER_DISCLOSURE_NOTE),
+            html.Div(f"Source: FDIC BankFind Suite API \u00b7 {BASE_URL} \u00b7 "
+                     f"UBPR-aligned methodology \u00b7 values as reported, never synthesized.",
+                     style={'marginTop': '4px'}),
+        ], className='ftr')
+
+        return html.Div([
+            header,
+            html.Div([
+                peer_card,
+                self._missing_data_banner(),
+                html.Div(self._exec_banner(self.peers), id='exec-banner-wrap',
+                         className='sec'),
+                snapshot_sec,
+                dual_sec,
+                detail_sec,
+                self._reference_section(),
+            ], className='main-wrap'),
+            footer,
+        ])
+
+    # =========================================================== chart methods
+    def _bar(self, f, m, dt=None):
+        """Ranked horizontal peer snapshot. JPM gets the brand color and a dark
+        outline; peers are muted slate. Direction-aware: best at the TOP."""
+        f = f.dropna(subset=[m]).drop_duplicates(subset=['Bank'], keep='last')
+        if f.empty:
+            return self._ef("No data for this metric/date")
+        asc = is_inverse_metric(m)
+        f = f.sort_values(m, ascending=asc)
+        banks = list(f['Bank'])
+        vals = list(f[m])
+        colors = [CS['ghb'] if b == self.GHB else CS['peer'] for b in banks]
+        line_colors = [CS['primary_dark'] if b == self.GHB else 'rgba(0,0,0,0)' for b in banks]
+        line_widths = [1.4 if b == self.GHB else 0 for b in banks]
+        texts = [self._fmt(v, m) for v in vals]
+        fig = go.Figure(go.Bar(
+            x=vals, y=banks, orientation='h',
+            marker=dict(color=colors, opacity=[1.0 if b == self.GHB else CS['peer_op']
+                                               for b in banks],
+                        line=dict(color=line_colors, width=line_widths)),
+            text=texts, textposition='outside', cliponaxis=False,
+            textfont=dict(size=10.5, family='Inter, sans-serif'),
+            hovertemplate='%{y}: %{text}<extra></extra>',
+        ))
+        peer_vals = [v for b, v in zip(banks, vals) if b != self.GHB]
+        if peer_vals:
+            avg = float(np.nanmean(peer_vals))
+            fig.add_vline(x=avg, line_dash='dot', line_color=CS['peer_band_mid'],
+                          line_width=1.2,
+                          annotation_text=f"peer avg {self._fmt(avg, m)}",
+                          annotation_position='top',
+                          annotation_font=dict(size=10, color=CS['text3']))
+        self._base_fig_layout(fig, height=max(PAIRED_GRAPH_HEIGHT, 22 * len(banks) + 60))
+        fig.update_layout(showlegend=False, yaxis=dict(autorange='reversed'),
+                          margin=dict(l=14, r=64, t=26, b=12))
+        if is_dollar_metric(m):
+            fig.update_xaxes(tickformat='~s')
+        return self._bl(fig)
+
+    def _ov(self, f, m, dt):
+        """Metric overview panel: JPM value, percentile gauge, rank, peer
+        statistics, deltas, and the 8-quarter JPM momentum sparkline."""
+        f = f.dropna(subset=[m]).drop_duplicates(subset=['Bank'], keep='last')
+        row = f[f['Bank'] == self.GHB]
+        val = row.iloc[0][m] if not row.empty else None
+        cohort = list(f['Bank'])
+        rank, total, pct = compute_peer_rank(self.df, self.GHB, m, dt, cohort)
+        peer_df = f[f['Bank'] != self.GHB]
+        stats_rows = []
+        if not peer_df.empty:
+            pv = peer_df[m].dropna()
+            if not pv.empty:
+                hi_i, lo_i = pv.idxmax(), pv.idxmin()
+                stats_rows = [
+                    ("Peer median", self._fmt(float(pv.median()), m)),
+                    ("Peer average", self._fmt(float(pv.mean()), m)),
+                    ("Peer high", f"{self._fmt(float(pv.loc[hi_i]), m)} \u00b7 "
+                                  f"{peer_df.loc[hi_i, 'Bank']}"),
+                    ("Peer low", f"{self._fmt(float(pv.loc[lo_i]), m)} \u00b7 "
+                                 f"{peer_df.loc[lo_i, 'Bank']}"),
+                ]
+        qoq, yoy = self._bank_qoq_yoy(self.GHB, m, dt)
+        q_txt, q_col = fmt_delta(val, qoq, m)
+        y_txt, y_col = fmt_delta(val, yoy, m)
+
+        def chip(txt, col, label):
+            cls = 'up' if col == CS['good'] else ('down' if col == CS['bad'] else 'flat')
+            return html.Span(f"{txt} {label}", className=f'delta-chip {cls}',
+                             style={'marginRight': '6px'})
+
+        rank_line = (f"Rank #{rank} of {total} \u00b7 "
+                     f"{'higher' if not is_inverse_metric(m) else 'lower'} is better"
+                     if rank else "Rank unavailable")
+        return html.Div([
+            html.Div([
+                html.Div([
+                    html.Div([html.Span(self._fmt(val, m), className='ov-val'),
+                              html.Span(self.GHB, className='ov-unit')]),
+                    html.Div(rank_line, className='ov-rank'),
+                    html.Div([chip(q_txt, q_col, 'QoQ'), chip(y_txt, y_col, 'YoY')],
+                             style={'marginTop': '9px'}),
+                ]),
+                make_percentile_arc_img(pct),
+            ], className='ov-top'),
+            html.Div([html.Div([html.Div(lbl, className='ov-stat-label'),
+                                html.Div(v, className='ov-stat-val')],
+                               className='ov-stat') for lbl, v in stats_rows],
+                     className='ov-stats'),
+            html.Div("JPM Momentum \u00b7 trailing 8 quarters", className='ov-mom-label'),
+            make_sparkline_img_cached(self._bank_spark(self.GHB, m), width=240, height=44,
+                                      cls='spark-img'),
+        ], className='ov-wrap')
+
+    def _trend(self, banks, m, years):
+        start, end = self._window_bounds(banks, years)
+        if start is None:
+            return self._ef("No data")
+        sub = self.df[(self.df['Bank'].isin(banks)) & (self.df['Date'] >= start)
+                      & (self.df['Date'] <= end)]
+        sub = sub.dropna(subset=[m])
+        if sub.empty:
+            return self._ef("No data in window")
+        piv = (sub.drop_duplicates(subset=['Bank', 'Date'], keep='last')
+                  .pivot(index='Date', columns='Bank', values=m).sort_index())
+        peer_cols = [c for c in piv.columns if c != self.GHB]
+        fig = go.Figure()
+        if peer_cols:
+            pmax = piv[peer_cols].max(axis=1)
+            pmin = piv[peer_cols].min(axis=1)
+            pmed = piv[peer_cols].median(axis=1)
+            fig.add_trace(go.Scatter(x=piv.index, y=pmax, mode='lines',
+                                     line=dict(width=0), hoverinfo='skip',
+                                     showlegend=False))
+            fig.add_trace(go.Scatter(x=piv.index, y=pmin, mode='lines',
+                                     line=dict(width=0), fill='tonexty',
+                                     fillcolor=CS['peer_tint'], hoverinfo='skip',
+                                     name='Peer range', showlegend=True))
+            fig.add_trace(go.Scatter(x=piv.index, y=pmed, mode='lines',
+                                     name='Peer median',
+                                     line=dict(color=CS['peer_band_mid'], width=1.4,
+                                               dash='dash'),
+                                     hovertemplate='Peer median: %{y:.2f}<extra></extra>'))
+        if self.GHB in piv.columns:
+            jp = piv[self.GHB]
+            fig.add_trace(go.Scatter(x=piv.index, y=jp, mode='lines', name=self.GHB,
+                                     line=dict(color=CS['ghb'], width=2.6),
+                                     hovertemplate=self.GHB + ': %{y:.2f}<extra></extra>'))
+            jnn = jp.dropna()
+            if not jnn.empty:
+                fig.add_trace(go.Scatter(x=[jnn.index[-1]], y=[jnn.iloc[-1]],
+                                         mode='markers', showlegend=False,
+                                         marker=dict(size=7, color=CS['ghb'],
+                                                     line=dict(color='white', width=2)),
+                                         hoverinfo='skip'))
+        self._base_fig_layout(fig)
+        fig.update_layout(hovermode='x unified')
+        if is_dollar_metric(m):
+            fig.update_yaxes(tickformat='~s')
+        return self._bl(fig)
+
+    def _ta(self, banks, m, years):
+        start, end = self._window_bounds(banks, years)
+        if start is None:
+            return html.P("No data", className='emp')
+        jdf = self._bank_frame(self.GHB)
+        jdf = jdf[(jdf['Date'] >= start) & (jdf['Date'] <= end)].dropna(subset=[m])
+        if len(jdf) < 2:
+            return html.P("Not enough history in this window", className='emp')
+        vals = jdf[m].astype(float).values
+        sv, ev = vals[0], vals[-1]
+        chg = calc_trend_change(sv, ev, m)
+        x = np.arange(len(vals))
+        slope = float(np.polyfit(x, vals, 1)[0]) if len(vals) >= 2 else np.nan
+        vol = float(np.nanstd(vals))
+        mean = float(np.nanmean(vals))
+        cv = (vol / abs(mean) * 100) if mean not in (0, None) and abs(mean) > 1e-12 else None
+        # correlation with the peer median over the same dates
+        corr_txt = "N/A"
+        peers = [b for b in banks if b != self.GHB]
+        if peers:
+            sub = self.df[(self.df['Bank'].isin(peers)) & (self.df['Date'] >= start)
+                          & (self.df['Date'] <= end)].dropna(subset=[m])
+            if not sub.empty:
+                pmed = (sub.drop_duplicates(subset=['Bank', 'Date'], keep='last')
+                           .pivot(index='Date', columns='Bank', values=m)
+                           .median(axis=1))
+                joined = pd.concat([jdf.set_index('Date')[m], pmed], axis=1,
+                                   join='inner').dropna()
+                if len(joined) >= 3:
+                    a = joined.iloc[:, 0].values
+                    b = joined.iloc[:, 1].values
+                    if np.std(a) > 1e-12 and np.std(b) > 1e-12:
+                        r, _ = stats.pearsonr(a, b)
+                        corr_txt = f"{r:+.2f}"
+        items = [
+            ("Window", self._window_label(start, end)),
+            ("Start \u2192 end", f"{self._fmt(sv, m)} \u2192 {self._fmt(ev, m)}"),
+            ("Net change", fmt_trend_change(chg, m)),
+            ("Direction", trend_direction_label(slope)),
+            ("Volatility (\u03c3)", f"{vol:,.2f}"),
+            ("Coef. of variation", f"{cv:.1f}%" if cv is not None else "N/A"),
+            ("Corr. w/ peer median", corr_txt),
+            ("Observations", f"{len(vals)} quarters"),
+        ]
+        return html.Div([html.Div([html.Div(lbl, className='ov-stat-label'),
+                                   html.Div(v, className='ov-stat-val')],
+                                  className='ov-stat') for lbl, v in items],
+                        className='ov-stats')
+
+    def _dual(self, a, b, years):
+        start, end = self._window_bounds([self.GHB], years)
+        if start is None:
+            return self._ef("No data")
+        jdf = self._bank_frame(self.GHB)
+        jdf = jdf[(jdf['Date'] >= start) & (jdf['Date'] <= end)]
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        fig.add_trace(go.Scatter(x=jdf['Date'], y=jdf[a], name=a, mode='lines',
+                                 line=dict(color=CS['ghb'], width=2.4),
+                                 hovertemplate=a + ': %{y:.2f}<extra></extra>'),
+                      secondary_y=False)
+        fig.add_trace(go.Scatter(x=jdf['Date'], y=jdf[b], name=b, mode='lines',
+                                 line=dict(color=CS['warn'], width=2.2, dash='dot'),
+                                 hovertemplate=b + ': %{y:.2f}<extra></extra>'),
+                      secondary_y=True)
+        self._base_fig_layout(fig)
+        fig.update_layout(hovermode='x unified')
+        fig.update_yaxes(title_text=a, title_font=dict(size=10.5), secondary_y=False)
+        fig.update_yaxes(title_text=b, title_font=dict(size=10.5), secondary_y=True,
+                         gridcolor='rgba(0,0,0,0)')
+        if is_dollar_metric(a):
+            fig.update_yaxes(tickformat='~s', secondary_y=False)
+        if is_dollar_metric(b):
+            fig.update_yaxes(tickformat='~s', secondary_y=True)
+        return self._bl(fig)
+
+    def _corr(self, a, b, years):
+        start, end = self._window_bounds([self.GHB], years)
+        if start is None:
+            return html.P("No data", className='emp')
+        jdf = self._bank_frame(self.GHB)
+        jdf = jdf[(jdf['Date'] >= start) & (jdf['Date'] <= end)][[a, b]].dropna()
+        if len(jdf) < 3:
+            return html.P("Fewer than 3 overlapping quarters \u2014 correlation not computed.",
+                          className='emp')
+        x, y = jdf[a].values.astype(float), jdf[b].values.astype(float)
+        if np.std(x) < 1e-12 or np.std(y) < 1e-12:
+            return html.P("One series is constant in this window \u2014 correlation undefined.",
+                          className='emp')
+        r, p = stats.pearsonr(x, y)
+        ar = abs(r)
+        strength = ("very strong" if ar >= 0.8 else "strong" if ar >= 0.6 else
+                    "moderate" if ar >= 0.4 else "weak" if ar >= 0.2 else "negligible")
+        direction = "positive" if r > 0 else "negative"
+        col = CS['good'] if r > 0.2 else (CS['bad'] if r < -0.2 else CS['neutral'])
+        interp = (f"A {strength} {direction} relationship between \u201c{a}\u201d and "
+                  f"\u201c{b}\u201d for {self.GHB} across {len(jdf)} quarters "
+                  f"({self._window_label(start, end)}). p = {p:.3f}. "
+                  f"Correlation is descriptive, not causal.")
+        return html.Div([
+            html.Div("Pearson r", className='corr-label'),
+            html.Div(f"{r:+.2f}", className='corr-val', style={'color': col}),
+            html.Div(interp, className='corr-interp'),
+        ])
+
+    # ----------------------------------------------------- All-Metrics detail
+    def _bd(self, dt, bank=None):
+        bank = bank or self.GHB
+        key = (bank, pd.Timestamp(dt))
+        if key in self._bd_cache:
+            return self._bd_cache[key]
+        out = self._bd_build(pd.Timestamp(dt), bank)
+        self._bd_cache[key] = out
+        return out
+
+    def _bd_build(self, dt, bank):
+        bf = self._bank_frame(bank)
+        row = bf[bf['Date'] == dt]
+        if row.empty:
+            return html.P(f"No data for {bank} on {dt.strftime('%m/%d/%Y')}.",
+                          className='emp')
+        r = row.iloc[0]
+        cats = []
+        for cat_name, cat_metrics in METRIC_CATEGORIES:
+            present = [m for m in cat_metrics if m in self.metrics]
             if not present:
                 continue
             accent = CATEGORY_ACCENTS.get(cat_name, CS['primary'])
             bg = CATEGORY_BG.get(cat_name, '#f8fafc')
-            mid = (len(present) + 1) // 2
-
-            def make_rows(ms):
-                rows = []
-                for m in ms:
-                    curr = data[m]
-                    if pd.isna(curr):
-                        curr = None
-                    qoq_prev, yoy_prev = self._ghb_qoq_yoy(m, date)
-                    qoq_text, qoq_color = fmt_delta(curr, qoq_prev, m)
-                    yoy_text, yoy_color = fmt_delta(curr, yoy_prev, m)
-                    spark_vals = self._ghb_spark(m, date, self.SPARK_LOOKBACK)
-                    val_display = fmt_val(curr, m, with_unit=True)
-                    rows.append(html.Div([
-                        html.Div(m, className="dn"),
-                        html.Div([
-                            html.Div(val_display, className="dv"),
-                            html.Div([make_sparkline_img(spark_vals, width=78, height=20)], className="dspark"),
-                            html.Div([
-                                html.Span("QoQ", className="ddelta-lbl"),
-                                html.Span(qoq_text, className="ddelta-val", style={'color': qoq_color}),
-                            ], className="ddelta"),
-                            html.Div([
-                                html.Span("YoY", className="ddelta-lbl"),
-                                html.Span(yoy_text, className="ddelta-val", style={'color': yoy_color}),
-                            ], className="ddelta"),
-                        ], className="dright"),
-                    ], className="dr"))
-                return rows
-
-            sections.append(html.Div([
+            rows = [html.Div([
+                html.Div("Metric"), html.Div("Value", style={'textAlign': 'right'}),
+                html.Div("8Q trend", className='det-spark'),
+                html.Div("QoQ", style={'textAlign': 'right'}),
+                html.Div("YoY", style={'textAlign': 'right'}, className='det-col-yoy'),
+            ], className='det-row det-hdr-row')]
+            for m in present:
+                v = r[m]
+                qoq, yoy = self._bank_qoq_yoy(bank, m, dt)
+                q_txt, q_col = fmt_delta(v, qoq, m)
+                y_txt, y_col = fmt_delta(v, yoy, m)
+                rows.append(html.Div([
+                    html.Div(m, className='det-name', title=METRIC_DEFINITIONS.get(m, '')),
+                    html.Div(self._fmt(v, m), className='det-val'),
+                    html.Div(make_sparkline_img_cached(
+                        self._bank_spark(bank, m)), className='det-spark'),
+                    html.Div(q_txt, className='det-delta', style={'color': q_col}),
+                    html.Div(y_txt, className='det-delta det-col-yoy',
+                             style={'color': y_col}),
+                ], className='det-row'))
+            cats.append(html.Div([
                 html.Div([
-                    html.Div(style={"width": "3px", "background": accent, "borderRadius": "2px",
-                                    "flexShrink": "0", "alignSelf": "stretch"}),
-                    html.Span(cat_name, className="det-cat-label"),
-                    html.Span(f"{len(present)}", className="det-cat-count")
-                ], className="det-cat-hdr", style={"background": bg}),
-                dbc.Row([
-                    dbc.Col(html.Div(make_rows(present[:mid]), className="dc"), xs=12, md=6),
-                    dbc.Col(html.Div(make_rows(present[mid:]), className="dc"), xs=12, md=6)
-                ], className="det-cat-body")
-            ], className="det-cat-section"))
-        return html.Div(sections, className="dg")
-
-    def _css(self):
-        # NOTE: Functional stylesheet covering every class used by the layout.
-        # Paste your original hand-tuned _css body back over this method to
-        # restore exact styling. The Dash {%...%} tokens must be preserved.
-        return '''<!DOCTYPE html>
-<html>
-<head>
-{%metas%}
-<title>{%title%}</title>
-{%favicon%}
-{%css%}
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-<style>
-:root{--primary:#005EB8;--primary-dark:#003B73;--text:#0f172a;--text2:#475569;--text3:#64748b;
---bg:#f4f6f9;--card:#ffffff;--border:rgba(15,23,42,0.10);--good:#16a34a;--bad:#ef4444;}
-*{box-sizing:border-box;}
-body{margin:0;font-family:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;background:var(--bg);
-color:var(--text);font-size:13px;line-height:1.4;-webkit-font-smoothing:antialiased;}
-.main{max-width:1480px;margin:0 auto;padding:18px 22px 40px;}
-.hdr{background:linear-gradient(100deg,#003B73,#005EB8);color:#fff;padding:16px 26px;display:flex;
-align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;}
-.hdr-brand{display:flex;align-items:center;gap:14px;}
-.hdr-mark{width:46px;height:46px;border-radius:10px;background:rgba(255,255,255,0.14);display:flex;
-align-items:center;justify-content:center;font-weight:700;font-size:15px;letter-spacing:0.5px;}
-.hdr-title{display:block;font-size:18px;font-weight:700;}
-.hdr-sub{display:block;font-size:11.5px;opacity:0.82;margin-top:2px;}
-.hdr-meta{text-align:right;display:flex;flex-direction:column;gap:3px;}
-.hdr-meta-line{font-size:11.5px;opacity:0.92;}
-.hdr-src{font-weight:600;}
-.hdr-cnt{margin-left:6px;opacity:0.85;}
-.hdr-disclaimer{font-size:10px;opacity:0.66;font-style:italic;}
-.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px 18px;
-box-shadow:0 1px 3px rgba(15,23,42,0.04);}
-.mb-3{margin-bottom:16px;}.mb-4{margin-bottom:22px;}
-.ch{display:flex;align-items:center;gap:10px;margin-bottom:10px;}
-.ch-wrap{flex-wrap:wrap;}
-.ct{font-size:14px;font-weight:700;margin:0;color:var(--text);}
-.section-title-note{font-size:11px;color:var(--text3);}
-.rng{font-size:11px;color:var(--text3);margin-left:auto;}
-.exec-banner{background:linear-gradient(120deg,#f8fbff,#eef5fc);border:1px solid var(--border);
-border-radius:12px;padding:16px 18px;margin-bottom:16px;}
-.exec-banner-hdr{display:flex;flex-direction:column;gap:2px;margin-bottom:12px;}
-.exec-banner-title{font-size:14px;font-weight:700;color:var(--primary-dark);}
-.exec-banner-date{font-size:11px;color:var(--text3);}
-.exec-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;}
-.exec-card{background:#fff;border:1px solid var(--border);border-radius:10px;padding:12px;}
-.exec-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;}
-.exec-label{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.4px;color:var(--text3);}
-.exec-rank{font-size:10px;font-weight:600;border:1px solid;border-radius:20px;padding:1px 7px;}
-.exec-val{font-size:22px;font-weight:700;color:var(--text);}
-.exec-metric-name{font-size:10.5px;color:var(--text3);margin:2px 0 6px;min-height:26px;}
-.exec-spark{margin-bottom:6px;}
-.exec-delta{display:flex;align-items:center;gap:6px;}
-.exec-delta-label{font-size:10px;color:var(--text3);font-weight:600;}
-.exec-delta-val{font-size:12px;font-weight:600;}
-.peer-control-grid{display:flex;flex-wrap:wrap;gap:14px;margin-bottom:14px;align-items:flex-end;}
-.corr-control-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
-gap:14px;margin-bottom:14px;align-items:end;}
-.peer-control-metric{flex:0 0 500px;min-width:360px;max-width:610px;}
-.peer-control-date{flex:0 0 162px;min-width:150px;max-width:170px;}
-.peer-control-peers{flex:0 0 100%;width:100%;}
-.peer-metric-dd,.peer-date-dd{width:100%;}
-.peer-control-label{display:block;font-size:10px;font-weight:600;text-transform:uppercase;
-letter-spacing:0.4px;color:var(--text3);margin-bottom:5px;}
-.peer-select-row{display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap;}
-.peer-sel-dd{flex:1;min-width:240px;}
-.peer-actions{display:flex;gap:6px;}
-.tb-btn,.peer-btn{font-size:11px;font-weight:600;padding:6px 12px;border-radius:7px;border:1px solid var(--primary);
-background:var(--primary);color:#fff;cursor:pointer;}
-.tb-btn-secondary{background:#fff;color:var(--text2);border-color:var(--border);}
-.peer-section{margin-top:6px;}
-.paired-row{display:flex;flex-wrap:wrap;margin:0 -8px;}
-.pair-col{padding:0 8px;}
-.pair-card{background:#fff;border:1px solid var(--border);border-radius:10px;padding:14px;height:100%;
-min-height:432px;display:flex;flex-direction:column;}
-.viz-shell,.insight-load-shell{flex:1;}
-.corr-title-main{font-size:14px;font-weight:700;margin-bottom:12px;color:var(--text);}
-.det-card{background:linear-gradient(110deg,#0f2a4a,#1a3a5c);}
-.det-hdr{color:#fff;}
-.det-hdr .idd-d-light{min-width:150px;color:var(--text)!important;}
-.det-hdr .idd-d-light .Select-control,
-.det-hdr .idd-d-light [class*="-control"]{background:#fff!important;color:var(--text)!important;border:1px solid rgba(255,255,255,0.80)!important;border-radius:8px!important;box-shadow:none!important;min-height:34px!important;}
-.det-hdr .idd-d-light .Select-value,
-.det-hdr .idd-d-light .Select-placeholder{line-height:32px!important;}
-.det-hdr .idd-d-light .Select-value-label,
-.det-hdr .idd-d-light .Select-placeholder,
-.det-hdr .idd-d-light .Select-input>input,
-.det-hdr .idd-d-light .Select-value span,
-.det-hdr .idd-d-light [class*="-singleValue"],
-.det-hdr .idd-d-light [class*="-placeholder"],
-.det-hdr .idd-d-light [class*="-Input"] input{color:var(--text)!important;opacity:1!important;}
-.det-hdr .idd-d-light .Select-arrow-zone,
-.det-hdr .idd-d-light [class*="-indicatorContainer"]{color:var(--text3)!important;}
-.det-hdr .idd-d-light .Select-arrow{border-color:var(--text3) transparent transparent!important;}
-.det-hdr .idd-d-light.is-open .Select-arrow{border-color:transparent transparent var(--text3)!important;}
-.det-hdr .idd-d-light .Select-menu-outer,
-.det-hdr .idd-d-light [class*="-menu"]{background:#fff!important;color:var(--text)!important;z-index:9999!important;}
-.det-hdr .idd-d-light .VirtualizedSelectOption,
-.det-hdr .idd-d-light [class*="-option"]{color:var(--text)!important;background:#fff;}
-.det-hdr .idd-d-light .VirtualizedSelectFocusedOption,
-.det-hdr .idd-d-light [class*="-option"]:hover{background:#f1f5f9!important;color:var(--text)!important;}
-.det-legend{display:flex;align-items:center;gap:6px;color:#fff;font-size:11px;}
-.legend-dot{font-size:11px;}
-.export-btn{font-size:12px;font-weight:600;padding:7px 14px;border-radius:8px;border:none;
-background:#fff;color:var(--primary-dark);cursor:pointer;display:flex;align-items:center;}
-.dg{display:flex;flex-direction:column;gap:14px;}
-.det-cat-section{background:#fff;border-radius:10px;overflow:hidden;border:1px solid var(--border);}
-.det-cat-hdr{display:flex;align-items:center;gap:8px;padding:8px 12px;font-weight:700;font-size:12.5px;}
-.det-cat-count{margin-left:auto;font-size:11px;color:var(--text3);font-weight:600;}
-.det-cat-body{padding:8px 12px;}
-.dc{display:flex;flex-direction:column;}
-.dr{display:flex;justify-content:space-between;align-items:center;padding:7px 4px;
-border-bottom:1px solid #f1f5f9;gap:10px;}
-.dn{font-size:11.5px;color:var(--text2);flex:1;}
-.dright{display:flex;align-items:center;gap:12px;}
-.dv{font-size:13px;font-weight:700;min-width:78px;text-align:right;}
-.ddelta{display:flex;flex-direction:column;align-items:flex-end;}
-.ddelta-lbl{font-size:9px;color:var(--text3);}
-.ddelta-val{font-size:11px;font-weight:600;}
-.ow{display:flex;flex-direction:column;gap:14px;}
-.os{background:#f8fafc;border:1px solid var(--border);border-radius:9px;padding:10px 12px;}
-.ost{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.4px;color:var(--text3);
-margin-bottom:7px;}
-.or{display:flex;justify-content:space-between;padding:3px 0;font-size:12px;}
-.or.oh{font-weight:700;border-top:1px solid var(--border);padding-top:6px;margin-top:3px;}
-.ol{color:var(--text2);}
-.ov{font-weight:600;color:var(--text);text-align:right;}
-.pct-gauge-section{margin-bottom:6px;}
-.pct-gauge-wrap{display:flex;align-items:center;gap:14px;background:#f8fafc;border:1px solid var(--border);
-border-radius:9px;padding:12px;}
-.pct-info{display:flex;flex-direction:column;gap:2px;}
-.pct-label{font-size:10px;text-transform:uppercase;letter-spacing:0.4px;color:var(--text3);font-weight:600;}
-.pct-rank{font-size:17px;font-weight:700;}
-.pct-band{font-size:12px;}
-.df-line{font-size:11px;color:var(--text3);margin-top:8px;line-height:1.5;}
-.df-cat{font-weight:700;color:var(--text2);}
-.dfoot{margin-top:8px;}
-.ref-wrap{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px;}
-.ref-section{border:1px solid var(--border);border-radius:9px;overflow:hidden;}
-.ref-cat{display:flex;align-items:center;gap:8px;padding:8px 10px;background:#f8fafc;}
-.ref-cat-label{font-weight:700;font-size:12px;}
-.ref-cat-count{margin-left:auto;font-size:10.5px;color:var(--text3);}
-.ref-body{padding:6px 10px;}
-.ref-row{padding:6px 0;border-bottom:1px solid #f1f5f9;}
-.ref-name{font-size:11.5px;font-weight:600;color:var(--text);}
-.ref-desc{font-size:10.5px;color:var(--text3);line-height:1.5;margin-top:2px;}
-.dashboard-footer{margin-top:8px;}
-.data-scope-banner{background:#fff;border:1px solid var(--border);border-radius:11px;padding:14px 16px;
-margin-bottom:12px;}
-.scope-hdr{margin-bottom:10px;}
-.scope-title-wrap{display:flex;align-items:center;gap:10px;flex-wrap:wrap;}
-.scope-title-pill{background:var(--primary);color:#fff;font-size:11px;font-weight:700;padding:3px 10px;
-border-radius:20px;}
-.scope-meta{font-size:11px;color:var(--text3);}
-.scope-lines{display:flex;flex-direction:column;gap:5px;}
-.scope-line{display:flex;gap:8px;font-size:11.5px;}
-.scope-k{font-weight:700;color:var(--text2);min-width:120px;}
-.scope-v{color:var(--text3);}
-.dashboard-footer-note{padding:6px 2px;}
-.dashboard-footer-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.4px;
-color:var(--text3);margin-bottom:4px;}
-.dashboard-footer-text{font-size:11px;color:var(--text3);line-height:1.6;}
-.dashboard-footer-emph{font-weight:600;color:var(--text2);}
-.dashboard-footer-muted{font-style:italic;opacity:0.85;}
-.metric-opt{display:flex;align-items:center;gap:7px;padding:2px 0;}
-.metric-opt-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;}
-.metric-opt-cat{font-size:9px;font-weight:600;padding:1px 6px;border-radius:5px;white-space:nowrap;}
-.metric-opt-name{font-size:12px;color:var(--text);}
-.emp{color:var(--text3);font-size:12px;text-align:center;padding:20px;}
-.spark-img{display:block;}
-/* --- supplementary layout rules (containers/modifiers used by the layout) --- */
-.peer-performance-card,.jpm-corr-card,.ref-card{position:relative;}
-.peer-perf-top,.peer-perf-controls-only,.exec-banner-inner{display:block;}
-.peer-control{display:flex;flex-direction:column;}
-.peer-section-snapshot,.peer-section-trend{margin-top:4px;}
-.peer-subrow,.corr-subrow{margin-top:2px;}
-.peer-panel,.corr-panel{height:100%;}
-.pair-card-chart,.pair-card-side{min-height:432px;}
-.viz-graph{width:100%;}
-.insight-shell,.analysis-shell,.overview-shell{display:flex;flex-direction:column;gap:14px;
-height:auto;min-height:0;overflow:visible;}
-.det-cat-label{font-weight:700;font-size:12.5px;}
-.df-txt{color:var(--text3);}
-.dspark{display:flex;align-items:center;}
-.legend-txt{font-size:11px;color:inherit;margin-right:4px;}
-.corr-header-grid{margin-bottom:6px;}
-.corr-title-block{margin-bottom:4px;}
-.corr-control-metric,.corr-control-timeline{display:flex;flex-direction:column;}
-.peer-def-wrap{margin-top:10px;}
-.scope-title{font-weight:700;}
-@media (max-width:768px){.pair-col{flex:0 0 100%;max-width:100%;}.hdr-meta{text-align:left;}
-.peer-control-metric,.peer-control-date{flex:1 1 100%!important;max-width:100%!important;min-width:0!important;}}
-</style>
-</head>
-<body>
-{%app_entry%}
-<footer>{%config%}{%scripts%}{%renderer%}</footer>
-</body>
-</html>'''
+                    html.Span(style={'width': '4px', 'height': '16px',
+                                     'borderRadius': '3px', 'background': accent,
+                                     'display': 'inline-block'}),
+                    html.Span(CATEGORY_SHORT_LABELS.get(cat_name, cat_name)),
+                    html.Span(f"{len(present)} metrics", className='det-cat-count'),
+                ], className='det-cat-head', style={'background': bg, 'color': accent}),
+                html.Div(rows),
+            ], className='det-cat'))
+        return html.Div(cats)
 
 
-def build_error_dashboard(title, message, missing_banks=None):
-    app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP],
-                    meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}])
-    app.title = DASHBOARD_TITLE
-    extra = []
-    if missing_banks:
-        extra.append(html.Div("Affected banks: " + ", ".join(sorted(missing_banks)),
-                              style={"marginTop": "12px", "fontSize": "13px", "color": "#475569"}))
-    app.layout = html.Div([
-        html.Div([
-            html.Div("\u26a0", style={"fontSize": "40px", "marginBottom": "8px"}),
-            html.H3(title, style={"color": "#b91c1c", "fontWeight": "700"}),
-            html.P(message, style={"color": "#334155", "maxWidth": "640px", "margin": "10px auto",
-                                   "lineHeight": "1.6"}),
-            html.P("Real-data-only dashboard. No synthetic, sample, or fallback data is substituted "
-                   "if the FDIC API is unavailable. Refresh after verifying connectivity to retry.",
-                   style={"color": "#64748b", "fontSize": "12px", "maxWidth": "640px",
-                          "margin": "10px auto", "fontStyle": "italic"}),
-        ] + extra, style={"textAlign": "center", "padding": "70px 24px", "fontFamily": "'Inter',sans-serif"})
-    ], style={"minHeight": "100vh", "background": "#f4f6f9", "display": "flex",
-              "alignItems": "center", "justifyContent": "center"})
-    return app
+# =============================================================================
+# NON-BLOCKING BOOT -- module-level app binds to $PORT instantly; the FDIC
+# load runs in a background daemon thread started lazily on the FIRST page
+# request (lazy start also keeps the debug reloader and gunicorn forking from
+# double-spawning it). Visitors see a live-updating boot screen that reloads
+# itself into the dashboard when the data is ready.
+# =============================================================================
+class _AppState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.thread_started = False
+        self.status = 'loading'      # loading | ready | error
+        self.message = 'Contacting the FDIC BankFind API\u2026'
+        self.error_title = None
+        self.error_message = None
+        self.builder = None
+        self.missing_banks = []
 
 
-def main():
+STATE = _AppState()
+
+
+def _load_data():
+    def msg(m):
+        STATE.message = m
+        logger.info(f"[boot] {m}")
+
     try:
+        sd = DEFAULT_START_DATE
+        ed = datetime.today().strftime('%Y%m%d')  # recompute: dyno may outlive import day
+        msg(f"Requesting quarterly filings for {len(BANK_INFO)} institutions\u2026")
         service = BankDataService()
-        df = service.get_metrics_data()
-    except FDICDataUnavailableError as exc:
-        logger.error(f"FDIC data unavailable: {exc}")
-        return build_error_dashboard("FDIC Data Unavailable", str(exc))
-    except Exception as exc:  # noqa: BLE001 - last-resort guard so the dyno serves a page, not a 500
-        logger.exception("Unexpected error building dashboard data.")
-        return build_error_dashboard("Dashboard Error",
-                                     f"An unexpected error occurred while preparing the data: {exc}")
+        df = service.get_metrics_data(sd, ed, progress=msg)
+        if df is None or df.empty:
+            raise FDICDataUnavailableError(
+                "The FDIC API responded but produced zero usable bank-quarters.")
+        msg("Assembling peer statistics and layout\u2026")
+        present = set(df['Bank'].unique())
+        missing = [b['display'] for b in BANK_INFO if b['display'] not in present]
+        if PRIMARY_BANK_DISPLAY_NAME not in present:
+            raise FDICDataUnavailableError(
+                f"{PRIMARY_BANK_DISPLAY_NAME} (cert {PRIMARY_BANK_CERT}) is missing "
+                f"from the dataset; the dashboard cannot render without its anchor bank.")
+        cecl = service.calc.cecl_status()
+        builder = DashboardBuilder(df, cecl=cecl, missing_banks=missing)
+        STATE.missing_banks = missing
+        STATE.builder = builder          # set builder BEFORE flipping status
+        STATE.status = 'ready'
+        logger.info(f"[boot] READY: {len(builder.banks)} banks, "
+                    f"{len(builder.metrics)} metrics, latest {builder.latest}. "
+                    f"Missing: {missing or 'none'}. CECL: {cecl}")
+    except FDICDataUnavailableError as e:
+        STATE.error_title = "FDIC Data Unavailable"
+        STATE.error_message = str(e)
+        STATE.status = 'error'
+        logger.error(f"[boot] FDIC data unavailable: {e}")
+    except Exception as e:  # noqa: BLE001 -- surface anything to the error page
+        STATE.error_title = "Dashboard Error"
+        STATE.error_message = f"{type(e).__name__}: {e}"
+        STATE.status = 'error'
+        logger.exception("[boot] Unhandled error while building the dashboard.")
 
-    if df is None or df.empty:
-        return build_error_dashboard(
-            "FDIC Data Unavailable",
-            "The dashboard could not retrieve usable data from the FDIC BankFind API.")
 
-    expected_banks = {b['display'] for b in BANK_INFO}
-    actual_banks = set(df['Bank'].unique())
-    missing_banks = expected_banks - actual_banks
-    if missing_banks:
-        logger.warning(f"Rendering with missing banks (excluded from peer stats): {sorted(missing_banks)}")
-
-    cecl_status = service.calc.cecl_status()
-    logger.info(f"CECL concentration adjustment status: {cecl_status}")
-
-    builder = DashboardBuilder(df, missing_banks=missing_banks, cecl_status=cecl_status)
-    return builder.create_dashboard()
+def _ensure_loader_started():
+    if STATE.thread_started:
+        return
+    with STATE.lock:
+        if STATE.thread_started:
+            return
+        STATE.thread_started = True
+        t = threading.Thread(target=_load_data, name='fdic-loader', daemon=True)
+        t.start()
+        logger.info("[boot] FDIC loader thread started.")
 
 
-app = main()
+def _loading_layout():
+    return html.Div([
+        dcc.Location(id='boot-loc', refresh=True),
+        dcc.Interval(id='boot-int', interval=1250),
+        html.Div([
+            html.Div("JPM", className='boot-mark'),
+            html.Div(DASHBOARD_TITLE, className='boot-title'),
+            html.Div([html.Span(className='boot-dot'), html.Span(className='boot-dot'),
+                      html.Span(className='boot-dot')], className='boot-dots'),
+            html.Div(STATE.message, id='boot-msg', className='boot-msg'),
+            html.Div(f"Pulling full quarterly history for {len(BANK_INFO)} systemically "
+                     f"important banks from the FDIC BankFind API. A cold start takes "
+                     f"~30\u201390 seconds \u00b7 this page refreshes automatically.",
+                     className='boot-sub'),
+        ], className='boot-card'),
+    ], className='boot-screen')
+
+
+def _error_layout(title, message):
+    return html.Div([
+        html.Div([
+            html.Div("!", className='boot-mark'),
+            html.Div(title or "Dashboard Error", className='boot-title'),
+            html.Div(message or "An unexpected error occurred.", className='boot-err-msg'),
+            html.Div("This dashboard renders real FDIC data only \u2014 no synthetic "
+                     "fallback is ever substituted.", className='boot-note'),
+            html.A("Retry data load", href='/?retry=1', className='boot-retry'),
+        ], className='boot-card boot-card--err'),
+    ], className='boot-screen')
+
+
+def _serve_layout():
+    # An explicit retry resets an errored loader and spawns a fresh attempt.
+    try:
+        if (STATE.status == 'error'
+                and flask_request and flask_request.args.get('retry')):
+            with STATE.lock:
+                if STATE.status == 'error':
+                    STATE.status = 'loading'
+                    STATE.message = 'Retrying FDIC data load\u2026'
+                    STATE.error_title = None
+                    STATE.error_message = None
+                    STATE.thread_started = False
+    except RuntimeError:
+        pass  # outside a request context (e.g., layout validation)
+    _ensure_loader_started()
+    if STATE.status == 'ready' and STATE.builder is not None:
+        return STATE.builder._layout()
+    if STATE.status == 'error':
+        return _error_layout(STATE.error_title, STATE.error_message)
+    return _loading_layout()
+
+
+# =============================================================================
+# APP + CALLBACKS (registered once at import; every callback guards on STATE)
+# =============================================================================
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP],
+                meta_tags=[{'name': 'viewport',
+                            'content': 'width=device-width, initial-scale=1'}])
+app.title = DASHBOARD_SHORT_TITLE
+app.config.suppress_callback_exceptions = True
+app.index_string = INDEX_STRING
+app.layout = _serve_layout
 server = app.server
 
-if __name__ == "__main__":
-    app.run(debug=False)
+
+def register_callbacks(app):
+
+    @app.callback([Output('boot-msg', 'children'), Output('boot-loc', 'href')],
+                  Input('boot-int', 'n_intervals'))
+    def boot_poll(_n):
+        if STATE.status in ('ready', 'error'):
+            return no_update, '/'
+        return STATE.message, no_update
+
+    @app.callback(Output('peer-sel', 'value'),
+                  [Input('sel-all', 'n_clicks'), Input('sel-clear', 'n_clicks')],
+                  State('peer-sel', 'options'), prevent_initial_call=True)
+    def sel_action(n_all, n_clear, options):
+        ctx = dash.callback_context
+        if not ctx.triggered:
+            raise PreventUpdate
+        trig = ctx.triggered[0]['prop_id'].split('.')[0]
+        if trig == 'sel-all' and n_all:
+            return [x['value'] for x in (options or [])]
+        if trig == 'sel-clear' and n_clear:
+            return []
+        raise PreventUpdate
+
+    @app.callback(Output('exec-banner-wrap', 'children'), Input('peer-sel', 'value'))
+    def ue(p):
+        b = STATE.builder
+        if b is None:
+            raise PreventUpdate
+        return b._exec_banner(p or [])
+
+    @app.callback(Output('peer-def', 'children'), Input('peer-metric', 'value'))
+    def d_peer(m):
+        b = STATE.builder
+        if b is None:
+            raise PreventUpdate
+        return b._peer_metric_definition(m)
+
+    @app.callback(Output('peer-metric-wrap', 'style'), Input('peer-metric', 'value'))
+    def resize_peer_metric_control(m):
+        base = {'flex': '0 0 500px', 'maxWidth': '610px', 'minWidth': '360px'}
+        if STATE.builder is None or not m:
+            return base
+        # Widen the control for the long segment-metric names so the selected
+        # value never truncates; capped to keep the control row balanced.
+        width = min(610, max(360, 240 + 7 * len(str(m))))
+        return {'flex': f'0 0 {width}px', 'maxWidth': '610px', 'minWidth': '360px'}
+
+    @app.callback(Output('r3f', 'children'),
+                  [Input('r3p', 'value'), Input('r3s', 'value')])
+    def d3(a, b_):
+        b = STATE.builder
+        if b is None:
+            raise PreventUpdate
+        return html.Div([b._rdef(a, "Primary"), b._rdef(b_, "Secondary")])
+
+    @app.callback([Output('r1c', 'figure'), Output('r1o', 'children')],
+                  [Input('peer-metric', 'value'), Input('r1d', 'value'),
+                   Input('peer-sel', 'value')])
+    def u1(m, ds, p):
+        b = STATE.builder
+        if b is None:
+            raise PreventUpdate
+        if not m or not ds:
+            return b._ef(""), html.Div()
+        dt = pd.to_datetime(ds)
+        bk = [b.GHB] + (p or [])
+        f = b.df[(b.df['Date'] == dt) & b.df['Bank'].isin(bk)]
+        if f.empty:
+            return b._ef("No data"), html.Div()
+        return b._bar(f, m, dt), b._ov(f, m, dt)
+
+    @app.callback([Output('r2c', 'figure'), Output('r2a', 'children'),
+                   Output('r2r', 'children')],
+                  [Input('peer-metric', 'value'), Input('peer-sel', 'value'),
+                   Input('r2t', 'value')])
+    def u2(m, p, y):
+        b = STATE.builder
+        if b is None:
+            raise PreventUpdate
+        if not m:
+            return b._ef(""), html.Div(), ""
+        bk = [b.GHB] + (p or [])
+        y = y or 5
+        start, end = b._window_bounds(bk, y)
+        return b._trend(bk, m, y), b._ta(bk, m, y), b._window_label(start, end)
+
+    @app.callback([Output('r3c', 'figure'), Output('r3x', 'children')],
+                  [Input('r3p', 'value'), Input('r3s', 'value'), Input('r3t', 'value')])
+    def u3(a, b_, y):
+        b = STATE.builder
+        if b is None:
+            raise PreventUpdate
+        if not a or not b_:
+            return b._ef(""), html.Div()
+        return b._dual(a, b_, y or 10), b._corr(a, b_, y or 10)
+
+    @app.callback(Output('det', 'children'),
+                  [Input('det-date', 'value'), Input('det-bank', 'value')])
+    def ud(ds, bank):
+        b = STATE.builder
+        if b is None:
+            raise PreventUpdate
+        if not ds:
+            return html.P("Select a date", className='emp')
+        return b._bd(pd.to_datetime(ds), bank or b.GHB)
+
+    @app.callback(Output('dl', 'data'), Input('exp', 'n_clicks'),
+                  State('det-bank', 'value'), prevent_initial_call=True)
+    def export_all_periods(n, bank):
+        b = STATE.builder
+        if not n or b is None:
+            raise PreventUpdate
+        bank = bank or b.GHB
+        payload = build_bank_export(b.df, bank_display=bank)
+        safe = ''.join(ch if ch.isalnum() else '_' for ch in bank).strip('_')
+        fname = f"{safe}_all_metrics_{datetime.today().strftime('%Y%m%d')}.xlsx"
+        return dcc.send_bytes(payload, fname)
+
+
+register_callbacks(app)
+
+
+if __name__ == '__main__':
+    app.run(debug=False, host='0.0.0.0', port=int(os.environ.get('PORT', 8050)))
