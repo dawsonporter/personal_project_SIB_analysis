@@ -40,15 +40,53 @@ from dash.exceptions import PreventUpdate
 from flask import request as flask_request
 
 import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
-try:
-    ssl._create_default_https_context = ssl._create_unverified_context
-except AttributeError:
-    pass
 
 BASE_URL = "https://banks.data.fdic.gov/api"
+
+# --- FDIC API key (REQUIRED as of 2025-09-08) --------------------------------
+# The BankFind Suite API is fronted by the api.data.gov gateway and now rejects
+# unauthenticated requests. Register at https://api.data.gov/signup/ (linked
+# from BankFind Suite); keys are NOT retrievable if lost.
+#
+# PRECEDENCE: the FDIC_API_KEY environment variable WINS over the constant
+# below. That is deliberate for a deployed app -- on Heroku you rotate with
+#     heroku config:set FDIC_API_KEY=...
+# and never touch or redeploy source. The constant is the local-dev fallback.
+# A hard-coded key travels with every copy of this file and with every git
+# push, so blank it before the repo goes anywhere you do not control.
+FDIC_API_KEY = "CL2kk7opgrVdfmJu0CpFJJZrpfziI66opAuknOqY"
+
+# --- TLS verification --------------------------------------------------------
+# This module used to run with verify=False AND a process-wide
+# ssl._create_default_https_context = ssl._create_unverified_context. That was
+# tolerable while every request was anonymous reads of public data. It is not
+# tolerable now: each request carries a credential, and an unverified channel
+# hands that credential to whatever is sitting in the path. Heroku's dyno trust
+# store validates api.data.gov out of the box, so the default is now verified.
+#
+# Escape hatch for an intercepting corporate proxy with a private CA -- prefer
+# pointing REQUESTS_CA_BUNDLE at that CA over using this:
+#     FDIC_INSECURE_TLS=1
+FDIC_VERIFY_TLS = os.environ.get("FDIC_INSECURE_TLS", "").strip() not in ("1", "true", "TRUE", "yes")
+if not FDIC_VERIFY_TLS:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    try:
+        ssl._create_default_https_context = ssl._create_unverified_context
+    except AttributeError:
+        pass
+    logger.error(
+        "FDIC_INSECURE_TLS is set: certificate verification is DISABLED and the "
+        "FDIC API key will be transmitted over an unauthenticated channel. Any "
+        "device in the network path can capture it. Fix the trust store "
+        "(REQUESTS_CA_BUNDLE) and unset this as soon as possible.")
+
+
+def _resolve_api_key():
+    """The FDIC API key: environment variable wins, module constant is the
+    fallback. Env-first so a deployed dyno can rotate via config vars."""
+    return (os.environ.get("FDIC_API_KEY", "") or FDIC_API_KEY).strip()
 DEFAULT_START_DATE = '20030331'
 DEFAULT_END_DATE = datetime.today().strftime('%Y%m%d')
 REQUESTED_START_DATE_DISPLAY = '03/31/2003'
@@ -1000,8 +1038,23 @@ class FDICDataUnavailableError(RuntimeError):
 # FDIC API CLIENT
 # =============================================================================
 class FDICAPIClient:
-    def __init__(self):
+    def __init__(self, api_key=None):
         self.base_url = BASE_URL
+        self.api_key = (api_key or _resolve_api_key())
+        if not self.api_key:
+            raise FDICDataUnavailableError(
+                "No FDIC API key is configured. The BankFind Suite API has "
+                "rejected unauthenticated requests since 2025-09-08. Register "
+                "at https://api.data.gov/signup/ and set the FDIC_API_KEY "
+                "environment variable (heroku config:set FDIC_API_KEY=...) or "
+                "the FDIC_API_KEY constant near the top of this module.")
+        # api.data.gov gateway auth. The gateway also accepts an ?api_key=
+        # query parameter, but the header keeps the credential out of URLs,
+        # router logs, Heroku request logs and anything pasted into a ticket.
+        self.headers = {
+            "Accept": "application/json",
+            "X-Api-Key": self.api_key,
+        }
 
     def _get(self, ep, params, attempts=4):
         last_error = None
@@ -1011,10 +1064,21 @@ class FDICAPIClient:
                 r = requests.get(
                     f"{self.base_url}/{ep}",
                     params=params,
-                    headers={"Accept": "application/json"},
-                    verify=False,
+                    headers=self.headers,
+                    verify=FDIC_VERIFY_TLS,
                     timeout=45,
                 )
+                if r.status_code in (401, 403):
+                    # api.data.gov returns 403 for API_KEY_INVALID / _MISSING /
+                    # _DISABLED / _UNAUTHORIZED. None improve with a retry, and
+                    # with 12 banks x 2 endpoints x 4 attempts a bad key would
+                    # otherwise burn ~6 minutes of boot before the error screen.
+                    raise FDICDataUnavailableError(
+                        "The FDIC API rejected the request (HTTP %d): the API key "
+                        "is missing, invalid, disabled, or not authorized for this "
+                        "endpoint. Register or rotate at https://api.data.gov/signup/ "
+                        "and update FDIC_API_KEY. Gateway response: %s"
+                        % (r.status_code, (r.text or "")[:300]))
                 if r.status_code == 429 or 500 <= r.status_code < 600:
                     ra = r.headers.get('Retry-After')
                     if ra:
@@ -2658,6 +2722,12 @@ def _load_data():
         logger.info(f"[boot] {m}")
 
     try:
+        if not _resolve_api_key():
+            raise FDICDataUnavailableError(
+                "No FDIC API key is configured. The FDIC BankFind API has required "
+                "an API key since September 8, 2025. Register at "
+                "https://api.data.gov/signup/, then set the FDIC_API_KEY config "
+                "variable on this app and restart.")
         sd = DEFAULT_START_DATE
         ed = datetime.today().strftime('%Y%m%d')  # recompute: dyno may outlive import day
         msg(f"Requesting quarterly filings for {len(BANK_INFO)} institutions\u2026")
