@@ -1,4 +1,4 @@
-"""Systemically Important Banks Dashboard.
+"""JPMorgan Chase — Systemically Important Banks Dashboard.
 
 Heroku-ready Dash app. Key architecture notes:
   * NON-BLOCKING BOOT: the FDIC fetch (19 banks, full history) runs in a
@@ -56,7 +56,7 @@ BASE_URL = "https://banks.data.fdic.gov/api"
 # and never touch or redeploy source. The constant is the local-dev fallback.
 # A hard-coded key travels with every copy of this file and with every git
 # push, so blank it before the repo goes anywhere you do not control.
-FDIC_API_KEY = ""  # Local-dev fallback only; use Heroku FDIC_API_KEY config var.
+FDIC_API_KEY = "CL2kk7opgrVdfmJu0CpFJJZrpfziI66opAuknOqY"
 
 # --- TLS verification --------------------------------------------------------
 # This module used to run with verify=False AND a process-wide
@@ -93,16 +93,14 @@ REQUESTED_START_DATE_DISPLAY = '03/31/2003'
 COMMON_FULL_PEER_START_DATE_DISPLAY = '12/31/2008'
 CACHE_DIR = 'data_cache'
 os.makedirs(CACHE_DIR, exist_ok=True)
-DEFAULT_ANCHOR_BANK = "JPMorgan Chase"
-# JPM remains the documented CECL validation reference because the historical
-# Page 7B reconciliation notes below were explicitly validated against JPM.
-# This is methodological validation only; it is NOT the runtime dashboard anchor.
-CECL_VALIDATION_BANK = "JPMorgan Chase"
-DASHBOARD_TITLE = "Systemically Important Banks Dashboard"
+PRIMARY_BANK_DISPLAY_NAME = "JPMorgan Chase"
+PRIMARY_BANK_ABBR = "JPM"
+PRIMARY_BANK_FDIC_NAME = "JPMorgan Chase Bank, National Association"
+DASHBOARD_TITLE = "JPMorgan Chase \u2014 Systemically Important Banks Dashboard"
 DASHBOARD_SHORT_TITLE = "SIB Dashboard"
 PEER_UNIVERSE_LABEL = "Systemically Important Banks (SIBs)"
-HEADER_DISCLOSURE_SHORT = "Personal project \u00b7 public FDIC data \u00b7 not affiliated with any bank shown"
-FOOTER_DISCLOSURE_NOTE = "Independent personal project using public FDIC data; not affiliated with or endorsed by any bank shown."
+HEADER_DISCLOSURE_SHORT = "Personal project \u00b7 public FDIC data \u00b7 not affiliated with JPMorgan Chase"
+FOOTER_DISCLOSURE_NOTE = "Independent personal project using public FDIC data; not affiliated with or endorsed by JPMorgan Chase."
 PAIRED_GRAPH_HEIGHT = 340
 PAIRED_CARD_MIN_HEIGHT = 432
 OVERVIEW_GAUGE_SIZE = 78
@@ -198,14 +196,14 @@ CS = {
     'light': '#94a3b8', 'lighter': '#cbd5e1',
     'grid': 'rgba(15,23,42,0.05)', 'border': 'rgba(15,23,42,0.06)',
     'border_strong': 'rgba(15,23,42,0.12)',
-    'anchor': '#005EB8', 'peer': '#94a3b8', 'peer_op': 0.55,
+    'ghb': '#005EB8', 'peer': '#94a3b8', 'peer_op': 0.55,
     'good': '#16a34a', 'good_light': '#dcfce7', 'good_dark': '#166534',
     'warn': '#f59e0b', 'warn_light': '#fef3c7', 'warn_dark': '#b45309',
     'bad': '#ef4444', 'bad_light': '#fee2e2', 'bad_dark': '#b91c1c',
     'neutral': '#64748b', 'neutral_light': '#f1f5f9',
     'peer_band_top': '#475569', 'peer_band_mid': '#64748b', 'peer_band_low': '#94a3b8',
     'peer_band_bg': '#f8fafc', 'peer_tint': 'rgba(100,116,139,0.06)',
-    'hover_bg': '#f8fafc', 'anchor2': '#0B4F8A',
+    'hover_bg': '#f8fafc', 'ghb2': '#0B4F8A',
     'gold': '#d4a017', 'silver': '#a8a8a8', 'bronze': '#cd7f32',
     'spark': '#005EB8', 'spark_area': 'rgba(0,94,184,0.08)',
 }
@@ -240,9 +238,9 @@ BANK_INFO = [
 
 CERT_TO_DISPLAY = {b["cert"]: b["display"] for b in BANK_INFO}
 
-# Default-anchor metadata is derived from BANK_INFO so the configured default
-# cannot drift away from the bank universe. It is not a render requirement.
-DEFAULT_ANCHOR_BANK_CERT = next(b["cert"] for b in BANK_INFO if b["display"] == DEFAULT_ANCHOR_BANK)
+# The primary bank's cert is the one hard requirement for the dashboard to
+# render; derived from BANK_INFO so it can never drift out of sync.
+PRIMARY_BANK_CERT = next(b["cert"] for b in BANK_INFO if b["display"] == PRIMARY_BANK_DISPLAY_NAME)
 
 BANK_NAME_MAPPING = {
     "JPMORGAN CHASE BANK, NATIONAL ASSOCIATION": "JPMorgan Chase",
@@ -1262,7 +1260,7 @@ class BankMetricsCalculator:
         # CECL adjustment coverage diagnostics (populated during calculate_metrics).
         self.cecl_window_rows = 0       # bank-quarters inside the transition window
         self.cecl_applied_rows = 0      # bank-quarters where an add-back was applied
-        self.cecl_validation_samples = []  # [(REPDTE, addback$000s)] for CECL_VALIDATION_BANK
+        self.cecl_primary_samples = []  # [(REPDTE, addback$000s)] for the primary bank
 
     @staticmethod
     def _sf(v):
@@ -1439,8 +1437,8 @@ class BankMetricsCalculator:
             if candidate > 0:
                 adj_t1 = candidate
                 self.cecl_applied_rows += 1
-                if r.get('Bank') == CECL_VALIDATION_BANK and len(self.cecl_validation_samples) < 8:
-                    self.cecl_validation_samples.append((repdte, addback))
+                if r.get('Bank') == PRIMARY_BANK_DISPLAY_NAME and len(self.cecl_primary_samples) < 8:
+                    self.cecl_primary_samples.append((repdte, addback))
             # else: add-back exceeds Tier 1 (implausible) -> fall back unadjusted.
         base = adj_t1 + acl
         return base if base > 0 else None
@@ -1641,8 +1639,7 @@ class BankMetricsCalculator:
         return {'window_rows': self.cecl_window_rows,
                 'applied_rows': self.cecl_applied_rows,
                 'coverage_pct': cov,
-                'validation_bank': CECL_VALIDATION_BANK,
-                'validation_samples': list(self.cecl_validation_samples)}
+                'primary_samples': list(self.cecl_primary_samples)}
 
 
 # =============================================================================
@@ -1670,7 +1667,7 @@ class BankDataService:
 
 # =============================================================================
 # EXCEL EXPORT -- every period, every metric, one sheet per category, for any
-# bank in the cohort (defaults to the initial anchor bank).
+# bank in the cohort (defaults to the primary bank).
 # =============================================================================
 def _safe_sheet_title(name, max_len=31):
     """Excel sheet titles: <=31 chars, no []:*?/\\ characters."""
@@ -1679,7 +1676,7 @@ def _safe_sheet_title(name, max_len=31):
     return (clean[:max_len]) if clean else "Sheet"
 
 
-def build_bank_export(df, bank_display=DEFAULT_ANCHOR_BANK):
+def build_bank_export(df, bank_display=PRIMARY_BANK_DISPLAY_NAME):
     """All-periods Excel workbook for one bank: a sheet per metric category,
     metrics as rows, reporting dates as columns (oldest -> newest), values
     formatted exactly as the dashboard shows them. Returns workbook bytes."""
@@ -1749,7 +1746,7 @@ INDEX_STRING = """<!DOCTYPE html>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
         :root{
-            --anchor:#005EB8; --anchor-dark:#003B73; --anchor-light:#2F7FD3;
+            --jpm:#005EB8; --jpm-dark:#003B73; --jpm-light:#2F7FD3;
             --ink:#0f172a; --ink2:#475569; --ink3:#64748b;
             --bg:#f4f6f9; --card:#ffffff;
             --line:rgba(15,23,42,0.06); --line2:rgba(15,23,42,0.12);
@@ -1769,7 +1766,7 @@ INDEX_STRING = """<!DOCTYPE html>
         ::-webkit-scrollbar-track{background:transparent}
         ::-webkit-scrollbar-thumb{background:#c7d2de;border-radius:6px;border:2px solid var(--bg)}
         ::-webkit-scrollbar-thumb:hover{background:#9fb2c4}
-        :focus-visible{outline:2px solid var(--anchor);outline-offset:2px;border-radius:4px}
+        :focus-visible{outline:2px solid var(--jpm);outline-offset:2px;border-radius:4px}
 
         /* ---------- header ---------- */
         .hdr{position:sticky;top:0;z-index:60;
@@ -1818,7 +1815,7 @@ INDEX_STRING = """<!DOCTYPE html>
             color:var(--ink2);font:inherit;font-size:12px;font-weight:600;
             padding:7px 14px;border-radius:var(--r-sm);cursor:pointer;
             transition:all .15s ease;white-space:nowrap}
-        .btn-mini:hover{border-color:var(--anchor);color:var(--anchor);background:#f5f9fe}
+        .btn-mini:hover{border-color:var(--jpm);color:var(--jpm);background:#f5f9fe}
         .peer-count{font-size:11.5px;color:var(--ink3);margin-top:8px}
 
         /* ---------- executive banner ---------- */
@@ -1828,11 +1825,11 @@ INDEX_STRING = """<!DOCTYPE html>
             border-radius:var(--r-md);box-shadow:var(--sh-1);padding:13px 14px 12px;
             overflow:hidden;transition:box-shadow .18s ease,transform .18s ease}
         .exec-card::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;
-            background:var(--anchor);opacity:0;transition:opacity .18s ease}
+            background:var(--jpm);opacity:0;transition:opacity .18s ease}
         .exec-card:hover{transform:translateY(-2px);box-shadow:var(--sh-2)}
         .exec-card:hover::before{opacity:1}
         .exec-kpi-cat{font-size:10px;font-weight:700;letter-spacing:.08em;
-            text-transform:uppercase;color:var(--anchor)}
+            text-transform:uppercase;color:var(--jpm)}
         .exec-kpi-label{font-size:11.5px;font-weight:600;color:var(--ink2);
             margin-top:2px;min-height:30px;line-height:1.3}
         .exec-kpi-val{font-size:21px;font-weight:800;letter-spacing:-.02em;
@@ -1882,7 +1879,7 @@ INDEX_STRING = """<!DOCTYPE html>
             text-transform:uppercase;color:var(--ink3);margin:16px 0 6px}
         .pct-arc{flex:0 0 auto}
 
-        .anchor-corr-card .corr-val{font-size:30px;font-weight:800;
+        .jpm-corr-card .corr-val{font-size:30px;font-weight:800;
             font-variant-numeric:tabular-nums;letter-spacing:-.02em}
         .corr-label{font-size:11px;font-weight:700;letter-spacing:.06em;
             text-transform:uppercase;color:var(--ink3)}
@@ -1898,10 +1895,10 @@ INDEX_STRING = """<!DOCTYPE html>
         .det-bank-wrap{flex:0 0 300px;min-width:240px;transition:flex-basis .2s ease}
         .det-date-wrap{flex:0 0 190px}
         .btn-export{appearance:none;border:none;cursor:pointer;font:inherit;
-            font-size:12.5px;font-weight:700;color:#fff;background:var(--anchor);
+            font-size:12.5px;font-weight:700;color:#fff;background:var(--jpm);
             padding:9px 18px;border-radius:var(--r-sm);
             box-shadow:0 2px 8px -2px rgba(0,94,184,.55);transition:all .15s ease}
-        .btn-export:hover{background:var(--anchor-dark);transform:translateY(-1px)}
+        .btn-export:hover{background:var(--jpm-dark);transform:translateY(-1px)}
         .det-legend{font-size:11px;color:var(--ink3);margin-left:auto;align-self:center}
         .det-cat{margin-top:18px;border:1px solid var(--line);border-radius:var(--r-md);overflow:hidden}
         .det-cat-head{display:flex;align-items:center;gap:10px;padding:9px 14px;
@@ -1942,28 +1939,28 @@ INDEX_STRING = """<!DOCTYPE html>
             border:1px solid var(--line2)!important;border-radius:var(--r-sm)!important;
             min-height:38px!important;box-shadow:none!important;
             font-size:13px;transition:border-color .15s ease}
-        .dd .Select-control:hover,.dd [class*="-control"]:hover{border-color:var(--anchor)!important}
+        .dd .Select-control:hover,.dd [class*="-control"]:hover{border-color:var(--jpm)!important}
         .dd .is-focused .Select-control,.dd [class*="-control"][class*="-is-focused"],
         .dd [class*="-control"]:focus-within{
-            border-color:var(--anchor)!important;box-shadow:0 0 0 3px rgba(0,94,184,.14)!important}
+            border-color:var(--jpm)!important;box-shadow:0 0 0 3px rgba(0,94,184,.14)!important}
         .dd .Select-menu-outer,.dd [class*="-menu"]{
             border:1px solid var(--line2)!important;border-radius:var(--r-sm)!important;
             box-shadow:var(--sh-2)!important;font-size:13px;z-index:80!important}
         .dd .VirtualizedSelectFocusedOption,.dd [class*="-option"][class*="-is-focused"]{
             background:#eef5fd!important;color:var(--ink)!important}
         .dd [class*="-option"][class*="-is-selected"]{
-            background:var(--anchor)!important;color:#fff!important}
+            background:var(--jpm)!important;color:#fff!important}
         /* multi-select peer chips: compact, scrollable when 18 are selected */
         .dd .Select--multi .Select-multi-value-wrapper,
         .dd [class*="-control"] [class*="-ValueContainer"]{
             max-height:88px;overflow-y:auto}
         .dd .Select--multi .Select-value,.dd [class*="-multiValue"]{
             background:#e8f2fc!important;border:1px solid rgba(0,94,184,.25)!important;
-            border-radius:5px!important;color:var(--anchor-dark)!important;
+            border-radius:5px!important;color:var(--jpm-dark)!important;
             font-size:11.5px;font-weight:600}
         .dd .Select--multi .Select-value-icon:hover,
         .dd [class*="-multiValue"] [role="button"]:hover{
-            background:rgba(0,94,184,.18)!important;color:var(--anchor-dark)!important}
+            background:rgba(0,94,184,.18)!important;color:var(--jpm-dark)!important}
 
         /* ---------- boot / error screens ---------- */
         .boot-screen{min-height:100vh;display:flex;align-items:center;justify-content:center;
@@ -1980,7 +1977,7 @@ INDEX_STRING = """<!DOCTYPE html>
             box-shadow:0 10px 24px -8px rgba(0,94,184,.6)}
         .boot-title{margin:18px 0 4px;font-size:17px;font-weight:800;letter-spacing:-.01em}
         .boot-dots{display:flex;gap:7px;justify-content:center;margin:18px 0 14px}
-        .boot-dot{width:9px;height:9px;border-radius:50%;background:var(--anchor);
+        .boot-dot{width:9px;height:9px;border-radius:50%;background:var(--jpm);
             animation:bdot 1.25s ease-in-out infinite}
         .boot-dot:nth-child(2){animation-delay:.18s}
         .boot-dot:nth-child(3){animation-delay:.36s}
@@ -1992,10 +1989,10 @@ INDEX_STRING = """<!DOCTYPE html>
         .boot-err-msg{font-size:13px;color:var(--ink2);line-height:1.6;margin-top:8px}
         .boot-note{font-style:italic;font-size:11.5px;color:var(--ink3);margin-top:14px}
         .boot-retry{display:inline-block;margin-top:18px;padding:10px 22px;
-            border-radius:var(--r-sm);background:var(--anchor);color:#fff!important;
+            border-radius:var(--r-sm);background:var(--jpm);color:#fff!important;
             font-size:13px;font-weight:700;text-decoration:none;
             box-shadow:0 2px 10px -2px rgba(0,94,184,.6);transition:all .15s ease}
-        .boot-retry:hover{background:var(--anchor-dark);transform:translateY(-1px)}
+        .boot-retry:hover{background:var(--jpm-dark);transform:translateY(-1px)}
 
         /* ---------- responsive ---------- */
         @media (max-width:1180px){
@@ -2037,24 +2034,20 @@ INDEX_STRING = """<!DOCTYPE html>
 class DashboardBuilder:
     def __init__(self, df, cecl=None, missing_banks=None):
         self.df = df
+        self.GHB = PRIMARY_BANK_DISPLAY_NAME
         self.cecl = cecl or {}
         self.missing_banks = missing_banks or []
         self.metrics = [m for m in METRIC_ORDER if m in df.columns]
-
-        present = set(df['Bank'].dropna().unique())
+        present = set(df['Bank'].unique())
         self.banks = [b['display'] for b in BANK_INFO if b['display'] in present]
-        self.default_anchor = (DEFAULT_ANCHOR_BANK if DEFAULT_ANCHOR_BANK in self.banks
-                               else (self.banks[0] if self.banks else None))
-
-        # Global dates are retained only for header metadata. Analytical dates
-        # and windows are derived from the selected anchor at runtime.
-        self.dates = sorted(df['Date'].dropna().unique(), reverse=True)
+        self.peers = [b for b in self.banks if b != self.GHB]
+        prim = df[df['Bank'] == self.GHB]
+        self.dates = sorted(prim['Date'].unique(), reverse=True) if not prim.empty \
+            else sorted(df['Date'].unique(), reverse=True)
         self.latest = pd.Timestamp(self.dates[0]) if len(self.dates) else None
         self.default_metric = ('Return on Assets' if 'Return on Assets' in self.metrics
                                else (self.metrics[0] if self.metrics else None))
-
-        # Per-bank render caches are safe to share across sessions because the
-        # keys include bank/date and the underlying FDIC dataset is immutable.
+        # Per-bank render caches (cleared only on process restart -- data is static).
         self._bframes = {}
         self._bd_cache = {}
 
@@ -2067,56 +2060,9 @@ class DashboardBuilder:
                             clearable=clearable, placeholder=placeholder,
                             className='dd')
 
-    def _date_options(self, bank=None):
-        """Reporting-date dropdown options, optionally scoped to one bank."""
-        if bank is not None:
-            bank = self._valid_anchor(bank)
-            dates = self._bank_frame(bank)['Date'].dropna().unique() if bank else []
-        else:
-            dates = self.dates
-        return [{'label': pd.Timestamp(d).strftime('%m/%d/%Y'),
-                 'value': str(pd.Timestamp(d))}
-                for d in sorted(dates, reverse=True)]
-
-    def _valid_anchor(self, anchor):
-        """Return a valid runtime anchor without mutating shared builder state."""
-        if anchor in self.banks:
-            return anchor
-        return self.default_anchor
-
-    def _peer_banks(self, anchor):
-        anchor = self._valid_anchor(anchor)
-        return [bank for bank in self.banks if bank != anchor]
-
-    def _sanitize_peers(self, anchor, peers):
-        """Valid, de-duplicated peers in BANK_INFO display order; anchor excluded."""
-        anchor = self._valid_anchor(anchor)
-        selected = set(peers or [])
-        return [bank for bank in self.banks if bank != anchor and bank in selected]
-
-    def _latest_for_bank(self, bank):
-        bank = self._valid_anchor(bank)
-        if not bank:
-            return None
-        bf = self._bank_frame(bank)
-        dates = bf['Date'].dropna()
-        return pd.Timestamp(dates.max()) if not dates.empty else None
-
-    def _coerce_date_for_bank(self, bank, requested_date=None):
-        """Use requested date when the bank filed it; otherwise its latest date."""
-        bank = self._valid_anchor(bank)
-        if not bank:
-            return None
-        bf = self._bank_frame(bank)
-        dates = set(pd.Timestamp(d) for d in bf['Date'].dropna().unique())
-        if requested_date is not None:
-            try:
-                dt = pd.Timestamp(pd.to_datetime(requested_date))
-                if dt in dates:
-                    return dt
-            except (TypeError, ValueError):
-                pass
-        return max(dates) if dates else None
+    def _date_options(self):
+        return [{'label': pd.Timestamp(d).strftime('%m/%d/%Y'), 'value': str(pd.Timestamp(d))}
+                for d in self.dates]
 
     def _fmt(self, v, m):
         return fmt_val(v, m, with_unit=True)
@@ -2132,11 +2078,11 @@ class DashboardBuilder:
     def _bank_spark(self, bank, metric, lookback=8):
         return get_sparkline_series(self.df, bank, metric, lookback)
 
-    def _window_bounds(self, anchor, years):
-        """Trailing window ending on the selected anchor bank's latest filing."""
-        end = self._latest_for_bank(anchor)
-        if end is None:
+    def _window_bounds(self, banks, years):
+        sub = self.df[self.df['Bank'].isin(banks)]
+        if sub.empty:
             return None, None
+        end = sub['Date'].max()
         start = end - pd.DateOffset(years=years)
         return start, end
 
@@ -2188,28 +2134,24 @@ class DashboardBuilder:
         return fig
 
     # -------------------------------------------------------- header sections
-    def _exec_banner(self, anchor, selected_peers):
-        anchor = self._valid_anchor(anchor)
-        peers = self._sanitize_peers(anchor, selected_peers)
-        cohort = ([anchor] if anchor else []) + peers
-        latest = self._latest_for_bank(anchor)
-
+    def _exec_banner(self, selected_peers):
+        cohort = [self.GHB] + [p for p in (selected_peers or []) if p in self.peers]
         cards = []
         for metric, cat in EXECUTIVE_KPIS:
-            if metric not in self.metrics or latest is None or not anchor:
+            if metric not in self.metrics or self.latest is None:
                 continue
-            row = self.df[(self.df['Bank'] == anchor) & (self.df['Date'] == latest)]
+            row = self.df[(self.df['Bank'] == self.GHB) & (self.df['Date'] == self.latest)]
             val = row.iloc[0][metric] if not row.empty else None
-            qoq, _yoy = self._bank_qoq_yoy(anchor, metric, latest)
+            qoq, _yoy = self._bank_qoq_yoy(self.GHB, metric, self.latest)
             d_txt, d_col = fmt_delta(val, qoq, metric)
             chip_cls = 'flat'
             if d_col == CS['good']:
                 chip_cls = 'up'
             elif d_col == CS['bad']:
                 chip_cls = 'down'
-            rank, total, _pct = compute_peer_rank(self.df, anchor, metric, latest, cohort)
+            rank, total, _pct = compute_peer_rank(self.df, self.GHB, metric, self.latest, cohort)
             rank_txt = f"#{rank} of {total}" if rank else "\u2014"
-            spark = self._bank_spark(anchor, metric)
+            spark = self._bank_spark(self.GHB, metric)
             cards.append(html.Div([
                 html.Div(cat, className='exec-kpi-cat'),
                 html.Div(metric, className='exec-kpi-label'),
@@ -2220,14 +2162,12 @@ class DashboardBuilder:
                 ], className='exec-kpi-row'),
                 make_sparkline_img_cached(spark),
             ], className='exec-card'))
-
-        snap = latest.strftime('%m/%d/%Y') if latest is not None else "\u2014"
+        snap = self.latest.strftime('%m/%d/%Y') if self.latest is not None else "\u2014"
         return html.Div([
             html.Div([
-                html.H3(f"Executive Snapshot \u2014 {anchor or 'Anchor Bank'}",
-                        className='sec-title'),
-                html.P(f"Latest anchor quarter {snap} \u00b7 QoQ deltas \u00b7 rank vs "
-                       f"{len(peers)} selected peers", className='sec-sub'),
+                html.H3("Executive Snapshot \u2014 " + self.GHB, className='sec-title'),
+                html.P(f"Latest quarter {snap} \u00b7 QoQ deltas \u00b7 rank vs "
+                       f"{len(cohort) - 1} selected peers", className='sec-sub'),
             ], className='sec-head'),
             html.Div(cards, className='exec-grid'),
         ])
@@ -2284,11 +2224,9 @@ class DashboardBuilder:
     # ----------------------------------------------------------------- layout
     def _layout(self):
         metric_opts = [self._metric_option(m) for m in self.metrics]
-        initial_anchor = self.default_anchor
-        anchor_date_opts = self._date_options(initial_anchor)
-        latest_anchor_val = anchor_date_opts[0]['value'] if anchor_date_opts else None
-        initial_peers = self._peer_banks(initial_anchor)
-        peer_opts = [{'label': p, 'value': p} for p in initial_peers]
+        date_opts = self._date_options()
+        latest_val = date_opts[0]['value'] if date_opts else None
+        peer_opts = [{'label': p, 'value': p} for p in self.peers]
         bank_opts = [{'label': b, 'value': b} for b in self.banks]
         year_opts = [{'label': f"{y} yr" if y > 1 else "1 yr", 'value': y}
                      for y in (1, 2, 3, 5, 10, 23)]
@@ -2309,27 +2247,20 @@ class DashboardBuilder:
 
         peer_card = html.Div([
             html.Div([
-                html.H6("Comparison Set", className='ct'),
+                html.H6("Peer Set", className='ct'),
                 html.Span(PEER_UNIVERSE_LABEL, className='csub'),
             ], className='ch'),
             html.Div([
-                html.Div([
-                    html.Span("Anchor Bank", className='ctl-label'),
-                    self._mdd('anchor-bank', initial_anchor, bank_opts, clearable=False),
-                ], className='ctl', style={'flex': '0 0 300px', 'minWidth': '240px'}),
-                html.Div([
-                    html.Span("Comparison Peers", className='ctl-label'),
-                    self._mdd('peer-sel', initial_peers, peer_opts, multi=True,
-                              placeholder="Select peer banks\u2026"),
-                ], className='peer-dd-wrap'),
+                html.Div(self._mdd('peer-sel', self.peers, peer_opts, multi=True,
+                                   placeholder="Select peer banks\u2026"),
+                         className='peer-dd-wrap'),
                 html.Div([
                     html.Button("Select all", id='sel-all', n_clicks=None, className='btn-mini'),
                     html.Button("Clear", id='sel-clear', n_clicks=None, className='btn-mini'),
-                ], className='peer-actions', style={'alignSelf': 'flex-end'}),
+                ], className='peer-actions'),
             ], className='peer-row'),
-            html.Div(f"{initial_anchor} is the anchor \u00b7 "
-                     f"{len(initial_peers)} selected comparison peers",
-                     id='peer-count', className='peer-count'),
+            html.Div(f"{self.GHB} is always included; statistics use the selected peers.",
+                     className='peer-count'),
         ], className='card peer-card')
 
         snapshot_sec = html.Div([
@@ -2345,7 +2276,7 @@ class DashboardBuilder:
                 ], id='peer-metric-wrap', className='ctl peer-metric-wrap'),
                 html.Div([
                     html.Span("Snapshot date", className='ctl-label'),
-                    self._mdd('r1d', latest_anchor_val, anchor_date_opts),
+                    self._mdd('r1d', latest_val, date_opts),
                 ], className='ctl', style={'flex': '0 0 190px'}),
                 html.Div([
                     html.Span("Trend window", className='ctl-label'),
@@ -2358,8 +2289,7 @@ class DashboardBuilder:
             html.Div([
                 html.Div(html.Div([
                     html.Div([html.H6("Peer Snapshot", className='ct'),
-                              html.Span(f"ranked bar \u00b7 {initial_anchor} highlighted",
-                                        id='snapshot-highlight-label', className='csub')],
+                              html.Span("ranked bar \u00b7 JPM highlighted", className='csub')],
                              className='ch'),
                     dcc.Loading(dcc.Graph(id='r1c', config=GRAPH_CONFIG), type='dot',
                                 color=CS['primary']),
@@ -2387,8 +2317,8 @@ class DashboardBuilder:
         dual_sec = html.Div([
             html.Div([
                 html.H3("Metric Relationship", className='sec-title'),
-                html.P(f"Two metrics for {initial_anchor} on independent axes, with Pearson correlation.",
-                       id='relationship-subtitle', className='sec-sub'),
+                html.P("Two metrics for JPMorgan on independent axes, with Pearson correlation.",
+                       className='sec-sub'),
             ], className='sec-head'),
             html.Div([
                 html.Div([html.Span("Primary metric", className='ctl-label'),
@@ -2406,18 +2336,16 @@ class DashboardBuilder:
             html.Div(id='r3f'),
             html.Div([
                 html.Div(html.Div([
-                    html.Div([html.H6(f"Dual-Axis Trend \u2014 {initial_anchor}",
-                                            id='dual-title', className='ct')],
+                    html.Div([html.H6("Dual-Axis Trend \u2014 JPMorgan", className='ct')],
                              className='ch'),
                     dcc.Loading(dcc.Graph(id='r3c', config=GRAPH_CONFIG), type='dot',
                                 color=CS['primary']),
                 ], className='card'), className='chart-col'),
                 html.Div(html.Div([
-                    html.Div([html.H6(f"{initial_anchor} Correlation Analysis",
-                                            id='corr-title', className='ct')],
+                    html.Div([html.H6("JPMorgan Correlation Analysis", className='ct')],
                              className='ch'),
                     html.Div(id='r3x', className='insight-shell'),
-                ], className='card anchor-corr-card'), className='insight-col'),
+                ], className='card jpm-corr-card'), className='insight-col'),
             ], className='paired-row'),
         ], className='sec')
 
@@ -2429,10 +2357,10 @@ class DashboardBuilder:
             ], className='ch'),
             html.Div([
                 html.Div([html.Span("Bank", className='ctl-label'),
-                          self._mdd('det-bank', initial_anchor, bank_opts)],
+                          self._mdd('det-bank', self.GHB, bank_opts)],
                          id='det-bank-wrap', className='ctl det-bank-wrap'),
                 html.Div([html.Span("As of", className='ctl-label'),
-                          self._mdd('det-date', latest_anchor_val, anchor_date_opts)],
+                          self._mdd('det-date', latest_val, date_opts)],
                          className='ctl det-date-wrap'),
                 html.Button("Export all periods (Excel)", id='exp', n_clicks=None,
                             className='btn-export'),
@@ -2451,13 +2379,12 @@ class DashboardBuilder:
         ], className='ftr')
 
         return html.Div([
-            dcc.Store(id='anchor-state', data=initial_anchor, storage_type='memory'),
             header,
             html.Div([
                 peer_card,
                 self._missing_data_banner(),
-                html.Div(self._exec_banner(initial_anchor, initial_peers),
-                         id='exec-banner-wrap', className='sec'),
+                html.Div(self._exec_banner(self.peers), id='exec-banner-wrap',
+                         className='sec'),
                 snapshot_sec,
                 dual_sec,
                 detail_sec,
@@ -2467,9 +2394,9 @@ class DashboardBuilder:
         ])
 
     # =========================================================== chart methods
-    def _bar(self, f, m, anchor, dt=None):
-        """Ranked horizontal snapshot; runtime anchor emphasized, peers muted."""
-        anchor = self._valid_anchor(anchor)
+    def _bar(self, f, m, dt=None):
+        """Ranked horizontal peer snapshot. JPM gets the brand color and a dark
+        outline; peers are muted slate. Direction-aware: best at the TOP."""
         f = f.dropna(subset=[m]).drop_duplicates(subset=['Bank'], keep='last')
         if f.empty:
             return self._ef("No data for this metric/date")
@@ -2477,21 +2404,20 @@ class DashboardBuilder:
         f = f.sort_values(m, ascending=asc)
         banks = list(f['Bank'])
         vals = list(f[m])
-        colors = [CS['anchor'] if bank == anchor else CS['peer'] for bank in banks]
-        line_colors = [CS['primary_dark'] if bank == anchor else 'rgba(0,0,0,0)'
-                       for bank in banks]
-        line_widths = [1.4 if bank == anchor else 0 for bank in banks]
+        colors = [CS['ghb'] if b == self.GHB else CS['peer'] for b in banks]
+        line_colors = [CS['primary_dark'] if b == self.GHB else 'rgba(0,0,0,0)' for b in banks]
+        line_widths = [1.4 if b == self.GHB else 0 for b in banks]
         texts = [self._fmt(v, m) for v in vals]
         fig = go.Figure(go.Bar(
             x=vals, y=banks, orientation='h',
-            marker=dict(color=colors,
-                        opacity=[1.0 if bank == anchor else CS['peer_op'] for bank in banks],
+            marker=dict(color=colors, opacity=[1.0 if b == self.GHB else CS['peer_op']
+                                               for b in banks],
                         line=dict(color=line_colors, width=line_widths)),
             text=texts, textposition='outside', cliponaxis=False,
             textfont=dict(size=10.5, family='Inter, sans-serif'),
             hovertemplate='%{y}: %{text}<extra></extra>',
         ))
-        peer_vals = [v for bank, v in zip(banks, vals) if bank != anchor]
+        peer_vals = [v for b, v in zip(banks, vals) if b != self.GHB]
         if peer_vals:
             avg = float(np.nanmean(peer_vals))
             fig.add_vline(x=avg, line_dash='dot', line_color=CS['peer_band_mid'],
@@ -2506,15 +2432,15 @@ class DashboardBuilder:
             fig.update_xaxes(tickformat='~s')
         return self._bl(fig)
 
-    def _ov(self, f, m, dt, anchor):
-        """Metric overview for the runtime anchor vs selected comparison peers."""
-        anchor = self._valid_anchor(anchor)
+    def _ov(self, f, m, dt):
+        """Metric overview panel: JPM value, percentile gauge, rank, peer
+        statistics, deltas, and the 8-quarter JPM momentum sparkline."""
         f = f.dropna(subset=[m]).drop_duplicates(subset=['Bank'], keep='last')
-        row = f[f['Bank'] == anchor]
+        row = f[f['Bank'] == self.GHB]
         val = row.iloc[0][m] if not row.empty else None
         cohort = list(f['Bank'])
-        rank, total, pct = compute_peer_rank(self.df, anchor, m, dt, cohort)
-        peer_df = f[f['Bank'] != anchor]
+        rank, total, pct = compute_peer_rank(self.df, self.GHB, m, dt, cohort)
+        peer_df = f[f['Bank'] != self.GHB]
         stats_rows = []
         if not peer_df.empty:
             pv = peer_df[m].dropna()
@@ -2528,7 +2454,7 @@ class DashboardBuilder:
                     ("Peer low", f"{self._fmt(float(pv.loc[lo_i]), m)} \u00b7 "
                                  f"{peer_df.loc[lo_i, 'Bank']}"),
                 ]
-        qoq, yoy = self._bank_qoq_yoy(anchor, m, dt)
+        qoq, yoy = self._bank_qoq_yoy(self.GHB, m, dt)
         q_txt, q_col = fmt_delta(val, qoq, m)
         y_txt, y_col = fmt_delta(val, yoy, m)
 
@@ -2544,7 +2470,7 @@ class DashboardBuilder:
             html.Div([
                 html.Div([
                     html.Div([html.Span(self._fmt(val, m), className='ov-val'),
-                              html.Span(anchor or "Anchor", className='ov-unit')]),
+                              html.Span(self.GHB, className='ov-unit')]),
                     html.Div(rank_line, className='ov-rank'),
                     html.Div([chip(q_txt, q_col, 'QoQ'), chip(y_txt, y_col, 'YoY')],
                              style={'marginTop': '9px'}),
@@ -2555,14 +2481,13 @@ class DashboardBuilder:
                                 html.Div(v, className='ov-stat-val')],
                                className='ov-stat') for lbl, v in stats_rows],
                      className='ov-stats'),
-            html.Div("Anchor Momentum \u00b7 trailing 8 quarters", className='ov-mom-label'),
-            make_sparkline_img_cached(self._bank_spark(anchor, m), width=240, height=44,
+            html.Div("JPM Momentum \u00b7 trailing 8 quarters", className='ov-mom-label'),
+            make_sparkline_img_cached(self._bank_spark(self.GHB, m), width=240, height=44,
                                       cls='spark-img'),
         ], className='ov-wrap')
 
-    def _trend(self, banks, m, years, anchor):
-        anchor = self._valid_anchor(anchor)
-        start, end = self._window_bounds(anchor, years)
+    def _trend(self, banks, m, years):
+        start, end = self._window_bounds(banks, years)
         if start is None:
             return self._ef("No data")
         sub = self.df[(self.df['Bank'].isin(banks)) & (self.df['Date'] >= start)
@@ -2572,7 +2497,7 @@ class DashboardBuilder:
             return self._ef("No data in window")
         piv = (sub.drop_duplicates(subset=['Bank', 'Date'], keep='last')
                   .pivot(index='Date', columns='Bank', values=m).sort_index())
-        peer_cols = [c for c in piv.columns if c != anchor]
+        peer_cols = [c for c in piv.columns if c != self.GHB]
         fig = go.Figure()
         if peer_cols:
             pmax = piv[peer_cols].max(axis=1)
@@ -2590,17 +2515,16 @@ class DashboardBuilder:
                                      line=dict(color=CS['peer_band_mid'], width=1.4,
                                                dash='dash'),
                                      hovertemplate='Peer median: %{y:.2f}<extra></extra>'))
-        if anchor in piv.columns:
-            anchor_series = piv[anchor]
-            fig.add_trace(go.Scatter(x=piv.index, y=anchor_series, mode='lines',
-                                     name=anchor,
-                                     line=dict(color=CS['anchor'], width=2.6),
-                                     hovertemplate=anchor + ': %{y:.2f}<extra></extra>'))
-            ann = anchor_series.dropna()
-            if not ann.empty:
-                fig.add_trace(go.Scatter(x=[ann.index[-1]], y=[ann.iloc[-1]],
+        if self.GHB in piv.columns:
+            jp = piv[self.GHB]
+            fig.add_trace(go.Scatter(x=piv.index, y=jp, mode='lines', name=self.GHB,
+                                     line=dict(color=CS['ghb'], width=2.6),
+                                     hovertemplate=self.GHB + ': %{y:.2f}<extra></extra>'))
+            jnn = jp.dropna()
+            if not jnn.empty:
+                fig.add_trace(go.Scatter(x=[jnn.index[-1]], y=[jnn.iloc[-1]],
                                          mode='markers', showlegend=False,
-                                         marker=dict(size=7, color=CS['anchor'],
+                                         marker=dict(size=7, color=CS['ghb'],
                                                      line=dict(color='white', width=2)),
                                          hoverinfo='skip'))
         self._base_fig_layout(fig)
@@ -2609,16 +2533,15 @@ class DashboardBuilder:
             fig.update_yaxes(tickformat='~s')
         return self._bl(fig)
 
-    def _ta(self, banks, m, years, anchor):
-        anchor = self._valid_anchor(anchor)
-        start, end = self._window_bounds(anchor, years)
+    def _ta(self, banks, m, years):
+        start, end = self._window_bounds(banks, years)
         if start is None:
             return html.P("No data", className='emp')
-        adf = self._bank_frame(anchor)
-        adf = adf[(adf['Date'] >= start) & (adf['Date'] <= end)].dropna(subset=[m])
-        if len(adf) < 2:
+        jdf = self._bank_frame(self.GHB)
+        jdf = jdf[(jdf['Date'] >= start) & (jdf['Date'] <= end)].dropna(subset=[m])
+        if len(jdf) < 2:
             return html.P("Not enough history in this window", className='emp')
-        vals = adf[m].astype(float).values
+        vals = jdf[m].astype(float).values
         sv, ev = vals[0], vals[-1]
         chg = calc_trend_change(sv, ev, m)
         x = np.arange(len(vals))
@@ -2626,10 +2549,9 @@ class DashboardBuilder:
         vol = float(np.nanstd(vals))
         mean = float(np.nanmean(vals))
         cv = (vol / abs(mean) * 100) if mean not in (0, None) and abs(mean) > 1e-12 else None
-
-        # Correlation with selected-peer median over the same anchor-defined window.
+        # correlation with the peer median over the same dates
         corr_txt = "N/A"
-        peers = [bank for bank in banks if bank != anchor]
+        peers = [b for b in banks if b != self.GHB]
         if peers:
             sub = self.df[(self.df['Bank'].isin(peers)) & (self.df['Date'] >= start)
                           & (self.df['Date'] <= end)].dropna(subset=[m])
@@ -2637,13 +2559,13 @@ class DashboardBuilder:
                 pmed = (sub.drop_duplicates(subset=['Bank', 'Date'], keep='last')
                            .pivot(index='Date', columns='Bank', values=m)
                            .median(axis=1))
-                joined = pd.concat([adf.set_index('Date')[m], pmed], axis=1,
+                joined = pd.concat([jdf.set_index('Date')[m], pmed], axis=1,
                                    join='inner').dropna()
                 if len(joined) >= 3:
-                    av = joined.iloc[:, 0].values
-                    pv = joined.iloc[:, 1].values
-                    if np.std(av) > 1e-12 and np.std(pv) > 1e-12:
-                        r, _ = stats.pearsonr(av, pv)
+                    a = joined.iloc[:, 0].values
+                    b = joined.iloc[:, 1].values
+                    if np.std(a) > 1e-12 and np.std(b) > 1e-12:
+                        r, _ = stats.pearsonr(a, b)
                         corr_txt = f"{r:+.2f}"
         items = [
             ("Window", self._window_label(start, end)),
@@ -2660,19 +2582,18 @@ class DashboardBuilder:
                                   className='ov-stat') for lbl, v in items],
                         className='ov-stats')
 
-    def _dual(self, a, b, years, anchor):
-        anchor = self._valid_anchor(anchor)
-        start, end = self._window_bounds(anchor, years)
+    def _dual(self, a, b, years):
+        start, end = self._window_bounds([self.GHB], years)
         if start is None:
             return self._ef("No data")
-        adf = self._bank_frame(anchor)
-        adf = adf[(adf['Date'] >= start) & (adf['Date'] <= end)]
+        jdf = self._bank_frame(self.GHB)
+        jdf = jdf[(jdf['Date'] >= start) & (jdf['Date'] <= end)]
         fig = make_subplots(specs=[[{"secondary_y": True}]])
-        fig.add_trace(go.Scatter(x=adf['Date'], y=adf[a], name=a, mode='lines',
-                                 line=dict(color=CS['anchor'], width=2.4),
+        fig.add_trace(go.Scatter(x=jdf['Date'], y=jdf[a], name=a, mode='lines',
+                                 line=dict(color=CS['ghb'], width=2.4),
                                  hovertemplate=a + ': %{y:.2f}<extra></extra>'),
                       secondary_y=False)
-        fig.add_trace(go.Scatter(x=adf['Date'], y=adf[b], name=b, mode='lines',
+        fig.add_trace(go.Scatter(x=jdf['Date'], y=jdf[b], name=b, mode='lines',
                                  line=dict(color=CS['warn'], width=2.2, dash='dot'),
                                  hovertemplate=b + ': %{y:.2f}<extra></extra>'),
                       secondary_y=True)
@@ -2687,17 +2608,16 @@ class DashboardBuilder:
             fig.update_yaxes(tickformat='~s', secondary_y=True)
         return self._bl(fig)
 
-    def _corr(self, a, b, years, anchor):
-        anchor = self._valid_anchor(anchor)
-        start, end = self._window_bounds(anchor, years)
+    def _corr(self, a, b, years):
+        start, end = self._window_bounds([self.GHB], years)
         if start is None:
             return html.P("No data", className='emp')
-        adf = self._bank_frame(anchor)
-        adf = adf[(adf['Date'] >= start) & (adf['Date'] <= end)][[a, b]].dropna()
-        if len(adf) < 3:
+        jdf = self._bank_frame(self.GHB)
+        jdf = jdf[(jdf['Date'] >= start) & (jdf['Date'] <= end)][[a, b]].dropna()
+        if len(jdf) < 3:
             return html.P("Fewer than 3 overlapping quarters \u2014 correlation not computed.",
                           className='emp')
-        x, y = adf[a].values.astype(float), adf[b].values.astype(float)
+        x, y = jdf[a].values.astype(float), jdf[b].values.astype(float)
         if np.std(x) < 1e-12 or np.std(y) < 1e-12:
             return html.P("One series is constant in this window \u2014 correlation undefined.",
                           className='emp')
@@ -2708,7 +2628,7 @@ class DashboardBuilder:
         direction = "positive" if r > 0 else "negative"
         col = CS['good'] if r > 0.2 else (CS['bad'] if r < -0.2 else CS['neutral'])
         interp = (f"A {strength} {direction} relationship between \u201c{a}\u201d and "
-                  f"\u201c{b}\u201d for {anchor} across {len(adf)} quarters "
+                  f"\u201c{b}\u201d for {self.GHB} across {len(jdf)} quarters "
                   f"({self._window_label(start, end)}). p = {p:.3f}. "
                   f"Correlation is descriptive, not causal.")
         return html.Div([
@@ -2719,7 +2639,7 @@ class DashboardBuilder:
 
     # ----------------------------------------------------- All-Metrics detail
     def _bd(self, dt, bank=None):
-        bank = bank or self.default_anchor
+        bank = bank or self.GHB
         key = (bank, pd.Timestamp(dt))
         if key in self._bd_cache:
             return self._bd_cache[key]
@@ -2819,10 +2739,10 @@ def _load_data():
         msg("Assembling peer statistics and layout\u2026")
         present = set(df['Bank'].unique())
         missing = [b['display'] for b in BANK_INFO if b['display'] not in present]
-        available = [b['display'] for b in BANK_INFO if b['display'] in present]
-        if not available:
+        if PRIMARY_BANK_DISPLAY_NAME not in present:
             raise FDICDataUnavailableError(
-                "The FDIC API returned no usable institutions from the configured bank universe.")
+                f"{PRIMARY_BANK_DISPLAY_NAME} (cert {PRIMARY_BANK_CERT}) is missing "
+                f"from the dataset; the dashboard cannot render without its anchor bank.")
         cecl = service.calc.cecl_status()
         builder = DashboardBuilder(df, cecl=cecl, missing_banks=missing)
         STATE.missing_banks = missing
@@ -2860,14 +2780,14 @@ def _loading_layout():
         dcc.Location(id='boot-loc', refresh=True),
         dcc.Interval(id='boot-int', interval=1250),
         html.Div([
-            html.Div("SIB", className='boot-mark'),
+            html.Div("JPM", className='boot-mark'),
             html.Div(DASHBOARD_TITLE, className='boot-title'),
             html.Div([html.Span(className='boot-dot'), html.Span(className='boot-dot'),
                       html.Span(className='boot-dot')], className='boot-dots'),
             html.Div(STATE.message, id='boot-msg', className='boot-msg'),
             html.Div(f"Pulling full quarterly history for {len(BANK_INFO)} systemically "
-                     f"important banks from the FDIC BankFind API. This page refreshes "
-                     f"automatically when the live dataset is ready.",
+                     f"important banks from the FDIC BankFind API. A cold start takes "
+                     f"~30\u201390 seconds \u00b7 this page refreshes automatically.",
                      className='boot-sub'),
         ], className='boot-card'),
     ], className='boot-screen')
@@ -2930,112 +2850,26 @@ def register_callbacks(app):
             return no_update, '/'
         return STATE.message, no_update
 
-    @app.callback(
-        [Output('peer-sel', 'options'),
-         Output('peer-sel', 'value'),
-         Output('anchor-state', 'data'),
-         Output('peer-count', 'children')],
-        [Input('anchor-bank', 'value'),
-         Input('sel-all', 'n_clicks'),
-         Input('sel-clear', 'n_clicks')],
-        [State('peer-sel', 'value'),
-         State('anchor-state', 'data')],
-        prevent_initial_call=True)
-    def manage_comparison_set(requested_anchor, n_all, n_clear,
-                              selected_peers, previous_anchor):
-        """Atomic anchor/peer role management for one browser session.
-
-        The shared STATE.builder is never mutated. When the anchor changes, the
-        new anchor is removed from peers and the previous anchor becomes a peer.
-        """
-        b = STATE.builder
-        if b is None:
-            raise PreventUpdate
-
-        anchor = b._valid_anchor(requested_anchor)
-        if anchor is None:
-            raise PreventUpdate
-        previous_anchor = b._valid_anchor(previous_anchor)
-        available_peers = b._peer_banks(anchor)
-        selected = set(selected_peers or [])
-
+    @app.callback(Output('peer-sel', 'value'),
+                  [Input('sel-all', 'n_clicks'), Input('sel-clear', 'n_clicks')],
+                  State('peer-sel', 'options'), prevent_initial_call=True)
+    def sel_action(n_all, n_clear, options):
         ctx = dash.callback_context
         if not ctx.triggered:
             raise PreventUpdate
         trig = ctx.triggered[0]['prop_id'].split('.')[0]
-
         if trig == 'sel-all' and n_all:
-            selected = set(available_peers)
-        elif trig == 'sel-clear' and n_clear:
-            selected = set()
-        elif trig == 'anchor-bank':
-            # Runtime role swap: new anchor cannot be a peer; prior anchor
-            # becomes a selected comparison peer whenever it is still available.
-            selected.discard(anchor)
-            if previous_anchor and previous_anchor != anchor:
-                selected.add(previous_anchor)
-        else:
-            raise PreventUpdate
+            return [x['value'] for x in (options or [])]
+        if trig == 'sel-clear' and n_clear:
+            return []
+        raise PreventUpdate
 
-        # Defensive cleanup and deterministic BANK_INFO ordering.
-        selected.discard(anchor)
-        selected_ordered = [bank for bank in available_peers if bank in selected]
-        peer_options = [{'label': bank, 'value': bank} for bank in available_peers]
-        count_text = (f"{anchor} is the anchor \u00b7 "
-                      f"{len(selected_ordered)} selected comparison peers")
-        return peer_options, selected_ordered, anchor, count_text
-
-    @app.callback(
-        [Output('snapshot-highlight-label', 'children'),
-         Output('relationship-subtitle', 'children'),
-         Output('dual-title', 'children'),
-         Output('corr-title', 'children')],
-        Input('anchor-state', 'data'))
-    def update_anchor_copy(anchor):
+    @app.callback(Output('exec-banner-wrap', 'children'), Input('peer-sel', 'value'))
+    def ue(p):
         b = STATE.builder
         if b is None:
             raise PreventUpdate
-        anchor = b._valid_anchor(anchor)
-        return (f"ranked bar \u00b7 {anchor} highlighted",
-                f"Two metrics for {anchor} on independent axes, with Pearson correlation.",
-                f"Dual-Axis Trend \u2014 {anchor}",
-                f"{anchor} Correlation Analysis")
-
-    @app.callback(
-        [Output('r1d', 'options'), Output('r1d', 'value')],
-        Input('anchor-state', 'data'),
-        State('r1d', 'value'))
-    def update_anchor_dates(anchor, current_value):
-        b = STATE.builder
-        if b is None:
-            raise PreventUpdate
-        anchor = b._valid_anchor(anchor)
-        options = b._date_options(anchor)
-        valid = {x['value'] for x in options}
-        value = current_value if current_value in valid else (options[0]['value'] if options else None)
-        return options, value
-
-    @app.callback(
-        [Output('det-date', 'options'), Output('det-date', 'value')],
-        Input('det-bank', 'value'),
-        State('det-date', 'value'))
-    def update_detail_dates(bank, current_value):
-        b = STATE.builder
-        if b is None:
-            raise PreventUpdate
-        bank = bank if bank in b.banks else b.default_anchor
-        options = b._date_options(bank)
-        valid = {x['value'] for x in options}
-        value = current_value if current_value in valid else (options[0]['value'] if options else None)
-        return options, value
-
-    @app.callback(Output('exec-banner-wrap', 'children'),
-                  [Input('anchor-state', 'data'), Input('peer-sel', 'value')])
-    def ue(anchor, peers):
-        b = STATE.builder
-        if b is None:
-            raise PreventUpdate
-        return b._exec_banner(anchor, peers or [])
+        return b._exec_banner(p or [])
 
     @app.callback(Output('peer-def', 'children'), Input('peer-metric', 'value'))
     def d_peer(m):
@@ -3049,7 +2883,8 @@ def register_callbacks(app):
         base = {'flex': '0 0 500px', 'maxWidth': '610px', 'minWidth': '360px'}
         if STATE.builder is None or not m:
             return base
-        # Widen the control for long segment-metric names while keeping the row balanced.
+        # Widen the control for the long segment-metric names so the selected
+        # value never truncates; capped to keep the control row balanced.
         width = min(610, max(360, 240 + 7 * len(str(m))))
         return {'flex': f'0 0 {width}px', 'maxWidth': '610px', 'minWidth': '360px'}
 
@@ -3063,55 +2898,44 @@ def register_callbacks(app):
 
     @app.callback([Output('r1c', 'figure'), Output('r1o', 'children')],
                   [Input('peer-metric', 'value'), Input('r1d', 'value'),
-                   Input('peer-sel', 'value'), Input('anchor-state', 'data')])
-    def u1(m, ds, peers, anchor):
+                   Input('peer-sel', 'value')])
+    def u1(m, ds, p):
         b = STATE.builder
         if b is None:
             raise PreventUpdate
-        anchor = b._valid_anchor(anchor)
-        if not m or not anchor:
+        if not m or not ds:
             return b._ef(""), html.Div()
-        peers = b._sanitize_peers(anchor, peers)
-        dt = b._coerce_date_for_bank(anchor, ds)
-        if dt is None:
-            return b._ef("No anchor-bank data"), html.Div()
-        cohort = [anchor] + peers
-        f = b.df[(b.df['Date'] == dt) & b.df['Bank'].isin(cohort)]
+        dt = pd.to_datetime(ds)
+        bk = [b.GHB] + (p or [])
+        f = b.df[(b.df['Date'] == dt) & b.df['Bank'].isin(bk)]
         if f.empty:
             return b._ef("No data"), html.Div()
-        return b._bar(f, m, anchor, dt), b._ov(f, m, dt, anchor)
+        return b._bar(f, m, dt), b._ov(f, m, dt)
 
     @app.callback([Output('r2c', 'figure'), Output('r2a', 'children'),
                    Output('r2r', 'children')],
                   [Input('peer-metric', 'value'), Input('peer-sel', 'value'),
-                   Input('r2t', 'value'), Input('anchor-state', 'data')])
-    def u2(m, peers, years, anchor):
+                   Input('r2t', 'value')])
+    def u2(m, p, y):
         b = STATE.builder
         if b is None:
             raise PreventUpdate
-        anchor = b._valid_anchor(anchor)
-        if not m or not anchor:
+        if not m:
             return b._ef(""), html.Div(), ""
-        peers = b._sanitize_peers(anchor, peers)
-        cohort = [anchor] + peers
-        years = years or 5
-        start, end = b._window_bounds(anchor, years)
-        return (b._trend(cohort, m, years, anchor),
-                b._ta(cohort, m, years, anchor),
-                b._window_label(start, end))
+        bk = [b.GHB] + (p or [])
+        y = y or 5
+        start, end = b._window_bounds(bk, y)
+        return b._trend(bk, m, y), b._ta(bk, m, y), b._window_label(start, end)
 
     @app.callback([Output('r3c', 'figure'), Output('r3x', 'children')],
-                  [Input('r3p', 'value'), Input('r3s', 'value'), Input('r3t', 'value'),
-                   Input('anchor-state', 'data')])
-    def u3(a, b_, years, anchor):
+                  [Input('r3p', 'value'), Input('r3s', 'value'), Input('r3t', 'value')])
+    def u3(a, b_, y):
         b = STATE.builder
         if b is None:
             raise PreventUpdate
-        anchor = b._valid_anchor(anchor)
-        if not a or not b_ or not anchor:
+        if not a or not b_:
             return b._ef(""), html.Div()
-        return (b._dual(a, b_, years or 10, anchor),
-                b._corr(a, b_, years or 10, anchor))
+        return b._dual(a, b_, y or 10), b._corr(a, b_, y or 10)
 
     @app.callback(Output('det', 'children'),
                   [Input('det-date', 'value'), Input('det-bank', 'value')])
@@ -3119,10 +2943,9 @@ def register_callbacks(app):
         b = STATE.builder
         if b is None:
             raise PreventUpdate
-        bank = bank if bank in b.banks else b.default_anchor
         if not ds:
             return html.P("Select a date", className='emp')
-        return b._bd(pd.to_datetime(ds), bank)
+        return b._bd(pd.to_datetime(ds), bank or b.GHB)
 
     @app.callback(Output('dl', 'data'), Input('exp', 'n_clicks'),
                   State('det-bank', 'value'), prevent_initial_call=True)
@@ -3130,7 +2953,7 @@ def register_callbacks(app):
         b = STATE.builder
         if not n or b is None:
             raise PreventUpdate
-        bank = bank if bank in b.banks else b.default_anchor
+        bank = bank or b.GHB
         payload = build_bank_export(b.df, bank_display=bank)
         safe = ''.join(ch if ch.isalnum() else '_' for ch in bank).strip('_')
         fname = f"{safe}_all_metrics_{datetime.today().strftime('%Y%m%d')}.xlsx"
