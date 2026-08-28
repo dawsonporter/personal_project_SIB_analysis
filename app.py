@@ -121,8 +121,8 @@ DASHBOARD_MARK = "SIB"
 DASHBOARD_TITLE = "Systemically Important Banks \u2014 Peer Analytics Dashboard"
 DASHBOARD_SHORT_TITLE = "SIB Dashboard"
 PEER_UNIVERSE_LABEL = "Systemically Important Banks (SIBs)"
-HEADER_DISCLOSURE_SHORT = ("Personal project \u00b7 public FDIC data \u00b7 not "
-                           "affiliated with any institution shown")
+# The affiliation disclosure now lives ONLY in the footer (FOOTER_DISCLOSURE_NOTE
+# below); the short header version was removed to keep the header compact.
 FOOTER_DISCLOSURE_NOTE = ("Independent personal project using public FDIC data; not "
                           "affiliated with or endorsed by any institution shown.")
 PAIRED_GRAPH_HEIGHT = 340
@@ -845,7 +845,9 @@ def fmt_delta(curr, prev, metric=None):
             display = f"{diff:+.2f}"
         is_good = (diff > 0) if not inverse else (diff < 0)
     if abs(diff) < 1e-9:
-        if metric and is_percent_metric(metric):
+        if metric and is_dollar_metric(metric):
+            zero_display = "0.0%"      # dollar deltas display as % change
+        elif metric and is_percent_metric(metric):
             zero_display = "0.00 pp"
         elif metric and is_multiplier_metric(metric):
             zero_display = "0.00x"
@@ -1218,16 +1220,37 @@ class BankDataRepository:
         except (AttributeError, TypeError):
             return False
 
+    # Fallback caches (same cohort hash, different date window) are only
+    # trusted for this long. The fallback exists to cover redeploys earlier in
+    # the SAME quarter; without an age cap, any environment with a persistent
+    # disk (local dev especially -- Heroku dynos are ephemeral) would serve the
+    # first complete cache forever and never pick up a newly published quarter,
+    # because the fallback always matches. The exact-window cache (written
+    # today, since the end date is today) is always accepted.
+    FALLBACK_CACHE_MAX_AGE_DAYS = 45
+
     def _lc(self, s, e):
         """Load cache for the exact window; if absent, fall back to the most
         recent COMPLETE cache for this cohort hash (covers redeploys earlier in
-        the same quarter). Incomplete caches are rejected outright."""
+        the same quarter), provided it is younger than
+        FALLBACK_CACHE_MAX_AGE_DAYS. Incomplete caches are rejected outright."""
         p = self._cp(s, e)
-        candidates = [p] if os.path.exists(p) else []
+        exact = os.path.exists(p)
+        candidates = [p] if exact else []
         if not candidates:
             pattern = os.path.join(CACHE_DIR, f"bank_data_*_{self._bank_set_hash()}.json")
             candidates = sorted(glob.glob(pattern), key=os.path.getmtime, reverse=True)
         for path in candidates:
+            if not exact:
+                try:
+                    age_days = (time.time() - os.path.getmtime(path)) / 86400.0
+                except OSError:
+                    continue
+                if age_days > self.FALLBACK_CACHE_MAX_AGE_DAYS:
+                    logger.info(f"Rejecting fallback cache {path}: "
+                                f"{age_days:.0f} days old (> "
+                                f"{self.FALLBACK_CACHE_MAX_AGE_DAYS}); will refetch.")
+                    continue
             try:
                 with open(path) as f:
                     data = json.load(f)
@@ -1805,6 +1828,112 @@ def build_bank_export(df, bank_display):
     return buf.getvalue()
 
 
+def build_all_banks_export(df, bank_order=None):
+    """Whole-cohort Excel workbook: a 'Cohort Overview' contents sheet, then
+    ONE SHEET PER BANK in canonical BANK_INFO order, each laid out exactly like
+    the single-bank export's sheets -- metrics as rows, that bank's own
+    reporting dates as columns (oldest -> newest), values formatted as the
+    dashboard shows them -- except that the metric categories become colored
+    band rows within the sheet instead of separate sheets (12 categories x 19
+    banks as sheets would be unusable). Returns workbook bytes.
+
+    PERFORMANCE CONTRACT: this writes on the order of 400k cells and must
+    finish well inside Heroku's 30-second router timeout. Style objects are
+    shared (openpyxl styles are immutable and reusable), value cells carry
+    font + alignment only (no per-cell borders -- headers, category bands and
+    metric names keep the full treatment), and each bank's frame is converted
+    to a plain list-of-lists once instead of via repeated pandas indexing."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    order = bank_order or [b['display'] for b in BANK_INFO]
+    present = set(df['Bank'].unique())
+    banks = [b for b in order if b in present]
+    banks += sorted(b for b in present if b not in set(banks))
+
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    # Shared styles (one object each, reused across every cell).
+    hdr_font = Font(name='Calibri', size=10, bold=True, color='FFFFFF')
+    hdr_fill = PatternFill(start_color='005EB8', end_color='005EB8', fill_type='solid')
+    band_font = Font(name='Calibri', size=10, bold=True, color='FFFFFF')
+    name_font = Font(name='Calibri', size=10, bold=True)
+    val_font = Font(name='Calibri', size=10)
+    right = Alignment(horizontal='right')
+    center = Alignment(horizontal='center')
+    band_fills = {cat: PatternFill(start_color=CATEGORY_ACCENTS.get(cat, '#005EB8').lstrip('#').upper(),
+                                   end_color=CATEGORY_ACCENTS.get(cat, '#005EB8').lstrip('#').upper(),
+                                   fill_type='solid')
+                  for cat, _ in METRIC_CATEGORIES}
+
+    # ---- Sheet 1: cohort overview / contents -------------------------------
+    ov = wb.create_sheet("Cohort Overview")
+    ov_cols = ["Bank", "FDIC Cert", "Quarters on file",
+               "First filing", "Latest filing"]
+    for j, h in enumerate(ov_cols, start=1):
+        c = ov.cell(row=1, column=j, value=h)
+        c.font = hdr_font; c.fill = hdr_fill; c.alignment = center
+    for i, bank in enumerate(banks, start=2):
+        bdf = df[df['Bank'] == bank]
+        dts = sorted(bdf['Date'].unique())
+        ov.cell(row=i, column=1, value=bank).font = name_font
+        ov.cell(row=i, column=2, value=DISPLAY_TO_CERT.get(bank, "")).font = val_font
+        ov.cell(row=i, column=3, value=len(dts)).font = val_font
+        if dts:
+            ov.cell(row=i, column=4, value=pd.Timestamp(dts[0]).strftime('%m/%d/%Y')).font = val_font
+            ov.cell(row=i, column=5, value=pd.Timestamp(dts[-1]).strftime('%m/%d/%Y')).font = val_font
+    for j, w in zip(range(1, 6), (30, 10, 15, 12, 12)):
+        ov.column_dimensions[ov.cell(row=1, column=j).column_letter].width = w
+    ov.freeze_panes = 'A2'
+
+    # ---- One sheet per bank ------------------------------------------------
+    for bank in banks:
+        bdf = df[df['Bank'] == bank].sort_values('Date')
+        dates = list(bdf['Date'])
+        ncols = len(dates) + 1
+        ws = wb.create_sheet(_safe_sheet_title(bank))
+
+        c0 = ws.cell(row=1, column=1, value='Metric')
+        c0.font = hdr_font; c0.fill = hdr_fill
+        for j, d in enumerate(dates, start=2):
+            c = ws.cell(row=1, column=j, value=d.strftime('%m/%d/%Y'))
+            c.font = hdr_font; c.fill = hdr_fill; c.alignment = center
+        ws.freeze_panes = 'B2'
+        ws.column_dimensions['A'].width = 46
+        for j in range(2, ncols + 1):
+            ws.column_dimensions[ws.cell(row=1, column=j).column_letter].width = 12
+
+        row_i = 2
+        for cat_name, cat_metrics in METRIC_CATEGORIES:
+            present_ms = [m for m in cat_metrics if m in bdf.columns]
+            if not present_ms:
+                continue
+            # Category band row: colored, label in col A, merged across dates.
+            bc = ws.cell(row=row_i, column=1, value=cat_name)
+            bc.font = band_font; bc.fill = band_fills[cat_name]
+            if ncols > 1:
+                ws.merge_cells(start_row=row_i, start_column=2,
+                               end_row=row_i, end_column=ncols)
+                mc = ws.cell(row=row_i, column=2)
+                mc.fill = band_fills[cat_name]
+            row_i += 1
+            # Metric rows: pull each series ONCE as a plain list.
+            for m in present_ms:
+                nc = ws.cell(row=row_i, column=1, value=m)
+                nc.font = name_font
+                series = list(bdf[m])
+                for j, v in enumerate(series, start=2):
+                    vc = ws.cell(row=row_i, column=j, value=fmt_val(v, m, with_unit=True))
+                    vc.font = val_font
+                    vc.alignment = right
+                row_i += 1
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 # =============================================================================
 # PAGE TEMPLATE + DESIGN SYSTEM (single source of CSS; Dash tokens preserved)
 # The former --jpm brand tokens are renamed --anchor: the highlight color now
@@ -1848,7 +1977,7 @@ INDEX_STRING = """<!DOCTYPE html>
             background:linear-gradient(135deg,#003B73 0%,#005EB8 62%,#0B4F8A 100%);
             color:#fff;box-shadow:0 6px 22px -8px rgba(2,32,71,.55);
             backdrop-filter:saturate(140%) blur(6px)}
-        .hdr-inner{max-width:1480px;margin:0 auto;padding:16px 28px 14px}
+        .hdr-inner{max-width:1480px;margin:0 auto;padding:13px 28px 11px}
         .hdr-title{margin:0;font-size:21px;font-weight:800;letter-spacing:-.015em;line-height:1.2}
         .hdr-meta{display:flex;align-items:center;flex-wrap:wrap;gap:7px 14px;
             margin-top:6px;font-size:12px;font-weight:500;color:rgba(255,255,255,.82)}
@@ -1864,10 +1993,9 @@ INDEX_STRING = """<!DOCTYPE html>
             box-shadow:0 0 0 0 rgba(74,222,128,.65);animation:pulse 2.2s infinite}
         @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(74,222,128,.65)}
             70%{box-shadow:0 0 0 7px rgba(74,222,128,0)}100%{box-shadow:0 0 0 0 rgba(74,222,128,0)}}
-        .hdr-disc{margin-top:4px;font-size:11px;color:rgba(255,255,255,.6)}
 
         /* ---------- shell ---------- */
-        .main-wrap{max-width:1480px;margin:0 auto;padding:22px 28px 56px}
+        .main-wrap{max-width:1480px;margin:0 auto;padding:18px 28px 48px}
         .ftr{max-width:1480px;margin:0 auto;padding:18px 28px 30px;
             font-size:11.5px;color:var(--ink3);border-top:1px solid var(--line)}
 
@@ -1880,18 +2008,27 @@ INDEX_STRING = """<!DOCTYPE html>
         .ct{margin:0;font-size:14.5px;font-weight:700;letter-spacing:-.01em;color:var(--ink)}
         .csub,.rng{font-size:11.5px;font-weight:500;color:var(--ink3)}
 
-        .sec{margin-top:26px}
+        .sec{margin-top:22px}
         .sec-head{margin:0 2px 12px}
         .sec-title{margin:0;font-size:16.5px;font-weight:800;letter-spacing:-.015em}
         .sec-sub{margin:3px 0 0;font-size:12px;color:var(--ink3)}
 
         /* ---------- anchor + peer controls ---------- */
+        /* One grid holds both cards: stacked on narrow viewports, side-by-side
+           on wide ones. This reclaims a full card of vertical space above the
+           executive banner without changing anything inside either card. */
+        .config-grid{display:grid;grid-template-columns:1fr;gap:14px;align-items:stretch}
+        @media (min-width:1181px){
+            .config-grid{grid-template-columns:minmax(340px,5fr) minmax(440px,7fr)}
+        }
         .anchor-card{border-left:3px solid var(--anchor)}
-        .peer-card{margin-top:14px}
         .peer-row{display:flex;align-items:flex-start;gap:14px;flex-wrap:wrap}
         .anchor-dd-wrap{flex:0 0 330px;min-width:250px}
-        .anchor-note{flex:1 1 320px;min-width:260px;font-size:11.5px;
-            color:var(--ink3);line-height:1.55;padding-top:9px}
+        /* Compact companion line BESIDE the anchor dropdown (cert, quarters on
+           file, filing span), vertically centered on the 38px control. */
+        .anchor-side{flex:1 1 auto;min-width:0;display:flex;align-items:center;
+            flex-wrap:wrap;gap:8px;min-height:38px;font-size:11.5px;
+            color:var(--ink3);line-height:1.5}
         .peer-dd-wrap{flex:1 1 520px;min-width:300px}
         .peer-actions{display:flex;gap:8px;padding-top:2px}
         .btn-mini{appearance:none;border:1px solid var(--line2);background:#fff;
@@ -1899,7 +2036,6 @@ INDEX_STRING = """<!DOCTYPE html>
             padding:7px 14px;border-radius:var(--r-sm);cursor:pointer;
             transition:all .15s ease;white-space:nowrap}
         .btn-mini:hover{border-color:var(--anchor);color:var(--anchor);background:#f5f9fe}
-        .peer-count{font-size:11.5px;color:var(--ink3);margin-top:8px}
 
         /* ---------- executive banner ---------- */
         .exec-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));
@@ -1934,7 +2070,7 @@ INDEX_STRING = """<!DOCTYPE html>
         .ctl{display:flex;flex-direction:column;gap:5px}
         .ctl-label{font-size:10.5px;font-weight:700;letter-spacing:.07em;
             text-transform:uppercase;color:var(--ink3)}
-        .peer-metric-wrap{flex:0 0 500px;max-width:610px;min-width:360px;
+        .peer-metric-wrap{flex:0 0 var(--pmw,500px);max-width:610px;min-width:360px;
             transition:flex-basis .2s ease}
         .peer-def{font-size:11.5px;color:var(--ink3);line-height:1.5;
             margin:2px 2px 14px;max-width:1100px}
@@ -1982,6 +2118,11 @@ INDEX_STRING = """<!DOCTYPE html>
             padding:9px 18px;border-radius:var(--r-sm);
             box-shadow:0 2px 8px -2px rgba(0,94,184,.55);transition:all .15s ease}
         .btn-export:hover{background:var(--anchor-dark);transform:translateY(-1px)}
+        /* cohort-wide export: outlined so the per-bank export stays primary */
+        .btn-export.btn-export-alt{background:#fff;color:var(--anchor);
+            border:1.5px solid var(--anchor);box-shadow:none;padding:7.5px 16px}
+        .btn-export.btn-export-alt:hover{background:#f5f9fe;color:var(--anchor-dark);
+            border-color:var(--anchor-dark)}
         .det-legend{font-size:11px;color:var(--ink3);margin-left:auto;align-self:center}
         .det-cat{margin-top:18px;border:1px solid var(--line);border-radius:var(--r-md);overflow:hidden}
         .det-cat-head{display:flex;align-items:center;gap:10px;padding:9px 14px;
@@ -1998,10 +2139,18 @@ INDEX_STRING = """<!DOCTYPE html>
         .det-val{font-weight:700;font-variant-numeric:tabular-nums;text-align:right}
         .det-delta{font-size:11.5px;font-weight:700;font-variant-numeric:tabular-nums;text-align:right}
 
-        /* ---------- reference guide (collapsible) ---------- */
-        .ref-wrap{column-width:300px;column-gap:14px;margin-top:6px}
-        details.ref-cat{break-inside:avoid;background:#fff;border:1px solid var(--line);
-            border-radius:var(--r-md);margin:0 0 14px;overflow:hidden}
+        /* ---------- reference guide (collapsible) ----------
+           The category cards stack in ONE column. A CSS multi-column layout
+           (column-width) rebalances EVERY card each time one expands, so the
+           card being opened would visibly jump to a different column
+           mid-click. A single stacked column is fully predictable: the card
+           you click expands in place and nothing else moves. To keep a large
+           opened category compact, the definitions INSIDE the open body flow
+           into columns -- that reflow is confined to the one card the user
+           opened and never repositions the cards themselves. */
+        .ref-wrap{display:flex;flex-direction:column;gap:10px;margin-top:6px}
+        details.ref-cat{background:#fff;border:1px solid var(--line);
+            border-radius:var(--r-md);overflow:hidden}
         .ref-summary{display:flex;align-items:center;gap:10px;list-style:none;
             cursor:pointer;padding:10px 14px;user-select:none}
         .ref-summary::-webkit-details-marker{display:none}
@@ -2011,8 +2160,10 @@ INDEX_STRING = """<!DOCTYPE html>
         .ref-chev{flex:0 0 auto;color:var(--ink3);font-size:11px;
             transition:transform .18s ease}
         details[open] .ref-chev{transform:rotate(90deg)}
-        .ref-body{padding:2px 14px 12px;border-top:1px solid var(--line)}
-        .ref-row{padding:8px 0;border-bottom:1px dashed var(--line)}
+        .ref-body{padding:2px 16px 12px;border-top:1px solid var(--line);
+            column-width:340px;column-gap:22px}
+        .ref-row{padding:8px 0;border-bottom:1px dashed var(--line);
+            break-inside:avoid}
         .ref-row:last-child{border-bottom:none}
         .ref-name{font-size:12px;font-weight:700}
         .ref-desc{font-size:11.5px;color:var(--ink2);line-height:1.5;margin-top:2px}
@@ -2330,8 +2481,10 @@ class DashboardBuilder:
         return f"Anchor: {anchor} \u00b7 latest filing {stamp}"
 
     def anchor_note(self, anchor):
-        """Explanatory line under the anchor selector: history depth, peer count,
-        and an explicit statement that switching is free (no refetch)."""
+        """Compact companion line BESIDE the anchor selector: cert, quarters on
+        file, and filing span. The former explanatory paragraph was removed --
+        the controls are self-evident, and switching anchors being free (no
+        refetch) is now simply how the app behaves rather than a caption."""
         dates = self.bank_dates(anchor)
         first = self.earliest_date(anchor)
         last = self.latest_date(anchor)
@@ -2339,10 +2492,7 @@ class DashboardBuilder:
                 if first is not None and last is not None else "no filings")
         cert = DISPLAY_TO_CERT.get(anchor)
         cert_txt = f"FDIC cert {cert} \u00b7 " if cert else ""
-        return (f"{cert_txt}{len(dates)} quarters on file ({span}) \u00b7 compared against "
-                f"up to {len(self.peers_for(anchor))} peers. Every ranking, peer band, "
-                f"delta and correlation below is computed from this bank's perspective. "
-                f"Switching anchors re-reads data already in memory \u2014 no new FDIC calls.")
+        return f"{cert_txt}{len(dates)} quarters on file \u00b7 {span}"
 
     def _exec_banner(self, anchor, selected_peers):
         cohort = self.cohort(anchor, selected_peers)
@@ -2391,16 +2541,16 @@ class DashboardBuilder:
         ])
 
     def _missing_data_banner(self):
+        # NOTE: the CECL coverage line ("CECL concentration adjustment active:
+        # ...") was intentionally removed from the on-page banner. The
+        # adjustment itself still runs exactly as before; its coverage stats
+        # remain available in the boot log (see cecl_status()) and in the
+        # per-metric definitions in the Reference Guide.
         notes = []
         if self.missing_banks:
             notes.append(f"FDIC returned no data for: {', '.join(self.missing_banks)}. "
                          f"They are excluded from the anchor list and from peer "
                          f"statistics this session.")
-        cov = self.cecl.get('coverage_pct') if self.cecl else None
-        if cov is not None:
-            notes.append(f"CECL concentration adjustment active: add-back applied to "
-                         f"{self.cecl['applied_rows']} of {self.cecl['window_rows']} "
-                         f"bank-quarters in the 2020\u20132024 window ({cov:.0f}% coverage).")
         if not notes:
             return html.Div()
         return html.Div(" ".join(notes), className='warn-banner')
@@ -2469,7 +2619,6 @@ class DashboardBuilder:
                           f"{len(self.metrics)} UBPR-aligned metrics \u00b7 "
                           f"quarterly since {REQUESTED_START_DATE_DISPLAY}"),
             ], className='hdr-meta'),
-            html.Div(HEADER_DISCLOSURE_SHORT, className='hdr-disc'),
         ], className='hdr-inner'), className='hdr')
 
         anchor_card = html.Div([
@@ -2483,8 +2632,9 @@ class DashboardBuilder:
                                    placeholder="Select the anchor bank\u2026",
                                    extra_class='dd-anchor'),
                          className='anchor-dd-wrap'),
+                # Callback-owned: compact cert/history line tracks the anchor.
                 html.Div(self.anchor_note(anchor), id='anchor-note',
-                         className='anchor-note'),
+                         className='anchor-side'),
             ], className='peer-row'),
         ], className='card anchor-card')
 
@@ -2503,11 +2653,9 @@ class DashboardBuilder:
                     html.Button("Clear", id='sel-clear', n_clicks=None, className='btn-mini'),
                 ], className='peer-actions'),
             ], className='peer-row'),
-            html.Div("The anchor bank is always included and is never listed as its own "
-                     "peer; whichever bank you replace as anchor rejoins this list "
-                     "automatically. Peer averages, medians, bands and ranks use only "
-                     "the banks selected here.",
-                     className='peer-count'),
+            # The explanatory paragraph that used to sit here (anchor/peer
+            # handoff mechanics) was removed: the behavior is self-evident
+            # from the controls themselves.
         ], className='card peer-card')
 
         snapshot_sec = html.Div([
@@ -2613,9 +2761,18 @@ class DashboardBuilder:
                 html.Div([html.Span("As of", className='ctl-label'),
                           self._mdd('det-date', det_latest_val, det_date_opts)],
                          className='ctl det-date-wrap'),
-                html.Button("Export all periods (Excel)", id='exp', n_clicks=None,
-                            className='btn-export'),
+                html.Button("Export this bank \u00b7 all quarters (Excel)", id='exp',
+                            n_clicks=None, className='btn-export',
+                            title="The bank selected above: every metric, every "
+                                  "reported quarter, one sheet per category"),
+                html.Button(f"Export full cohort \u00b7 {len(self.banks)} banks (Excel)",
+                            id='exp-all', n_clicks=None,
+                            className='btn-export btn-export-alt',
+                            title="Every bank in the cohort: one sheet per bank, "
+                                  "all metrics and all reported quarters, plus a "
+                                  "cohort overview sheet"),
                 dcc.Download(id='dl'),
+                dcc.Download(id='dl-all'),
                 html.Span("Deltas: QoQ vs prior quarter \u00b7 YoY vs same quarter last year",
                           className='det-legend'),
             ], className='det-controls'),
@@ -2635,8 +2792,7 @@ class DashboardBuilder:
             dcc.Store(id='prev-anchor', data=anchor),
             header,
             html.Div([
-                anchor_card,
-                peer_card,
+                html.Div([anchor_card, peer_card], className='config-grid'),
                 self._missing_data_banner(),
                 html.Div(self._exec_banner(anchor, self.peers_for(anchor)),
                          id='exec-banner-wrap', className='sec'),
@@ -2874,6 +3030,13 @@ class DashboardBuilder:
         return self._bl(fig)
 
     def _corr(self, anchor, a, b, years):
+        # Same metric on both axes: adf[[a, b]] would produce duplicate columns
+        # and adf[a] would return a 2-D frame, crashing pearsonr. A self-
+        # correlation is also trivially +1.00, so say so instead of computing.
+        if a == b:
+            return html.P("Primary and secondary metrics are identical \u2014 "
+                          "select two different metrics to compute a correlation.",
+                          className='emp')
         start, end = self._window_bounds([anchor], years, anchor=anchor)
         if start is None:
             return html.P("No data", className='emp')
@@ -2892,9 +3055,10 @@ class DashboardBuilder:
                     "moderate" if ar >= 0.4 else "weak" if ar >= 0.2 else "negligible")
         direction = "positive" if r > 0 else "negative"
         col = CS['good'] if r > 0.2 else (CS['bad'] if r < -0.2 else CS['neutral'])
+        p_txt = "p < 0.001" if p < 0.001 else f"p = {p:.3f}"
         interp = (f"A {strength} {direction} relationship between \u201c{a}\u201d and "
                   f"\u201c{b}\u201d for {anchor} across {len(adf)} quarters "
-                  f"({self._window_label(start, end)}). p = {p:.3f}. "
+                  f"({self._window_label(start, end)}). {p_txt}. "
                   f"Correlation is descriptive, not causal.")
         return html.Div([
             html.Div("Pearson r", className='corr-label'),
@@ -3230,13 +3394,19 @@ def register_callbacks(app):
 
     @app.callback(Output('peer-metric-wrap', 'style'), Input('peer-metric', 'value'))
     def resize_peer_metric_control(m):
-        base = {'flex': '0 0 500px', 'maxWidth': '610px', 'minWidth': '360px'}
+        # The width is communicated as a CSS custom property (--pmw) rather
+        # than an inline `flex` value. Inline styles outrank stylesheet rules,
+        # so setting flex directly here permanently overrode the <=1180px media
+        # query and pinned the control at ~500px on narrow screens. A custom
+        # property only feeds the stylesheet's base rule
+        # (.peer-metric-wrap{flex:0 0 var(--pmw,500px)}), which the media query
+        # continues to override normally on small viewports.
         if STATE.builder is None or not m:
-            return base
+            return {'--pmw': '500px'}
         # Widen the control for the long segment-metric names so the selected
         # value never truncates; capped to keep the control row balanced.
         width = min(610, max(360, 240 + 7 * len(str(m))))
-        return {'flex': f'0 0 {width}px', 'maxWidth': '610px', 'minWidth': '360px'}
+        return {'--pmw': f'{width}px'}
 
     @app.callback(Output('r3f', 'children'),
                   [Input('r3p', 'value'), Input('r3s', 'value')])
@@ -3345,6 +3515,20 @@ def register_callbacks(app):
         payload = build_bank_export(b.df, bank_display=bank)
         safe = ''.join(ch if ch.isalnum() else '_' for ch in bank).strip('_')
         fname = f"{safe}_all_metrics_{datetime.today().strftime('%Y%m%d')}.xlsx"
+        return dcc.send_bytes(payload, fname)
+
+    @app.callback(Output('dl-all', 'data'), Input('exp-all', 'n_clicks'),
+                  prevent_initial_call=True)
+    def export_all_banks(n):
+        """Whole-cohort workbook: overview sheet + one sheet per bank. Uses the
+        builder's canonical bank ordering so the sheet order matches the UI.
+        Independent of both the anchor and the All-Metrics bank selector."""
+        b = STATE.builder
+        if not n or b is None:
+            raise PreventUpdate
+        payload = build_all_banks_export(b.df, bank_order=b.banks)
+        fname = (f"sib_peers_all_banks_"
+                 f"{datetime.today().strftime('%Y%m%d')}.xlsx")
         return dcc.send_bytes(payload, fname)
 
 
